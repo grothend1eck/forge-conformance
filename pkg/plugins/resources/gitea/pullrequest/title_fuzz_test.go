@@ -29,7 +29,13 @@ func FuzzExistingPullRequestTitle(f *testing.F) {
 		}
 
 		prefix := marker.FindString(remote)
-		if prefix == "" || requested == "" {
+		if requested == "" {
+			if (draft || prefix != "") && got != remote {
+				t.Fatalf("empty edit changed draft title %q to %q", remote, got)
+			}
+			return
+		}
+		if prefix == "" {
 			return
 		}
 		if marker.MatchString(requested) {

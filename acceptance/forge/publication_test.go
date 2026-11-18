@@ -138,7 +138,7 @@ func testPublicationAlreadyCurrent(t *testing.T, f publicationFixture) {
 	before := f.initialRefs(t)
 
 	output := f.driver.run(t, "apply", input)
-	requireOutput(t, output, "version.yaml", input.version)
+	requireOutput(t, output, "version.yaml", `already set to "`+input.version+`"`)
 	require.Equal(t, before, f.repo.refs(t), "an already current target must not write refs")
 	require.Empty(t, f.driver.requests(t), "an already current target must not create a request in any state")
 }
