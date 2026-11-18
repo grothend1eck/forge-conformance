@@ -13,7 +13,6 @@ import (
 func seedReleaseOnLaterPage(t *testing.T, s *server) (*repository, *gitea.Release) {
 	t.Helper()
 	r := s.newRepo(t)
-	resourceReleaseReady(t, r, r.base)
 	const pageSize = 30
 	seeded := make(map[string]int64, pageSize+1)
 	for i := 1; i <= pageSize+1; i++ {

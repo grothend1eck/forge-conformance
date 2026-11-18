@@ -4,7 +4,6 @@ package forge
 
 import (
 	"encoding/base64"
-	"fmt"
 	"strings"
 	"testing"
 
@@ -43,8 +42,20 @@ func (c *forgeCLI) run(t *testing.T, mode, manifest string, flags ...string) cli
 func (c *forgeCLI) ok(t *testing.T, mode, manifest string, flags ...string) string {
 	t.Helper()
 	r := c.run(t, mode, manifest, flags...)
-	require.Equal(t, 0, r.ExitCode, "pipeline %s:\n%s", mode, r.Output)
+	if r.ExitCode != 0 {
+		t.Fatalf("pipeline %s: exit status %d, want 0", mode, r.ExitCode)
+	}
 	return r.Output
+}
+
+// requireOutput reports only the expected, test-authored markers.
+func requireOutput(t *testing.T, output string, want ...string) {
+	t.Helper()
+	for _, marker := range want {
+		if !strings.Contains(output, marker) {
+			t.Fatalf("CLI output does not contain %q", marker)
+		}
+	}
 }
 
 func redactCredential(text, user, token string) string {
@@ -67,37 +78,30 @@ func manifestYAML(t *testing.T, spec map[string]any) string {
 
 // requestManifest leaves the action's connection and branches for the SCM to
 // supply, just as a normal pipeline would. Only the desired edit and PR options vary.
-func requestManifest(r *repository, id, value string, actionSpec map[string]any) string {
-	options := ""
+func requestManifest(t *testing.T, r *repository, id, value string, actionSpec map[string]any) string {
+	t.Helper()
+	action := map[string]any{"kind": "gitea/pullrequest", "scmid": "origin"}
 	if len(actionSpec) > 0 {
-		b, err := yaml.Marshal(actionSpec)
-		if err != nil {
-			panic(err) // test definitions contain only YAML values
-		}
-		options = "    spec:\n      " + strings.ReplaceAll(strings.TrimSuffix(string(b), "\n"), "\n", "\n      ") + "\n"
+		action["spec"] = actionSpec
 	}
-	return fmt.Sprintf(`name: Update the fixture version
-pipelineid: %q
-scms:
-  origin:
-    kind: gitea
-    spec:
-      url: %q
-      owner: %q
-      repository: %q
-      branch: %q
-targets:
-  version:
-    name: Update the version
-    kind: yaml
-    scmid: origin
-    spec:
-      file: version.yaml
-      key: $.version
-      value: %q
-actions:
-  request:
-    kind: gitea/pullrequest
-    scmid: origin
-%s`, id, r.server.url, r.server.owner, r.name, r.base, value, options)
+	return manifestYAML(t, map[string]any{
+		"name":       "Update the fixture version",
+		"pipelineid": id,
+		"scms": map[string]any{
+			"origin": map[string]any{
+				"kind": "gitea",
+				"spec": map[string]any{
+					"url": r.server.url, "owner": r.server.owner,
+					"repository": r.name, "branch": r.base,
+				},
+			},
+		},
+		"targets": map[string]any{
+			"version": map[string]any{
+				"name": "Update the version", "kind": "yaml", "scmid": "origin",
+				"spec": map[string]any{"file": "version.yaml", "key": "$.version", "value": value},
+			},
+		},
+		"actions": map[string]any{"request": action},
+	})
 }

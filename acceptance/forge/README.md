@@ -16,11 +16,16 @@ export UPDATECLI_BIN="$PWD/bin/updatecli"
 UPDATECLI_TEST_FORGE=forgejo go test -tags=acceptance -count=1 -v ./acceptance/forge
 ```
 
-Select `gitea` for Gitea, or omit `UPDATECLI_TEST_FORGE` to run both. Use Go's
-`-run` flag to troubleshoot one case, for example
+Select `gitea` for Gitea, or leave `UPDATECLI_TEST_FORGE` unset to run both.
+Use Go's `-run` flag to troubleshoot one case, for example
 `-run '^TestForge$/^forgejo$/^server_automerge$/^observably_scheduled$'`.
-The public check uses the entire inventory in [cases.txt](cases.txt). A skip,
-missing case, test failure or incomplete test stream is a failed check.
+
+## Which capabilities run?
+
+[The `profiles` table](forge_test.go) maps each server to its enabled
+capabilities. **Gitea and Forgejo both run `giteaCapabilities`**, because they
+exercise the same Updatecli provider. Each entry names the capability and the
+Go function that tests it. Other forge providers are not enrolled.
 
 | Contract | What we observe |
 | --- | --- |
@@ -35,12 +40,13 @@ missing case, test failure or incomplete test stream is a failed check.
 
 ## Adding a capability
 
-Add the shared scenario to `forge_test.go` and the expected leaf names to
-`cases.txt`. A new case then runs for both servers without another workflow
-job. Only seeding and observations should use the SDK. The operation being
-tested must go through the built CLI. Prefer state the user can inspect: Git
-refs and file contents for published edits; forge API state for a request,
-review, status or release.
+Add a case with `runRequired(t, name, ...)` inside its capability; both servers
+pick it up. For a new capability, add its test function to the profile's list.
+An enrolled case that calls `t.Skip` fails. The workflow runs the whole selected
+profile and reports failures under their Go subtest names.
+
+Drive the operation through Updatecli. Use Git or the forge API to set up
+the repository and verify what changed.
 
 ## Known failures
 
@@ -57,8 +63,8 @@ Run both reproducers on both servers with `UPDATECLI_BIN` set:
 go test -tags=acceptance,knownissues -count=1 -run '^Test(NativeGitBranchPush|ExistingReleaseOnLaterPage)$' ./acceptance/forge
 ```
 
-Both tests assert the desired behavior. Move each into its capability and
-`cases.txt` when the corresponding fix lands. Neither counts as passing.
+Both tests assert the desired behavior. Move each into its capability when
+the corresponding fix lands. Neither counts as passing.
 
 ## Scope
 

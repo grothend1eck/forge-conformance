@@ -3,6 +3,7 @@
 package forge
 
 import (
+	"strings"
 	"testing"
 
 	gitea "gitea.dev/sdk"
@@ -15,24 +16,22 @@ func testAuthentication(t *testing.T, s *server) {
 	// requested branch. Use diff so a successful check doesn't publish a PR.
 	r.stage(t, r.base, "version.yaml", "version: v1.0.1\nkeep: untouched\n")
 	before := r.refs(t)
-	manifest := requestManifest(r, "auth", "v1.1.0", nil)
+	manifest := requestManifest(t, r, "auth", "v1.1.0", nil)
 	check := func(t *testing.T, user, token string, accessible bool) {
 		t.Helper()
 		c := newCLIWithCredentials(t, user, token)
-		result := c.run(t, "diff", manifest)
 		if accessible {
-			require.Equal(t, 0, result.ExitCode, result.Output)
-			require.Contains(t, result.Output, "v1.0.1")
-			require.Contains(t, result.Output, "v1.1.0")
+			requireOutput(t, c.ok(t, "diff", manifest), "v1.0.1", "v1.1.0")
 		} else {
+			result := c.run(t, "diff", manifest)
 			require.NotZero(t, result.ExitCode, "anonymous clone of a private repository succeeded")
-			require.NotContains(t, result.Output, "v1.0.1")
+			require.False(t, strings.Contains(result.Output, "v1.0.1"), "anonymous diff reported the private branch version")
 		}
 		require.Equal(t, before, r.refs(t))
 	}
-	t.Run("token_without_username", func(t *testing.T) { check(t, "", s.token, true) })
-	t.Run("private_without_credentials", func(t *testing.T) { check(t, "", "", false) })
-	t.Run("public_without_credentials", func(t *testing.T) {
+	runRequired(t, "token_without_username", func(t *testing.T) { check(t, "", s.token, true) })
+	runRequired(t, "private_without_credentials", func(t *testing.T) { check(t, "", "", false) })
+	runRequired(t, "public_without_credentials", func(t *testing.T) {
 		_, response, err := s.client.Repositories.EditRepo(t.Context(), s.owner, r.name, gitea.EditRepoOption{Private: new(false)})
 		if err != nil {
 			s.apiFailure(t, "make fixture repository public", response, err)

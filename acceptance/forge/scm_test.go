@@ -12,7 +12,7 @@ import (
 )
 
 func testSCM(t *testing.T, s *server) {
-	t.Run("private_branch_read_and_direct_push", func(t *testing.T) {
+	runRequired(t, "private_branch_read_and_direct_push", func(t *testing.T) {
 		r := s.newRepo(t)
 		c := newCLI(t, s)
 		const input, copied = "scm-input.txt", "scm-copy.txt"
@@ -75,7 +75,7 @@ func testSCM(t *testing.T, s *server) {
 		}
 	})
 
-	t.Run("custom_working_branch_existing_only", func(t *testing.T) {
+	runRequired(t, "custom_working_branch_existing_only", func(t *testing.T) {
 		r := s.newRepo(t)
 		c := newCLI(t, s)
 		const id, prefix, separator = "refresh", "automation", "--"
@@ -106,7 +106,7 @@ func testSCM(t *testing.T, s *server) {
 		// A skipped apply can leave local changes; isolate it from the publish.
 		skipCLI := newCLI(t, s)
 		out := skipCLI.ok(t, "apply", manifest(skipCLI.runner.Dir, "first\n"), "--existing-only")
-		require.Contains(t, out, "existing-only mode")
+		requireOutput(t, out, "existing-only mode")
 		require.Equal(t, before, r.refs(t), "existing-only must not publish a missing branch")
 
 		c.ok(t, "apply", manifest(c.runner.Dir, "first\n"))
@@ -127,7 +127,7 @@ func testSCM(t *testing.T, s *server) {
 		require.Equal(t, "added independently\n", r.git(t, "show", "FETCH_HEAD:remote-marker.txt"))
 	})
 
-	t.Run("managed_history", func(t *testing.T) {
+	runRequired(t, "managed_history", func(t *testing.T) {
 		r := s.newRepo(t)
 		c := newCLI(t, s)
 		r.stage(t, r.base, "stable-only.txt", "configured branch tip\n")
@@ -172,7 +172,7 @@ func testSCM(t *testing.T, s *server) {
 		require.Equal(t, "second apply\n", r.git(t, "show", tip+":second.txt"))
 	})
 
-	t.Run("native_gittag_target", func(t *testing.T) {
+	runRequired(t, "native_gittag_target", func(t *testing.T) {
 		r := s.newRepo(t)
 		c := newCLI(t, s)
 		r.stage(t, r.base, "stable-only.txt", "this commit should be tagged\n")
@@ -202,8 +202,8 @@ func testSCM(t *testing.T, s *server) {
 
 		// Preview the private repo with only a PAT, exercising the SCM's username fallback.
 		preview := newCLIWithCredentials(t, "", s.token).run(t, "diff", manifest)
-		require.Zero(t, preview.ExitCode, "%s", preview.Output)
-		require.Contains(t, preview.Output, `git tag "v1.1.0" should be created`)
+		require.Zero(t, preview.ExitCode)
+		requireOutput(t, preview.Output, `git tag "v1.1.0" should be created`)
 		require.Equal(t, before, r.refs(t), "diff must not write remote refs")
 
 		// The target publishes the tag itself; there are no files to commit.
@@ -214,7 +214,7 @@ func testSCM(t *testing.T, s *server) {
 		require.Equal(t, stable+"\t"+tagRef+"^{}\n", r.git(t, "ls-remote", "origin", tagRef+"^{}"),
 			"the annotated tag must peel to the configured base, not main")
 
-		require.Contains(t, c.ok(t, "apply", manifest, "--commit=false"), `git tag "v1.1.0" already exists`)
+		requireOutput(t, c.ok(t, "apply", manifest, "--commit=false"), `git tag "v1.1.0" already exists`)
 		require.Equal(t, published, r.refs(t), "reapply must neither replace the tag object nor move other refs")
 	})
 }

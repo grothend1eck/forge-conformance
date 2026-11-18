@@ -3,6 +3,7 @@
 package forge
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -25,13 +26,13 @@ func TestExistingReleaseOnLaterPage(t *testing.T) {
 			})
 
 			preview := c.run(t, "diff", manifest)
-			assert.Zero(t, preview.ExitCode, "%s", preview.Output)
-			assert.NotContains(t, preview.Output, "doesn't exist and should be created",
+			assert.Zero(t, preview.ExitCode)
+			assert.False(t, strings.Contains(preview.Output, "doesn't exist and should be created"),
 				"diff must not plan creation of existing release %s (ID %d)", release.TagName, release.ID)
 			assert.Equal(t, before, r.refs(t), "diff must not change remote refs")
 
 			applied := c.run(t, "apply", manifest)
-			assert.Zero(t, applied.ExitCode, "ensuring existing release %s (ID %d) must succeed:\n%s", release.TagName, release.ID, applied.Output)
+			assert.Zero(t, applied.ExitCode, "ensuring existing release %s (ID %d) must succeed", release.TagName, release.ID)
 			assert.Equal(t, before, r.refs(t), "apply must not change remote refs")
 			got, resp, err := s.client.Releases.GetReleaseByTag(t.Context(), s.owner, r.name, release.TagName)
 			if err != nil {

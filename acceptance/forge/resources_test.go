@@ -3,13 +3,11 @@
 package forge
 
 import (
-	"context"
 	"maps"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"gitea.dev/sdk"
 	"github.com/stretchr/testify/require"
@@ -61,7 +59,7 @@ func testTags(t *testing.T, s *server) {
 	r.git(t, "push", "origin", "refs/tags/v1.9.0")
 	// Use a single known ref for the default: the Git refs endpoint's list
 	// order is not a portable recency contract.
-	t.Run("source/default", func(t *testing.T) {
+	runRequired(t, "source/default", func(t *testing.T) {
 		checkResourceSelection(t, s, r.name, "tag", resourceSelection{want: "v1.9.0"})
 	})
 	for _, tag := range []string{"v1.10.0", "v2.0.0", "snapshot/nightly"} {
@@ -83,7 +81,7 @@ func testTags(t *testing.T, s *server) {
 }
 
 func testReleases(t *testing.T, s *server) {
-	t.Run("paginated_source", func(t *testing.T) {
+	runRequired(t, "paginated_source", func(t *testing.T) {
 		r, release := seedReleaseOnLaterPage(t, s)
 		before := r.refs(t)
 		checkResourceSelection(t, s, r.name, "release", resourceSelection{
@@ -91,9 +89,8 @@ func testReleases(t *testing.T, s *server) {
 		})
 		require.Equal(t, before, r.refs(t), "the selector and condition must not modify remote refs")
 	})
-	t.Run("selection-and-conditions", func(t *testing.T) {
+	runRequired(t, "selection-and-conditions", func(t *testing.T) {
 		r := s.newRepo(t)
-		resourceReleaseReady(t, r, r.base)
 		// Publish the highest semver first, so default/latest and a semver
 		// constraint need not return the same tag. A draft is newer still.
 		for _, tag := range []string{"v2.0.0", "v1.9.0", "v1.10.0", "v1.8.0", "v9.0.0"} {
@@ -127,7 +124,7 @@ func testReleases(t *testing.T, s *server) {
 			{name: "draft-excluded", kind: "latest", pattern: "v9.0.0", wantError: `no version found matching pattern "v9.0.0"`},
 		})
 		testResourceConditions(t, s, r.name, "release", "tag", "v2.0.0")
-		t.Run("condition/ignores-selector-age-and-excludes-drafts", func(t *testing.T) {
+		runRequired(t, "condition/ignores-selector-age-and-excludes-drafts", func(t *testing.T) {
 			c := newCLI(t, s)
 			writeResourceFile(t, c.runner.Dir, resourceOutput, resourceUntouched)
 			fresh := resourceNode(s, r.name, "release", map[string]any{
@@ -147,11 +144,11 @@ func testReleases(t *testing.T, s *server) {
 			t.Fatalf("release selectors and conditions changed remote refs: got %v, want %v", got, before)
 		}
 	})
-	t.Run("target/explicit-create-preview-and-no-op", func(t *testing.T) {
+	runRequired(t, "target/explicit-create-preview-and-no-op", func(t *testing.T) {
 		r := s.newRepo(t)
 		r.stage(t, r.base, "stable.txt", "release commit\n")
 		c := newCLI(t, s)
-		before := resourceReleaseReady(t, r, r.base)
+		before := r.awaitBranches(t, r.base)
 		const tag, title, description = "v4.0.0-rc.1", "Test candidate", "Release notes\n\n- Ship the fixture"
 		writeResourceFile(t, c.runner.Dir, resourceInput, "v0.0.1")
 		spec := map[string]any{
@@ -165,7 +162,7 @@ func testReleases(t *testing.T, s *server) {
 			"targets": map[string]any{"ensure": target},
 		}
 		out := c.ok(t, "diff", manifestYAML(t, manifest))
-		requireResourceOutput(t, out, "doesn't exist and should be created")
+		requireOutput(t, out, "doesn't exist and should be created")
 		if got := readResourceReleases(t, s, r.name); len(got) != 0 {
 			t.Fatalf("diff created %d API releases", len(got))
 		}
@@ -193,7 +190,7 @@ func testReleases(t *testing.T, s *server) {
 		spec["title"], spec["description"], spec["commitish"], spec["prerelease"] = "Changed title", "Changed body", "main", false
 		target["spec"] = resourceNode(s, r.name, "release", spec)["spec"]
 		out = c.ok(t, "apply", manifestYAML(t, manifest))
-		requireResourceOutput(t, out, "already exist")
+		requireOutput(t, out, "already exist")
 		got := onlyResourceRelease(t, s, r.name)
 		if got.ID != release.ID || !got.PublishedAt.Equal(release.PublishedAt) {
 			t.Fatalf("existing release was replaced or republished: id=%d time=%s; want id=%d time=%s", got.ID, got.PublishedAt, release.ID, release.PublishedAt)
@@ -203,10 +200,10 @@ func testReleases(t *testing.T, s *server) {
 			t.Fatalf("reapply changed remote refs: got %v, want %v", refs, after)
 		}
 	})
-	t.Run("target/source-fed-defaults", func(t *testing.T) {
+	runRequired(t, "target/source-fed-defaults", func(t *testing.T) {
 		r := s.newRepo(t)
 		r.stage(t, r.base, "stable.txt", "alternate commit\n")
-		before := resourceReleaseReady(t, r, "main")
+		before := r.refs(t)
 		main, base := before["refs/heads/main"], before["refs/heads/"+r.base]
 		if main == "" || base == "" || r.base == "main" || main == base {
 			t.Fatalf("fixture needs distinct main and default branch commits, got %v", before)
@@ -227,13 +224,13 @@ func testReleases(t *testing.T, s *server) {
 			t.Fatalf("default commitish points to %q, want main at %q", got, main)
 		}
 	})
-	t.Run("target/draft", func(t *testing.T) {
+	runRequired(t, "target/draft", func(t *testing.T) {
 		r := s.newRepo(t)
 		c := newCLI(t, s)
 		const tag = "v6.0.0"
 		target := resourceNode(s, r.name, "release", map[string]any{"tag": tag, "commitish": r.base, "draft": true})
 		target["disablesourceinput"] = true
-		before := resourceReleaseReady(t, r, r.base)
+		before := r.refs(t)
 		c.ok(t, "apply", manifestYAML(t, map[string]any{
 			"name":    "Create a draft without publishing its Git tag",
 			"targets": map[string]any{"draft": target},
@@ -258,7 +255,7 @@ type resourceSelection struct {
 func testResourceSelectors(t *testing.T, s *server, repo, kind string, cases []resourceSelection) {
 	t.Helper()
 	for _, tc := range cases {
-		t.Run("source/"+tc.name, func(t *testing.T) {
+		runRequired(t, "source/"+tc.name, func(t *testing.T) {
 			checkResourceSelection(t, s, repo, kind, tc)
 		})
 	}
@@ -282,9 +279,9 @@ func checkResourceSelection(t *testing.T, s *server, repo, kind string, tc resou
 		// Leave the source as a leaf so its error isn't masked by skipped dependents.
 		res := c.run(t, "apply", manifestYAML(t, manifest))
 		if res.ExitCode != 1 {
-			t.Fatalf("source failure: apply status=%d, want 1:\n%s", res.ExitCode, res.Output)
+			t.Fatalf("source failure: apply exited %d, want 1", res.ExitCode)
 		}
-		requireResourceOutput(t, res.Output, tc.wantError)
+		requireOutput(t, res.Output, tc.wantError)
 		return
 	}
 
@@ -297,7 +294,7 @@ func checkResourceSelection(t *testing.T, s *server, repo, kind string, tc resou
 	manifest["targets"] = map[string]any{"record": target}
 	out := c.ok(t, "apply", manifestYAML(t, manifest))
 	if tc.hold {
-		requireResourceOutput(t, out, "matches the age filter yet")
+		requireOutput(t, out, "matches the age filter yet")
 		assertResourceFile(t, c.runner.Dir, resourceOutput, resourceUntouched)
 		return
 	}
@@ -318,7 +315,7 @@ func testResourceConditions(t *testing.T, s *server, repo, kind, field, present 
 		{name: "failwhen-missing", explicit: resourceMissing, failWhen: true, wantPassed: true},
 		{name: "failwhen-present", explicit: present, failWhen: true},
 	} {
-		t.Run("condition/"+tc.name, func(t *testing.T) {
+		runRequired(t, "condition/"+tc.name, func(t *testing.T) {
 			c := newCLI(t, s)
 			writeResourceFile(t, c.runner.Dir, resourceOutput, resourceUntouched)
 			spec := map[string]any{}
@@ -354,7 +351,7 @@ func testResourceConditions(t *testing.T, s *server, repo, kind, field, present 
 
 func testUnsupportedRefTarget(t *testing.T, s *server, repo, kind, wantError string) {
 	t.Helper()
-	t.Run("target/unsupported", func(t *testing.T) {
+	runRequired(t, "target/unsupported", func(t *testing.T) {
 		c := newCLI(t, s)
 		target := resourceNode(s, repo, kind, map[string]any{kind: resourceMissing})
 		target["disablesourceinput"] = true
@@ -363,9 +360,9 @@ func testUnsupportedRefTarget(t *testing.T, s *server, repo, kind, wantError str
 			"targets": map[string]any{"unsupported": target},
 		}))
 		if res.ExitCode != 1 {
-			t.Fatalf("unsupported target: apply status=%d, want 1:\n%s", res.ExitCode, res.Output)
+			t.Fatalf("unsupported target: apply exited %d, want 1", res.ExitCode)
 		}
-		requireResourceOutput(t, res.Output, wantError)
+		requireOutput(t, res.Output, wantError)
 	})
 }
 
@@ -401,34 +398,6 @@ func assertResourceFile(t *testing.T, dir, file, want string) {
 	if string(content) != want {
 		t.Fatalf("%s = %q, want %q", file, content, want)
 	}
-}
-
-func requireResourceOutput(t *testing.T, output, want string) {
-	t.Helper()
-	if !strings.Contains(output, want) {
-		t.Fatalf("CLI output does not contain %q:\n%s", want, output)
-	}
-}
-
-func resourceReleaseReady(t *testing.T, r *repository, branch string) map[string]string {
-	t.Helper()
-	refs := r.refs(t)
-	want := refs["refs/heads/"+branch]
-	require.NotEmpty(t, want, "remote Git branch %s is missing", branch)
-	// Forgejo can accept Git pushes before the API sees a nonempty repository.
-	// Wait for the repository and commitish via REST; never retry a release write.
-	s := r.server
-	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
-	defer cancel()
-	require.Eventually(t, func() bool {
-		repo, _, err := s.client.Repositories.GetRepo(ctx, s.owner, r.name)
-		if err != nil || repo == nil || repo.Empty {
-			return false
-		}
-		ref, _, err := s.client.Repositories.GetRepoBranch(ctx, s.owner, r.name, branch)
-		return err == nil && ref != nil && ref.Commit != nil && ref.Commit.ID == want
-	}, 15*time.Second, 100*time.Millisecond, "forge REST API did not recognize the seeded repository and %s at %s", branch, want)
-	return refs
 }
 
 func readResourceReleases(t *testing.T, s *server, repo string) []*gitea.Release {

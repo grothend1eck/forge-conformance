@@ -102,7 +102,7 @@ runs:
 		{"github/action", "version", false},
 		{"github/action", "digest", true},
 	} {
-		t.Run(tc.crawler+"/"+tc.mode, func(t *testing.T) {
+		runRequired(t, tc.crawler+"/"+tc.mode, func(t *testing.T) {
 			c := newCLI(t, s)
 			manifest := manifestYAML(t, map[string]any{
 				"name": "Discover local forge actions",
@@ -173,17 +173,17 @@ runs:
 			diff := c.ok(t, "diff", manifest, "--disable-changelog")
 			for _, f := range files {
 				if got := readWorkflowFixture(t, c.runner.Dir, f.path); got != initial[f.path] {
-					t.Fatalf("diff changed %s:\n%s", f.path, got)
+					t.Fatalf("diff changed %s", f.path)
 				}
 			}
 			c.ok(t, "apply", manifest, "--disable-changelog", "--commit=false", "--push=false")
 			for _, f := range files {
 				if f.wantRef == "" {
 					if strings.Contains(diff, fmt.Sprintf("in file %q", f.path)) {
-						t.Errorf("diff proposed a change to neighboring workflow %s:\n%s", f.path, diff)
+						t.Errorf("diff proposed a change to neighboring workflow %s", f.path)
 					}
 					if got := readWorkflowFixture(t, c.runner.Dir, f.path); got != initial[f.path] {
-						t.Errorf("neighboring workflow %s changed:\n%s", f.path, got)
+						t.Errorf("neighboring workflow %s changed", f.path)
 					}
 					continue
 				}
@@ -199,7 +199,7 @@ runs:
 					wantDiff = fmt.Sprintf("already set to %q, from file %q", wantUses, f.path)
 				}
 				if !strings.Contains(diff, wantDiff) {
-					t.Errorf("diff did not propose %s:\n%s", wantDiff, diff)
+					t.Errorf("diff did not propose %s", wantDiff)
 				}
 				if f.path == composite {
 					assertCompositeUses(t, c.runner.Dir, f.path, wantUses, comment)

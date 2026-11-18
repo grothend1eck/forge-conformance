@@ -26,212 +26,176 @@ const (
 )
 
 func testProtectedMerge(t *testing.T, s *server) {
-	runProtectedMerge(t, giteaMergeOpener(s))
-}
-
-func testManualMerge(t *testing.T, s *server) {
-	runMergeNegative(t, giteaMergeOpener(s), "protected-manual", "manual", false)
-}
-
-func testDraft(t *testing.T, s *server) {
-	runMergeNegative(t, giteaMergeOpener(s), "protected-draft", "auto", true)
-}
-
-type mergeCaseSpec struct {
-	pipelineID, strategy string
-	draft                bool
-	defaultSquash        bool // configure the repository and omit the action's mergemethod
-}
-
-type openMergeFixture func(t *testing.T, spec mergeCaseSpec) protectedMergeFixture
-
-// A fixture prepares the protected branch and runs one real apply when opened.
-// After that, only postStatus writes; none of the fixtures can request a merge.
-type protectedMergeFixture interface {
-	seed() mergeSeed
-	snapshot(t *testing.T, phase string) mergeSnapshot
-	requestCount(t *testing.T, phase string) int
-	postStatus(t *testing.T, sha, check, state string) mergeStatus
-	latestStatus(t *testing.T, sha, check string) mergeStatus
-	schedule(t *testing.T, phase string) mergeSchedule
-	readCommit(t *testing.T, branch, sha string) (contents string, parents []string)
-}
-
-type mergeSeed struct {
-	baseBranch, baseTip, defaultTip string
-	title, actor, originalContents  string
-}
-
-type mergeSnapshot struct {
-	id, number                      int64
-	title, author                   string
-	baseBranch, headBranch, headSHA string
-	baseTip, defaultTip, headTip    string
-	open, draft, merged             bool
-	mergedSHA, mergedBy             string
-}
-
-type mergeStatus struct {
-	id                    int64
-	check, state, creator string
-}
-
-type mergeSchedule struct {
-	scheduledBy []string
-	canceled    bool
-}
-
-func runProtectedMerge(t *testing.T, open openMergeFixture) {
-	t.Run("observably_scheduled", func(t *testing.T) {
-		m := startMergeCase(t, open, mergeCaseSpec{pipelineID: "schedule-observer", strategy: "auto"})
+	runRequired(t, "observably_scheduled", func(t *testing.T) {
+		const id = "schedule-observer"
+		const title = "Acceptance: " + id
+		r, before := newProtectedMergeRepo(t, s)
+		newCLI(t, s).ok(t, "apply", requestManifest(t, r, id, "v1.1.0", map[string]any{
+			"title": title, "merge": map[string]any{"strategy": "auto"}, "mergemethod": "merge",
+		}))
+		opened := r.assertOpened(t, "after initial Updatecli apply", before, title, false)
 		const phase = "observe scheduling before status success"
-		m.assertScheduled(t, phase, true)
-		m.assertOpen(t, phase, m.snapshot(t, phase))
+		r.assertScheduledBy(t, phase, opened.number, s.owner)
+		assertOpen(t, phase, r.readMergeSnapshot(t, phase, opened.number), opened)
 	})
 
-	t.Run("merges_after_required_status", func(t *testing.T) {
-		m := startMergeCase(t, open, mergeCaseSpec{pipelineID: "protected-auto", strategy: "auto"})
-		head, base := m.initial.headSHA, m.original.baseTip
-		pending := m.publishStatus(t, head, requiredMergeCheck, "pending")
+	runRequired(t, "merges_after_required_status", func(t *testing.T) {
+		const id = "protected-auto"
+		const title = "Acceptance: " + id
+		r, before := newProtectedMergeRepo(t, s)
+		newCLI(t, s).ok(t, "apply", requestManifest(t, r, id, "v1.1.0", map[string]any{
+			"title": title, "merge": map[string]any{"strategy": "auto"}, "mergemethod": "merge",
+		}))
+		opened := r.assertOpened(t, "after initial Updatecli apply", before, title, false)
+		head, base := opened.headSHA, before.baseTip
+		pending := r.publishStatus(t, head, requiredMergeCheck, "pending")
 		// Neither a success on a different SHA nor a different context on the
 		// PR head can fulfill the required status for this head.
-		m.publishStatus(t, base, requiredMergeCheck, "success")
-		m.publishStatus(t, head, "acceptance/unrelated", "success")
-		m.assertUnmergedFor(t, "wrong SHA and wrong context have passed", time.Second)
-		if got := m.latestStatus(t, head, requiredMergeCheck); got != pending {
+		r.publishStatus(t, base, requiredMergeCheck, "success")
+		r.publishStatus(t, head, "acceptance/unrelated", "success")
+		r.assertUnmergedFor(t, "wrong SHA and wrong context have passed", opened, time.Second)
+		if got := r.latestStatus(t, head, requiredMergeCheck); got != pending {
 			t.Fatalf("after unrelated successes: required status on %s = %+v, want %+v", head, got, pending)
 		}
 
-		// Only the status fixture writes from here on. In particular, no
-		// Updatecli rerun, direct merge, or change to the protection rule.
-		m.publishStatus(t, head, requiredMergeCheck, "success")
-		m.awaitMerged(t, base, head)
+		// No second apply, direct merge, or change to the protection rule:
+		// only the independent status actor writes after the initial apply.
+		r.publishStatus(t, head, requiredMergeCheck, "success")
+		r.awaitMerged(t, opened, base, head)
 	})
 
-	t.Run("repository_merge_method", func(t *testing.T) {
-		m := startMergeCase(t, open, mergeCaseSpec{
-			pipelineID: "protected-repo-default", strategy: "auto", defaultSquash: true,
-		})
-		m.publishStatus(t, m.initial.headSHA, requiredMergeCheck, "success")
+	runRequired(t, "repository_merge_method", func(t *testing.T) {
+		const id = "protected-repo-default"
+		const title = "Acceptance: " + id
+		r, before := newProtectedMergeRepo(t, s)
+		r.configureDefaultSquash(t)
+		// Omit mergemethod so the forge's configured default must be used.
+		newCLI(t, s).ok(t, "apply", requestManifest(t, r, id, "v1.1.0", map[string]any{
+			"title": title, "merge": map[string]any{"strategy": "auto"},
+		}))
+		opened := r.assertOpened(t, "after initial Updatecli apply", before, title, false)
+		r.publishStatus(t, opened.headSHA, requiredMergeCheck, "success")
 		// Squash creates a new commit whose only parent is the old base.
-		m.awaitMerged(t, m.original.baseTip)
+		r.awaitMerged(t, opened, before.baseTip)
 	})
 }
 
-func runMergeNegative(t *testing.T, open openMergeFixture, pipelineID, strategy string, draft bool) {
-	m := startMergeCase(t, open, mergeCaseSpec{pipelineID: pipelineID, strategy: strategy, draft: draft})
-	m.publishStatus(t, m.initial.headSHA, requiredMergeCheck, "success")
-	phase := pipelineID + " after required status success"
-	m.assertUnmergedFor(t, phase, 2*time.Second)
-	m.assertScheduled(t, phase, false)
+func testManualMerge(t *testing.T, s *server) {
+	const id = "protected-manual"
+	const title = "Acceptance: " + id
+	r, before := newProtectedMergeRepo(t, s)
+	newCLI(t, s).ok(t, "apply", requestManifest(t, r, id, "v1.1.0", map[string]any{
+		"title": title, "merge": map[string]any{"strategy": "manual"}, "mergemethod": "merge",
+	}))
+	opened := r.assertOpened(t, "after initial Updatecli apply", before, title, false)
+	r.publishStatus(t, opened.headSHA, requiredMergeCheck, "success")
+	const phase = id + " after required status success"
+	r.assertUnmergedFor(t, phase, opened, 2*time.Second)
+	r.assertScheduledBy(t, phase, opened.number)
 }
 
-type protectedMergeCase struct {
-	protectedMergeFixture
-	original mergeSeed
-	initial  mergeSnapshot
+func testDraft(t *testing.T, s *server) {
+	const id = "protected-draft"
+	// Both pinned releases derive the draft flag from the WIP title.
+	const title = "WIP: Acceptance: " + id
+	r, before := newProtectedMergeRepo(t, s)
+	newCLI(t, s).ok(t, "apply", requestManifest(t, r, id, "v1.1.0", map[string]any{
+		"title": title, "merge": map[string]any{"strategy": "auto"}, "mergemethod": "merge",
+	}))
+	opened := r.assertOpened(t, "after initial Updatecli apply", before, title, true)
+	r.publishStatus(t, opened.headSHA, requiredMergeCheck, "success")
+	const phase = id + " after required status success"
+	r.assertUnmergedFor(t, phase, opened, 2*time.Second)
+	r.assertScheduledBy(t, phase, opened.number)
 }
 
-func startMergeCase(t *testing.T, open openMergeFixture, spec mergeCaseSpec) protectedMergeCase {
+type mergeSeed struct {
+	baseTip, defaultTip string
+}
+
+func newProtectedMergeRepo(t *testing.T, s *server) (*repository, mergeSeed) {
 	t.Helper()
-	const phase = "after initial Updatecli apply"
-	f := open(t, spec)
-	m := protectedMergeCase{f, f.seed(), f.snapshot(t, phase)}
-	if m.original.baseTip == "" || m.original.defaultTip == "" || m.original.originalContents != mergeFixtureBefore {
-		t.Fatal("before initial Updatecli apply: unexpected seeded Git state")
+	r := s.newRepo(t)
+	r.protectBase(t)
+	refs := r.refs(t)
+	before := mergeSeed{baseTip: refs["refs/heads/"+r.base], defaultTip: refs["refs/heads/main"]}
+	if before.baseTip == "" || before.defaultTip == "" {
+		t.Fatalf("before apply: missing seeded Git refs: %+v", before)
 	}
-	pr := m.initial
-	if pr.draft != spec.draft || pr.author != m.original.actor ||
-		pr.id <= 0 || pr.number <= 0 || pr.headBranch == "" || pr.headBranch == m.original.baseBranch ||
-		pr.headSHA == "" || pr.headSHA == m.original.baseTip {
-		t.Fatalf("%s: unexpected PR identity, actor, draft state or head: %+v", phase, pr)
+	if got := r.git(t, "show", before.baseTip+":version.yaml"); got != mergeFixtureBefore {
+		t.Fatalf("before apply: base version.yaml = %q, want %q", got, mergeFixtureBefore)
 	}
-	m.assertOpen(t, phase, pr)
-	if got := m.requestCount(t, phase); got != 1 {
-		t.Fatalf("%s: expected one request, got %d", phase, got)
+	return r, before
+}
+
+func (r *repository) assertOpened(t *testing.T, phase string, before mergeSeed, title string, draft bool) mergeSnapshot {
+	t.Helper()
+	prs := r.listRequests(t, phase)
+	if len(prs) != 1 || prs[0] == nil || prs[0].ID <= 0 || prs[0].Index <= 0 {
+		t.Fatalf("%s: expected one request with a valid ID and number, got %d requests", phase, len(prs))
 	}
-	if got, _ := m.readCommit(t, pr.headBranch, pr.headSHA); got != mergeFixtureAfter {
-		t.Fatalf("%s: head version.yaml = %q, want %q", phase, got, mergeFixtureAfter)
+	pr := r.readMergeSnapshot(t, phase, prs[0].Index)
+	if pr.headBranch == "" || pr.headBranch == r.base || pr.headSHA == "" || pr.headSHA == before.baseTip {
+		t.Fatalf("%s: expected a distinct PR head, got %+v", phase, pr)
 	}
-	if got := m.latestStatus(t, pr.headSHA, requiredMergeCheck); got.id != 0 {
+	assertOpen(t, phase, pr, mergeSnapshot{
+		id: prs[0].ID, number: prs[0].Index, title: title, author: r.server.owner,
+		baseBranch: r.base, baseTip: before.baseTip, defaultTip: before.defaultTip,
+		headBranch: pr.headBranch, headSHA: pr.headSHA, headTip: pr.headSHA, open: true, draft: draft,
+	})
+	if contents, parents := r.readCommit(t, pr.headBranch, pr.headSHA); contents != mergeFixtureAfter ||
+		!slices.Equal(parents, []string{before.baseTip}) {
+		t.Fatalf("%s: head version.yaml = %q, parents = %v; want %q and [%s]",
+			phase, contents, parents, mergeFixtureAfter, before.baseTip)
+	}
+	if got := r.latestStatus(t, pr.headSHA, requiredMergeCheck); got.id != 0 {
 		t.Fatalf("%s: required status on %s must initially be absent, got %+v", phase, pr.headSHA, got)
 	}
-	return m
+	return pr
 }
 
-func (m protectedMergeCase) assertIdentity(t *testing.T, phase string, got mergeSnapshot) {
+func assertOpen(t *testing.T, phase string, got, want mergeSnapshot) {
 	t.Helper()
-	if got.id != m.initial.id || got.number != m.initial.number || got.baseBranch != m.original.baseBranch ||
-		got.title != m.original.title || got.draft != m.initial.draft {
-		t.Fatalf("%s: request #%d no longer has the expected identity, target, title and draft state: %+v", phase, m.initial.number, got)
-	}
-	if got.defaultTip != m.original.defaultTip {
-		t.Fatalf("%s: non-target default branch moved from %s to %q", phase, m.original.defaultTip, got.defaultTip)
+	if got != want {
+		t.Fatalf("%s: expected the request to remain open at the expected refs:\n got %+v\nwant %+v", phase, got, want)
 	}
 }
 
-func (m protectedMergeCase) assertOpen(t *testing.T, phase string, got mergeSnapshot) {
-	t.Helper()
-	m.assertIdentity(t, phase, got)
-	if !got.open || got.merged || got.headBranch != m.initial.headBranch || got.headSHA != m.initial.headSHA ||
-		got.headTip != m.initial.headSHA || got.baseTip != m.original.baseTip {
-		t.Fatalf("%s: want request open and unmerged at %s with base %s unchanged, got %+v", phase, m.initial.headSHA, m.original.baseTip, got)
-	}
-}
-
-func (m protectedMergeCase) publishStatus(t *testing.T, sha, check, state string) mergeStatus {
-	t.Helper()
-	status := m.postStatus(t, sha, check, state)
-	if status.id <= 0 || status.check != check || status.state != state || status.creator == "" || status.creator == m.original.actor {
-		t.Fatalf("post %s status %s on %s: want %q from independent status actor, got %+v", state, check, sha, check, status)
-	}
-	if got := m.latestStatus(t, sha, check); got != status {
-		t.Fatalf("read %s status on exact SHA %s: got %+v, want %+v", check, sha, got, status)
-	}
-	return status
-}
-
-func (m protectedMergeCase) assertScheduled(t *testing.T, phase string, want bool) {
-	t.Helper()
-	got := m.schedule(t, phase)
-	if got.canceled || (want && !slices.Equal(got.scheduledBy, []string{m.original.actor})) ||
-		(!want && len(got.scheduledBy) != 0) {
-		t.Fatalf("%s: request #%d native schedule want=%t (actor %q), got %+v", phase, m.initial.number, want, m.original.actor, got)
-	}
-}
-
-func (m protectedMergeCase) assertUnmergedFor(t *testing.T, phase string, duration time.Duration) {
+func (r *repository) assertUnmergedFor(t *testing.T, phase string, opened mergeSnapshot, duration time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(duration)
 	for {
-		m.assertOpen(t, phase, m.snapshot(t, phase))
+		assertOpen(t, phase, r.readMergeSnapshot(t, phase, opened.number), opened)
 		if time.Now().After(deadline) {
 			break
 		}
 		time.Sleep(mergePollInterval)
 	}
-	if got := m.requestCount(t, phase); got != 1 {
+	if got := len(r.listRequests(t, phase)); got != 1 {
 		t.Fatalf("%s: expected one request, got %d", phase, got)
 	}
 }
 
-func (m protectedMergeCase) awaitMerged(t *testing.T, wantParents ...string) {
+func (r *repository) awaitMerged(t *testing.T, opened mergeSnapshot, wantParents ...string) {
 	t.Helper()
 	const phase = "await automatic merge after required status success"
 	deadline := time.Now().Add(mergeWaitTimeout)
 	for {
-		pr := m.snapshot(t, phase)
-		m.assertIdentity(t, phase, pr)
-		if pr.merged && !pr.open && pr.baseTip != "" && pr.baseTip != m.original.baseTip {
-			if pr.mergedSHA != pr.baseTip || pr.mergedBy != m.original.actor || m.requestCount(t, phase) != 1 {
-				t.Fatalf("%s: expected the sole original request merged by %q at the remote base tip, got %+v", phase, m.original.actor, pr)
+		pr := r.readMergeSnapshot(t, phase, opened.number)
+		if pr.id != opened.id || pr.number != opened.number || pr.baseBranch != opened.baseBranch ||
+			pr.title != opened.title || pr.draft != opened.draft || pr.author != opened.author || pr.defaultTip != opened.defaultTip {
+			t.Fatalf("%s: request identity or default branch changed:\n got %+v\nwas %+v", phase, pr, opened)
+		}
+		if pr.merged && !pr.open && pr.baseTip != "" && pr.baseTip != opened.baseTip {
+			if pr.mergedSHA != pr.baseTip || pr.mergedBy != r.server.owner || len(r.listRequests(t, phase)) != 1 {
+				t.Fatalf("%s: expected the sole original request merged by %q at the remote base tip, got %+v", phase, r.server.owner, pr)
 			}
-			if pr.baseTip == m.initial.headSHA {
+			if pr.baseTip == opened.headSHA {
 				t.Fatalf("%s: base fast-forwarded to %s instead of creating a new commit", phase, pr.baseTip)
 			}
 			// Read the actual Git parents and file, independent of the API's
 			// post-merge head. The expected parents depend on the merge method.
-			contents, parents := m.readCommit(t, m.original.baseBranch, pr.baseTip)
+			contents, parents := r.readCommit(t, r.base, pr.baseTip)
 			if !slices.Equal(parents, wantParents) {
 				t.Fatalf("%s: merge parents %v, want %v", phase, parents, wantParents)
 			}
@@ -241,72 +205,40 @@ func (m protectedMergeCase) awaitMerged(t *testing.T, wantParents ...string) {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("%s: checked head %s, last view %+v", phase, m.initial.headSHA, pr)
+			t.Fatalf("%s: checked head %s, last view %+v", phase, opened.headSHA, pr)
 		}
 		time.Sleep(mergePollInterval)
 	}
 }
 
-// Gitea 28.2.0 and Forgejo 17.0.0 implement the same Updatecli action and
-// similar APIs; keep their wire and Git readback details in this adapter.
-type giteaMergeFixture struct {
-	s      *server
-	r      *repository
-	number int64
-	before mergeSeed
+func (r *repository) publishStatus(t *testing.T, sha, check, state string) mergeStatus {
+	t.Helper()
+	status := r.postStatus(t, sha, check, state)
+	if status.id <= 0 || status.check != check || status.state != state || status.creator == "" || status.creator == r.server.owner {
+		t.Fatalf("post %s status %s on %s: want %q from independent status actor, got %+v", state, check, sha, check, status)
+	}
+	if got := r.latestStatus(t, sha, check); got != status {
+		t.Fatalf("read %s status on exact SHA %s: got %+v, want %+v", check, sha, got, status)
+	}
+	return status
 }
 
-func giteaMergeOpener(s *server) openMergeFixture {
-	return func(t *testing.T, spec mergeCaseSpec) protectedMergeFixture {
-		t.Helper()
-		r := s.newRepo(t)
-		p := &giteaMergeFixture{s: s, r: r}
-		p.protectBase(t)
-		if spec.defaultSquash {
-			p.configureDefaultSquash(t)
-		}
-		refs := r.refs(t)
-		p.before = mergeSeed{
-			baseBranch: r.base, baseTip: refs["refs/heads/"+r.base], defaultTip: refs["refs/heads/main"],
-			title: "Acceptance: " + spec.pipelineID, actor: s.owner,
-		}
-		if spec.draft {
-			// Both pinned releases derive the API draft flag from the WIP
-			// title prefix. Updatecli has no separate draft option here.
-			p.before.title = "WIP: " + p.before.title
-		}
-		if p.before.baseTip == "" {
-			t.Fatal("seed before apply: missing remote base ref")
-		}
-		p.before.originalContents = r.git(t, "show", p.before.baseTip+":version.yaml")
-		action := map[string]any{
-			"title": p.before.title,
-			"merge": map[string]any{"strategy": spec.strategy},
-		}
-		if !spec.defaultSquash {
-			action["mergemethod"] = "merge"
-		}
-		t.Logf("apply %s strategy on protected %s (draft=%t, repository merge method=%t)", spec.strategy, r.base, spec.draft, spec.defaultSquash)
-		newCLI(t, s).ok(t, "apply", requestManifest(r, spec.pipelineID, "v1.1.0", action))
-		const phase = "identify request after Updatecli apply"
-		prs := p.listRequests(t, phase)
-		if len(prs) != 1 || prs[0] == nil {
-			t.Fatalf("%s: expected one request, got %d", phase, len(prs))
-		}
-		p.number = prs[0].Index
-		return p
+func (r *repository) assertScheduledBy(t *testing.T, phase string, number int64, want ...string) {
+	t.Helper()
+	got := r.readMergeSchedule(t, phase, number)
+	if got.canceled || !slices.Equal(got.scheduledBy, want) {
+		t.Fatalf("%s: request #%d native schedule = %+v, want actors %q and no cancellation", phase, number, got, want)
 	}
 }
 
-func (p *giteaMergeFixture) seed() mergeSeed { return p.before }
-
-func (p *giteaMergeFixture) configureDefaultSquash(t *testing.T) {
+func (r *repository) configureDefaultSquash(t *testing.T) {
 	t.Helper()
-	repos := p.s.client.Repositories
+	s := r.server
+	repos := s.client.Repositories
 	// Leave regular merge available so choosing squash is not forced by
 	// repository policy. Disallow rebase and fast-forward as alternate ways
 	// of getting a linear history.
-	_, resp, err := repos.EditRepo(t.Context(), p.s.owner, p.r.name, giteasdk.EditRepoOption{
+	_, resp, err := repos.EditRepo(t.Context(), s.owner, r.name, giteasdk.EditRepoOption{
 		DefaultMergeStyle:         new(giteasdk.MergeStyleSquash),
 		AllowMerge:                new(true),
 		AllowSquash:               new(true),
@@ -315,11 +247,11 @@ func (p *giteaMergeFixture) configureDefaultSquash(t *testing.T) {
 		AllowFastForwardOnlyMerge: new(false),
 	})
 	if err != nil {
-		p.s.apiFailure(t, "configure repository default squash before apply", resp, err)
+		s.apiFailure(t, "configure repository default squash before apply", resp, err)
 	}
-	repo, resp, err := repos.GetRepo(t.Context(), p.s.owner, p.r.name)
+	repo, resp, err := repos.GetRepo(t.Context(), s.owner, r.name)
 	if err != nil {
-		p.s.apiFailure(t, "read back repository default squash before apply", resp, err)
+		s.apiFailure(t, "read back repository default squash before apply", resp, err)
 	}
 	if repo.DefaultMergeStyle != giteasdk.MergeStyleSquash || !repo.AllowMerge || !repo.AllowSquash ||
 		repo.AllowRebase || repo.AllowRebaseMerge || repo.AllowFastForwardOnlyMerge {
@@ -328,8 +260,9 @@ func (p *giteaMergeFixture) configureDefaultSquash(t *testing.T) {
 	}
 }
 
-func (p *giteaMergeFixture) protectBase(t *testing.T) {
+func (r *repository) protectBase(t *testing.T) {
 	t.Helper()
+	s := r.server
 	// SDK v1.4.0 models Gitea's block_admin_merge_override but not Forgejo's
 	// apply_to_admins. Use the public JSON endpoints to set and read back the
 	// provider's actual no-bypass rule. The shared fixture verifies the
@@ -344,36 +277,37 @@ func (p *giteaMergeFixture) protectBase(t *testing.T) {
 		ApplyToAdmins     bool     `json:"apply_to_admins,omitempty"`
 		BypassAllowlist   bool     `json:"enable_bypass_allowlist"`
 	}
-	want := rule{Name: p.r.base, EnableStatusCheck: true, Contexts: []string{requiredMergeCheck}}
-	switch p.s.provider {
+	want := rule{Name: r.base, EnableStatusCheck: true, Contexts: []string{requiredMergeCheck}}
+	switch s.provider {
 	case "gitea":
 		want.BlockOverride = true
 	case "forgejo":
 		want.ApplyToAdmins = true
 	default:
-		t.Fatalf("setup protection: no rule for provider %q", p.s.provider)
+		t.Fatalf("setup protection: no rule for provider %q", s.provider)
 	}
-	p.protectionRequest(t, http.MethodPost, "", want, http.StatusCreated, nil)
+	r.protectionRequest(t, http.MethodPost, "", want, http.StatusCreated, nil)
 	var got rule
-	p.protectionRequest(t, http.MethodGet, "/"+url.PathEscape(p.r.base), nil, http.StatusOK, &got)
+	r.protectionRequest(t, http.MethodGet, "/"+url.PathEscape(r.base), nil, http.StatusOK, &got)
 	if got.Name != want.Name || got.EnablePush || got.PushAllowlist || got.BypassAllowlist ||
 		!got.EnableStatusCheck || !slices.Equal(got.Contexts, want.Contexts) ||
 		got.BlockOverride != want.BlockOverride || got.ApplyToAdmins != want.ApplyToAdmins {
 		t.Fatalf("read back branch protection before apply: got %+v, want %+v", got, want)
 	}
-	branch, resp, err := p.s.client.Repositories.GetRepoBranch(t.Context(), p.s.owner, p.r.name, p.r.base)
+	branch, resp, err := s.client.Repositories.GetRepoBranch(t.Context(), s.owner, r.name, r.base)
 	if err != nil {
-		p.s.apiFailure(t, "read effective protection before apply", resp, err)
+		s.apiFailure(t, "read effective protection before apply", resp, err)
 	}
-	if !branch.Protected || !branch.EnableStatusCheck || branch.EffectiveBranchProtectionName != p.r.base ||
+	if !branch.Protected || !branch.EnableStatusCheck || branch.EffectiveBranchProtectionName != r.base ||
 		branch.UserCanPush || !slices.Equal(branch.StatusCheckContexts, want.Contexts) {
 		t.Fatalf("read effective protection before apply: %s protected=%t rule=%q pushable=%t check enabled=%t contexts=%v",
-			p.r.base, branch.Protected, branch.EffectiveBranchProtectionName, branch.UserCanPush, branch.EnableStatusCheck, branch.StatusCheckContexts)
+			r.base, branch.Protected, branch.EffectiveBranchProtectionName, branch.UserCanPush, branch.EnableStatusCheck, branch.StatusCheckContexts)
 	}
 }
 
-func (p *giteaMergeFixture) protectionRequest(t *testing.T, method, suffix string, in any, wantStatus int, out any) {
+func (r *repository) protectionRequest(t *testing.T, method, suffix string, in any, wantStatus int, out any) {
 	t.Helper()
+	s := r.server
 	phase := method + " branch protection before apply"
 	var body []byte
 	if in != nil {
@@ -385,13 +319,13 @@ func (p *giteaMergeFixture) protectionRequest(t *testing.T, method, suffix strin
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	endpoint := strings.TrimRight(p.s.url, "/") + "/api/v1/repos/" + url.PathEscape(p.s.owner) + "/" + url.PathEscape(p.r.name) + "/branch_protections" + suffix
+	endpoint := strings.TrimRight(s.url, "/") + "/api/v1/repos/" + url.PathEscape(s.owner) + "/" + url.PathEscape(r.name) + "/branch_protections" + suffix
 	req, err := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("%s: could not construct fixture request (%T)", phase, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "token "+p.s.token)
+	req.Header.Set("Authorization", "token "+s.token)
 	resp, err := (&http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
 		return http.ErrUseLastResponse
 	}}).Do(req)
@@ -409,35 +343,41 @@ func (p *giteaMergeFixture) protectionRequest(t *testing.T, method, suffix strin
 	}
 }
 
-func (p *giteaMergeFixture) listRequests(t *testing.T, phase string) []*giteasdk.PullRequest {
+func (r *repository) listRequests(t *testing.T, phase string) []*giteasdk.PullRequest {
 	t.Helper()
-	prs, resp, err := p.s.client.PullRequests.ListRepoPullRequests(t.Context(), p.s.owner, p.r.name, giteasdk.ListPullRequestsOptions{
+	s := r.server
+	prs, resp, err := s.client.PullRequests.ListRepoPullRequests(t.Context(), s.owner, r.name, giteasdk.ListPullRequestsOptions{
 		State: giteasdk.StateAll,
 	})
 	if err != nil {
-		p.s.apiFailure(t, phase+": list PRs", resp, err)
+		s.apiFailure(t, phase+": list PRs", resp, err)
 	}
 	return prs
 }
 
-func (p *giteaMergeFixture) requestCount(t *testing.T, phase string) int {
-	t.Helper()
-	return len(p.listRequests(t, phase))
+type mergeSnapshot struct {
+	id, number                      int64
+	title, author                   string
+	baseBranch, headBranch, headSHA string
+	baseTip, defaultTip, headTip    string
+	open, draft, merged             bool
+	mergedSHA, mergedBy             string
 }
 
-func (p *giteaMergeFixture) snapshot(t *testing.T, phase string) mergeSnapshot {
+func (r *repository) readMergeSnapshot(t *testing.T, phase string, number int64) mergeSnapshot {
 	t.Helper()
-	pr, resp, err := p.s.client.PullRequests.GetPullRequest(t.Context(), p.s.owner, p.r.name, p.number)
+	s := r.server
+	pr, resp, err := s.client.PullRequests.GetPullRequest(t.Context(), s.owner, r.name, number)
 	if err != nil {
-		p.s.apiFailure(t, fmt.Sprintf("%s: read PR #%d", phase, p.number), resp, err)
+		s.apiFailure(t, fmt.Sprintf("%s: read PR #%d", phase, number), resp, err)
 	}
 	if pr == nil || pr.Base == nil {
-		t.Fatalf("%s: PR #%d is missing base metadata", phase, p.number)
+		t.Fatalf("%s: PR #%d is missing base metadata", phase, number)
 	}
-	refs := p.r.refs(t)
+	refs := r.refs(t)
 	got := mergeSnapshot{
 		id: pr.ID, number: pr.Index, title: pr.Title, author: mergeUsername(pr.Poster),
-		baseBranch: pr.Base.Ref, baseTip: refs["refs/heads/"+p.r.base], defaultTip: refs["refs/heads/main"],
+		baseBranch: pr.Base.Ref, baseTip: refs["refs/heads/"+r.base], defaultTip: refs["refs/heads/main"],
 		open: pr.State == giteasdk.StateOpen, draft: pr.Draft, merged: pr.HasMerged,
 		mergedBy: mergeUsername(pr.MergedBy),
 	}
@@ -461,36 +401,43 @@ func mergeUsername(user *giteasdk.User) string {
 	return ""
 }
 
-func (p *giteaMergeFixture) readCommit(t *testing.T, branch, sha string) (string, []string) {
+func (r *repository) readCommit(t *testing.T, branch, sha string) (string, []string) {
 	t.Helper()
-	p.r.git(t, "fetch", "--no-tags", "origin", "refs/heads/"+branch)
-	parents := strings.Fields(p.r.git(t, "show", "-s", "--format=%P", sha))
-	return p.r.git(t, "show", sha+":version.yaml"), parents
+	r.git(t, "fetch", "--no-tags", "origin", "refs/heads/"+branch)
+	parents := strings.Fields(r.git(t, "show", "-s", "--format=%P", sha))
+	return r.git(t, "show", sha+":version.yaml"), parents
 }
 
-func (p *giteaMergeFixture) postStatus(t *testing.T, sha, check, state string) mergeStatus {
+type mergeStatus struct {
+	id                    int64
+	check, state, creator string
+}
+
+func (r *repository) postStatus(t *testing.T, sha, check, state string) mergeStatus {
 	t.Helper()
+	s := r.server
 	phase := fmt.Sprintf("post fixture status %s for %s at %s", state, check, sha)
 	// The admin identity stands in for CI and never invokes a merge.
-	status, resp, err := p.s.admin.Repositories.CreateStatus(t.Context(), p.s.owner, p.r.name, sha, giteasdk.CreateStatusOption{
+	status, resp, err := s.admin.Repositories.CreateStatus(t.Context(), s.owner, r.name, sha, giteasdk.CreateStatusOption{
 		State:       giteasdk.StatusState(state),
 		Context:     check,
 		Description: "Acceptance fixture; no Actions runner",
 	})
 	if err != nil {
-		p.s.apiFailure(t, phase, resp, err)
+		s.apiFailure(t, phase, resp, err)
 	}
 	return normalizedMergeStatus(status)
 }
 
-func (p *giteaMergeFixture) latestStatus(t *testing.T, sha, check string) mergeStatus {
+func (r *repository) latestStatus(t *testing.T, sha, check string) mergeStatus {
 	t.Helper()
+	s := r.server
 	// Read actual statuses scoped to the full SHA, not a branch name or
 	// aggregate state (which may also contain unrelated contexts).
 	phase := fmt.Sprintf("read %s status on exact SHA %s", check, sha)
-	statuses, resp, err := p.s.client.Repositories.ListStatusesBySHA(t.Context(), p.s.owner, p.r.name, sha, giteasdk.ListStatusesOption{})
+	statuses, resp, err := s.client.Repositories.ListStatusesBySHA(t.Context(), s.owner, r.name, sha, giteasdk.ListStatusesOption{})
 	if err != nil {
-		p.s.apiFailure(t, phase, resp, err)
+		s.apiFailure(t, phase, resp, err)
 	}
 	// Both pinned servers sort `highestindex` in ascending order, and
 	// timestamps may tie. Select the newest status ID for this context.
@@ -510,18 +457,24 @@ func normalizedMergeStatus(status *giteasdk.Status) mergeStatus {
 	return mergeStatus{status.ID, status.Context, string(status.State), mergeUsername(status.Creator)}
 }
 
-func (p *giteaMergeFixture) schedule(t *testing.T, phase string) mergeSchedule {
+type mergeSchedule struct {
+	scheduledBy []string
+	canceled    bool
+}
+
+func (r *repository) readMergeSchedule(t *testing.T, phase string, number int64) mergeSchedule {
 	t.Helper()
+	s := r.server
 	// Both pinned providers persist the native event in
 	// services/automerge/automerge.go and expose it via the issue timeline.
-	events, resp, err := p.s.client.Issues.ListIssueTimeline(t.Context(), p.s.owner, p.r.name, p.number, giteasdk.ListIssueCommentOptions{})
+	events, resp, err := s.client.Issues.ListIssueTimeline(t.Context(), s.owner, r.name, number, giteasdk.ListIssueCommentOptions{})
 	if err != nil {
-		p.s.apiFailure(t, fmt.Sprintf("%s: read PR #%d timeline", phase, p.number), resp, err)
+		s.apiFailure(t, fmt.Sprintf("%s: read PR #%d timeline", phase, number), resp, err)
 	}
 	var got mergeSchedule
 	for _, event := range events {
 		if event == nil {
-			t.Fatalf("%s: PR #%d timeline contained an invalid event", phase, p.number)
+			t.Fatalf("%s: PR #%d timeline contained an invalid event", phase, number)
 		}
 		switch event.Type {
 		case "pull_scheduled_merge":

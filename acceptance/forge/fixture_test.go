@@ -222,56 +222,58 @@ func (s *server) newRepo(t *testing.T) *repository {
 	r.git(t, "push", "--set-upstream", "origin", "main")
 	r.git(t, "switch", "-c", r.base)
 	r.git(t, "push", "--set-upstream", "origin", r.base)
-	r.awaitSeed(t)
+	refs := r.awaitBranches(t, "main", r.base)
+	seed := strings.TrimSpace(r.git(t, "rev-parse", "HEAD"))
+	if refs["refs/heads/main"] != seed || refs["refs/heads/"+r.base] != seed {
+		t.Fatalf("both fixture branches must point to seed %s", seed)
+	}
 	r.assertNotPublic(t)
 	return r
 }
 
-func (r *repository) awaitSeed(t *testing.T) {
+// Git may acknowledge a push before the forge API reflects it. Wait on reads,
+// never by retrying the mutation under test.
+func (r *repository) awaitBranches(t *testing.T, branches ...string) map[string]string {
 	t.Helper()
 	s := r.server
-	seed := strings.TrimSpace(r.git(t, "rev-parse", "HEAD"))
 	refs := r.refs(t)
-	branches := []string{"main", r.base}
 	for _, branch := range branches {
-		if got := refs["refs/heads/"+branch]; got != seed {
-			t.Fatalf("%s remote %s tip = %q, want seed %s", s.provider, branch, got, seed)
+		if refs["refs/heads/"+branch] == "" {
+			t.Fatalf("fixture branch %s is missing from the remote", branch)
 		}
 	}
 
-	// The Git receive and API metadata can become visible at different
-	// times. Poll only reads; every seed mutation must succeed on its own.
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 	defer cancel()
 	tick := time.NewTicker(100 * time.Millisecond)
 	defer tick.Stop()
 	for {
 		label := "repository metadata"
 		repo, resp, err := s.client.Repositories.GetRepo(ctx, s.owner, r.name)
-		ready := err == nil && !repo.Empty && repo.DefaultBranch == "main"
-		if err == nil && !repo.Private {
+		ready := err == nil && repo != nil && !repo.Empty && repo.DefaultBranch == "main"
+		if repo != nil && !repo.Private {
 			t.Fatalf("%s repository %s unexpectedly public", s.provider, r.name)
 		}
 		if ready {
 			for _, branch := range branches {
 				var got *gitea.Branch
 				got, resp, err = s.client.Repositories.GetRepoBranch(ctx, s.owner, r.name, branch)
-				if err != nil || got.Name != branch || got.Commit == nil || got.Commit.ID != seed {
+				if err != nil || got == nil || got.Name != branch || got.Commit == nil || got.Commit.ID != refs["refs/heads/"+branch] {
 					ready, label = false, branch+" branch metadata"
 					break
 				}
 			}
 		}
 		if ready {
-			return
+			return refs
 		}
 		select {
 		case <-tick.C:
 		case <-ctx.Done():
 			if err != nil {
-				s.apiFailure(t, "wait for seeded "+label, resp, err)
+				s.apiFailure(t, "wait for "+label, resp, err)
 			}
-			t.Fatalf("%s %s: %s didn't reflect seed %s", s.provider, r.name, label, seed)
+			t.Fatalf("%s %s: %s didn't match the pushed refs", s.provider, r.name, label)
 		}
 	}
 }
