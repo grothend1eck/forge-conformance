@@ -22,6 +22,7 @@ jobs:
       CGO_ENABLED: '0'
     outputs:
       binaries: ${{ steps.upload.outputs.artifact-id }}
+      sha256: ${{ steps.digest.outputs.sha256 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -46,9 +47,10 @@ jobs:
           GOVERSION="$GOVERSION" goreleaser build --config .goreleaser.yml --snapshot --clean --single-target \
             --output "$RUNNER_TEMP/forge-bin/updatecli"
           git diff --exit-code -- go.mod go.sum
-          jq -e --arg commit "$(git rev-parse HEAD)" 'select(.commit == $commit) | {tag, version, commit}' dist/metadata.json
+          tag="$(jq -er '.tag' dist/metadata.json)"
+          git merge-base --is-ancestor "refs/tags/$tag" HEAD
+          jq -e --arg commit "$(git rev-parse HEAD)" 'select(.commit == $commit and .version == (.tag + "-next")) | {tag, version, commit}' dist/metadata.json
           jq -er '.version | strings | select(length > 0) | "version=\(.)"' dist/metadata.json >> "$GITHUB_OUTPUT"
-          sha256sum "$RUNNER_TEMP/forge-bin/updatecli"
       - name: Compile forge acceptance tests
         run: |
           go test -c -tags=acceptance -ldflags='-s -w' -o "$RUNNER_TEMP/forge-bin/forge.test" ./acceptance/forge
@@ -57,6 +59,12 @@ jobs:
           UPDATECLI_BIN: ${{ runner.temp }}/forge-bin/updatecli
           UPDATECLI_EXPECTED_VERSION: ${{ steps.snapshot.outputs.version }}
         run: go test -tags=acceptance,candidate -count=1 -v ./acceptance/internal/cli
+      - name: Identify tested candidate
+        id: digest
+        run: |
+          digest="$(sha256sum "$RUNNER_TEMP/forge-bin/updatecli")"
+          echo "$digest"
+          echo "sha256=${digest%% *}" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         id: upload
         with:
@@ -92,8 +100,10 @@ jobs:
         env:
           DOCKER_AUTH_CONFIG: '{}'
           DOCKER_CONFIG: ${{ runner.temp }}/forge-docker-config
+          CANDIDATE_SHA256: ${{ needs.build.outputs.sha256 }}
           UPDATECLI_TEST_FORGE: ${{ matrix.provider }}
           UPDATECLI_BIN: ${{ runner.temp }}/forge-bin/updatecli
         run: |
+          echo "$CANDIDATE_SHA256  updatecli" | sha256sum --check --strict
           chmod +x updatecli forge.test
           ./forge.test -test.v -test.timeout=12m -test.paniconexit0

@@ -120,6 +120,7 @@ func assertPublicationHead(t *testing.T, r *gitRepository, req publicationReques
 	require.Equal(t, wantRefs, refs, "the request head must match native Git, with all sibling refs untouched")
 
 	r.git(t, "fetch", "origin", headRef)
+	r.git(t, "merge-base", "--is-ancestor", baseSHA, req.headSHA)
 	require.Equal(t, "version.yaml", strings.TrimSpace(r.git(t, "diff", "--name-only", baseSHA, req.headSHA)))
 	require.Equal(t, "version: "+version+"\nkeep: untouched\n", r.git(t, "show", req.headSHA+":version.yaml"))
 	return refs

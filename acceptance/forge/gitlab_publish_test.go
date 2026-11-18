@@ -25,7 +25,11 @@ type gitLabPublicationDriver struct {
 
 func testGitLabPublish(t *testing.T, g *gitlabFixture) {
 	t.Helper()
-	const id = "publish"
+	const (
+		id           = "publish"
+		firstVersion = "v1.1.0"
+		nextVersion  = "v1.2.0"
+	)
 	project := g.newProject(t)
 	r := seedGitLabPublication(t, g, project)
 	d := &gitLabPublicationDriver{
@@ -36,9 +40,17 @@ func testGitLabPublish(t *testing.T, g *gitlabFixture) {
 			token:  g.token,
 		},
 	}
-	p := openPublication(t, r, d, project.ID, d.head, "v1.1.0")
+	p := openPublication(t, r, d, project.ID, d.head, firstVersion)
+	d.assertTitle(t, p.opened, firstVersion)
+
+	// Assert the identical apply's remote invariants, not a particular
+	// internal lookup call or log message.
 	p.reapply(t)
-	p.update(t, "v1.2.0")
+	d.assertTitle(t, p.opened, firstVersion)
+
+	// A push can advance the SHA without editing the MR itself.
+	p.update(t, nextVersion)
+	d.assertTitle(t, p.opened, nextVersion)
 }
 
 func seedGitLabPublication(t *testing.T, g *gitlabFixture, project *gitlabsdk.Project) *gitRepository {
@@ -50,13 +62,24 @@ func seedGitLabPublication(t *testing.T, g *gitlabFixture, project *gitlabsdk.Pr
 	r := newGitRepository(t, root, g.owner, g.token)
 	r.seed(t, root+"/"+project.PathWithNamespace+".git")
 	seedPublication(t, r)
+	head, _, _ := strings.Cut(r.git(t, "ls-remote", "--symref", "origin", "HEAD"), "\n")
+	require.Equal(t, "ref: refs/heads/main\tHEAD", head, "GitLab's advertised HEAD must point to main")
 
-	got, resp, err := g.client.Projects.GetProject(project.ID, nil, gitlabsdk.WithContext(t.Context()))
-	if err != nil {
-		gitLabAPIFailure(t, "get project after seeding", resp, err)
-	}
-	require.NotNil(t, got)
-	require.Equal(t, "main", redactCredential(got.DefaultBranch, g.owner, g.token), "GitLab default branch")
+	// The API's project metadata can lag behind the refs just pushed.
+	const timeout = 15 * time.Second
+	ctx, cancel := context.WithTimeout(t.Context(), timeout)
+	defer cancel()
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		got, resp, err := g.client.Projects.GetProject(project.ID, nil, gitlabsdk.WithContext(ctx))
+		if err != nil {
+			reportGitLabReadFailure(c, "get seeded project", resp, err)
+			return
+		}
+		if assert.NotNil(c, got) {
+			assert.False(c, got.EmptyRepo, "GitLab still reports the seeded project as empty")
+			assert.Equal(c, "main", redactCredential(got.DefaultBranch, g.owner, g.token), "GitLab default branch")
+		}
+	}, timeout, 250*time.Millisecond, "GitLab did not expose the seeded project metadata")
 	return r
 }
 
@@ -90,9 +113,28 @@ func (d *gitLabPublicationDriver) manifest(t *testing.T, version string) string 
 		"actions": map[string]any{
 			"request": map[string]any{
 				"kind": "gitlab/mergerequest", "scmid": "origin",
+				"spec": map[string]any{"title": gitLabPublicationTitle(version)},
 			},
 		},
 	})
+}
+
+func gitLabPublicationTitle(version string) string {
+	return "Bump the fixture to " + version
+}
+
+func (d *gitLabPublicationDriver) assertTitle(t *testing.T, opened publicationRequest, version string) {
+	t.Helper()
+	g := d.fixture
+	mr, resp, err := g.client.MergeRequests.GetMergeRequest(d.project.ID, opened.number, nil, gitlabsdk.WithContext(t.Context()))
+	if err != nil {
+		gitLabAPIFailure(t, "read published MR title", resp, err)
+	}
+	require.NotNil(t, mr)
+	require.Equal(t, d.project.ID, mr.ProjectID)
+	require.Equal(t, opened.id, mr.ID)
+	require.Equal(t, opened.number, mr.IID)
+	require.Equal(t, gitLabPublicationTitle(version), redactCredential(mr.Title, g.owner, g.token), "title of the original GitLab MR !%d", opened.number)
 }
 
 func (d *gitLabPublicationDriver) requests(t *testing.T) []publicationRequest {
@@ -156,11 +198,7 @@ func readGitLabPublicationRequest(t *testing.T, g *gitlabFixture, projectID int6
 	require.EventuallyWithT(t, func(c *assert.CollectT) {
 		got, resp, err := g.client.MergeRequests.GetMergeRequest(projectID, listed.IID, nil, gitlabsdk.WithContext(ctx))
 		if err != nil {
-			if resp != nil && resp.Response != nil {
-				c.Errorf("get GitLab MR !%d: HTTP %d", listed.IID, resp.StatusCode)
-			} else {
-				c.Errorf("get GitLab MR !%d: SDK request failed (%T)", listed.IID, err)
-			}
+			reportGitLabReadFailure(c, "get project merge request", resp, err)
 			return
 		}
 		if assert.NotNil(c, got) && assert.Equal(c, headSHA, safe(got.DiffRefs.HeadSha), "GitLab MR diff head") {
@@ -175,4 +213,12 @@ func readGitLabPublicationRequest(t *testing.T, g *gitlabFixture, projectID int6
 	require.NotNil(t, mr.Author)
 	require.Equal(t, g.owner, safe(mr.Author.Username), "GitLab MR author is not the fixture actor")
 	return mr
+}
+
+func reportGitLabReadFailure(c *assert.CollectT, action string, resp *gitlabsdk.Response, err error) {
+	if resp != nil && resp.Response != nil {
+		c.Errorf("GitLab: %s: HTTP %d", action, resp.StatusCode)
+		return
+	}
+	c.Errorf("GitLab: %s: SDK request failed (%T)", action, err)
 }

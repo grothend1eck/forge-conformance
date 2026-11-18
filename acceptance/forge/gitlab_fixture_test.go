@@ -10,17 +10,16 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
+	"net/netip"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/network"
 	"github.com/testcontainers/testcontainers-go"
 	tcexec "github.com/testcontainers/testcontainers-go/exec"
-	tcnetwork "github.com/testcontainers/testcontainers-go/network"
 	"github.com/testcontainers/testcontainers-go/wait"
 	gitlabsdk "gitlab.com/gitlab-org/api/client-go"
 )
@@ -48,52 +47,25 @@ func startGitLab(t *testing.T) *gitlabFixture {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Minute)
 	defer cancel()
 
-	// Require a local engine: the host forwards loopback HTTP to an internal
-	// Docker bridge (Docker does not publish ports on an internal network).
-	docker, err := testcontainers.NewDockerClientWithOpts(ctx)
-	if err != nil {
-		t.Fatalf("connect to local Docker for GitLab CE: %v", err)
-	}
-	dockerHost := docker.DaemonHost()
-	_ = docker.Close()
-	if !strings.HasPrefix(dockerHost, "unix://") {
-		t.Fatal("GitLab CE fixture requires a local Docker Unix socket")
-	}
-	network, err := tcnetwork.New(ctx, tcnetwork.WithInternal())
-	if err != nil {
-		t.Fatalf("create internal network for GitLab CE: %v", err)
-	}
-	testcontainers.CleanupNetwork(t, network)
-	listener, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen on GitLab CE fixture loopback: %v", err)
-	}
-	t.Cleanup(func() { _ = listener.Close() })
-	g := &gitlabFixture{
-		url:   "http://" + listener.Addr().String(),
-		owner: "fixture-bot",
-		httpClient: &http.Client{
-			Timeout: 20 * time.Second,
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-			Transport: &http.Transport{}, // No inherited proxies.
-		},
-	}
-	t.Cleanup(g.httpClient.CloseIdleConnections)
-
+	const port = "80/tcp"
 	t.Logf("starting GitLab CE %s", gitLabImage)
-	quiet := log.New(io.Discard, "", 0)
 	c, err := testcontainers.Run(ctx, gitLabImage,
-		testcontainers.WithLogger(quiet),
-		tcnetwork.WithNetwork(nil, network),
+		// Report state on failure rather than dumping raw container logs.
+		testcontainers.WithLogger(log.New(io.Discard, "", 0)),
+		testcontainers.WithExposedPorts(port),
 		testcontainers.WithHostConfigModifier(func(config *container.HostConfig) {
 			config.ShmSize = 256 << 20
+			config.PortBindings = network.PortMap{
+				network.MustParsePort(port): {{HostIP: netip.MustParseAddr("127.0.0.1")}},
+			}
+			// 19.3's scheduled version check ignores version_check_enabled
+			// and hardcodes this hostname. Keep that request in the container.
+			config.ExtraHosts = []string{"version.gitlab.com:127.0.0.1"}
 		}),
 		testcontainers.WithEnv(map[string]string{
 			"GITLAB_DISABLE_OPENSSH": "true",
 			"GITLAB_SKIP_TAIL_LOGS":  "true",
-			"GITLAB_OMNIBUS_CONFIG":  "external_url '" + g.url + "'\n" + gitLabOmnibusConfig,
+			"GITLAB_OMNIBUS_CONFIG":  gitLabOmnibusConfig,
 		}),
 		testcontainers.WithWaitStrategyAndDeadline(8*time.Minute,
 			wait.ForExec([]string{"test", "-f", "/var/opt/gitlab/bootstrapped"}).
@@ -124,27 +96,23 @@ func startGitLab(t *testing.T) *gitlabFixture {
 		}
 		t.Fatalf("start GitLab CE: %v", err)
 	}
-	ip, err := c.ContainerIP(ctx)
-	if err != nil || net.ParseIP(ip) == nil {
-		t.Fatal("GitLab CE must have exactly one Docker network with an IP address")
+	mapped, err := c.MappedPort(ctx, port)
+	if err != nil {
+		t.Fatalf("get GitLab CE fixture HTTP port: %v", err)
 	}
-	backend := &url.URL{Scheme: "http", Host: net.JoinHostPort(ip, "80")}
-	transport := &http.Transport{}
-	proxy := &httputil.ReverseProxy{
-		Transport: transport,
-		ErrorLog:  quiet,
-		Rewrite: func(r *httputil.ProxyRequest) {
-			r.SetURL(backend)
-			r.Out.Host = listener.Addr().String()
-		},
-		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) {
-			http.Error(w, "GitLab CE fixture backend unavailable", http.StatusBadGateway)
+	g := &gitlabFixture{
+		// The API and Git use Docker's mapping, not GitLab's advertised URL.
+		url:   "http://" + net.JoinHostPort("127.0.0.1", mapped.Port()),
+		owner: "fixture-bot",
+		httpClient: &http.Client{
+			Timeout: 20 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+			Transport: &http.Transport{}, // No inherited proxies.
 		},
 	}
-	server := &http.Server{Handler: proxy, ReadHeaderTimeout: 5 * time.Second}
-	t.Cleanup(transport.CloseIdleConnections)
-	t.Cleanup(func() { _ = server.Close() })
-	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(g.httpClient.CloseIdleConnections)
 
 	_, response, err := g.sdkClient(t, "").Users.CurrentUser(gitlabsdk.WithContext(ctx))
 	if err == nil || response == nil || response.StatusCode != http.StatusUnauthorized {
@@ -157,6 +125,7 @@ func startGitLab(t *testing.T) *gitlabFixture {
 }
 
 const gitLabOmnibusConfig = `
+external_url 'http://localhost'
 nginx['listen_port'] = 80
 puma['worker_processes'] = 0
 prometheus_monitoring['enable'] = false
@@ -166,6 +135,7 @@ gitlab_rails['gitlab_email_enabled'] = false
 gitlab_rails['display_initial_root_password'] = false
 gitlab_rails['store_initial_root_password'] = false
 gitlab_rails['initial_gitlab_product_usage_data'] = false
+gitlab_rails['usage_ping_enabled'] = false
 gitlab_rails['rake_cache_clear'] = false
 `
 
@@ -174,7 +144,10 @@ func (g *gitlabFixture) bootstrapActor(t *testing.T, ctx context.Context, c test
 	// Use the stock Rails runner for initial root bootstrap only. GitLab
 	// generates the PAT itself; it is never in process arguments or the environment.
 	const script = `
-ApplicationSetting.current.update!(signup_enabled: false)
+ApplicationSetting.current.update!(
+  signup_enabled: false, version_check_enabled: false, import_sources: [],
+  shared_runners_enabled: false, allow_runner_registration_token: false,
+  update_runner_versions_enabled: false)
 pat = User.find_by!(username: 'root').personal_access_tokens.create!(
   name: 'acceptance-bootstrap', scopes: ['api'], expires_at: Date.current + 1)
 puts "ACCEPTANCE_BOOTSTRAP=#{pat.token}"
@@ -220,6 +193,10 @@ puts "ACCEPTANCE_BOOTSTRAP=#{pat.token}"
 	if response, err := root.PersonalAccessTokens.RevokePersonalAccessTokenSelf(api); err != nil {
 		gitLabAPIFailure(t, "revoke root bootstrap PAT", response, err)
 	}
+	_, response, err = root.Users.CurrentUser(api)
+	if err == nil || response == nil || response.StatusCode != http.StatusUnauthorized {
+		gitLabAPIFailure(t, "confirm revoked root PAT cannot authenticate (want HTTP 401)", response, err)
+	}
 	if credential.Token == "" || credential.Token == rootToken {
 		t.Fatal("GitLab CE did not issue a separate actor PAT")
 	}
@@ -263,6 +240,7 @@ func (g *gitlabFixture) newProject(t *testing.T) *gitlabsdk.Project {
 		Visibility:           gitlabsdk.Ptr(gitlabsdk.PrivateVisibility),
 		InitializeWithReadme: gitlabsdk.Ptr(false),
 		AutoDevopsEnabled:    gitlabsdk.Ptr(false),
+		BuildsAccessLevel:    gitlabsdk.Ptr(gitlabsdk.DisabledAccessControl),
 	}, api)
 	if err != nil {
 		gitLabAPIFailure(t, "create empty private project", response, err)
