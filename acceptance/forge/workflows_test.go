@@ -179,8 +179,8 @@ runs:
 			c.ok(t, "apply", manifest, "--disable-changelog", "--commit=false", "--push=false")
 			for _, f := range files {
 				if f.wantRef == "" {
-					if strings.Contains(diff, fmt.Sprintf("in file %q", f.path)) {
-						t.Errorf("diff proposed a change to neighboring workflow %s", f.path)
+					if strings.Contains(diff, fmt.Sprintf("file %q", f.path)) {
+						t.Errorf("diff produced a target for neighboring workflow %s", f.path)
 					}
 					if got := readWorkflowFixture(t, c.runner.Dir, f.path); got != initial[f.path] {
 						t.Errorf("neighboring workflow %s changed", f.path)

@@ -60,7 +60,9 @@ func testTags(t *testing.T, s *server) {
 	// Use a single known ref for the default: the Git refs endpoint's list
 	// order is not a portable recency contract.
 	runRequired(t, "source/default", func(t *testing.T) {
+		before := r.refs(t)
 		checkResourceSelection(t, s, r.name, "tag", resourceSelection{want: "v1.9.0"})
+		require.Equal(t, before, r.refs(t), "reading the default tag must not change remote refs")
 	})
 	for _, tag := range []string{"v1.10.0", "v2.0.0", "snapshot/nightly"} {
 		r.git(t, "tag", tag, r.base)
