@@ -25,19 +25,38 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0 # GoReleaser needs the tags and their history, not just HEAD.
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      - name: Build CLI and acceptance tests
+      - name: Install GoReleaser
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          version: v2.19.0
+          install-only: true
+      - name: Build native GoReleaser snapshot
+        id: snapshot
+        shell: bash
         run: |
+          test "$(git rev-parse --is-shallow-repository)" = false
+          git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' HEAD
           mkdir "$RUNNER_TEMP/forge-bin"
-          go build -ldflags='-s -w' -o "$RUNNER_TEMP/forge-bin/updatecli" .
+          GOVERSION="$(go version)"
+          GOVERSION="$GOVERSION" goreleaser build --config .goreleaser.yml --snapshot --clean --single-target \
+            --output "$RUNNER_TEMP/forge-bin/updatecli"
+          git diff --exit-code -- go.mod go.sum
+          jq -e --arg commit "$(git rev-parse HEAD)" 'select(.commit == $commit) | {tag, version, commit}' dist/metadata.json
+          jq -er '.version | strings | select(length > 0) | "version=\(.)"' dist/metadata.json >> "$GITHUB_OUTPUT"
+          sha256sum "$RUNNER_TEMP/forge-bin/updatecli"
+      - name: Compile forge acceptance tests
+        run: |
           go test -c -tags=acceptance -ldflags='-s -w' -o "$RUNNER_TEMP/forge-bin/forge.test" ./acceptance/forge
-      - name: Test shared CLI runner
+      - name: Test stamped candidate and shared CLI runner
         env:
           UPDATECLI_BIN: ${{ runner.temp }}/forge-bin/updatecli
-        run: go test -tags=acceptance -count=1 -v ./acceptance/internal/cli
+          UPDATECLI_EXPECTED_VERSION: ${{ steps.snapshot.outputs.version }}
+        run: go test -tags=acceptance,candidate -count=1 -v ./acceptance/internal/cli
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         id: upload
         with:
@@ -59,6 +78,8 @@ jobs:
             provider: gitea
           - name: Forgejo
             provider: forgejo
+          - name: GitLab
+            provider: gitlab
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:

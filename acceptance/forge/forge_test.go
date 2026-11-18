@@ -7,20 +7,21 @@ import (
 	"testing"
 )
 
-type capability struct {
+type capability[F any] struct {
 	name string
-	run  func(*testing.T, *server)
+	run  func(*testing.T, F)
 }
 
 var profiles = []struct {
-	server       string
-	capabilities []capability
+	name string
+	run  func(*testing.T)
 }{
-	{"gitea", giteaCapabilities},
-	{"forgejo", giteaCapabilities},
+	{"gitea", func(t *testing.T) { runProfile(t, startServer(t, "gitea"), giteaCapabilities) }},
+	{"forgejo", func(t *testing.T) { runProfile(t, startServer(t, "forgejo"), giteaCapabilities) }},
+	{"gitlab", func(t *testing.T) { runProfile(t, startGitLab(t), gitlabCapabilities) }},
 }
 
-var giteaCapabilities = []capability{
+var giteaCapabilities = []capability[*server]{
 	{"authentication", testAuthentication},
 	{"publish_update", testPublish},
 	{"request_safety", testRequestSafety},
@@ -36,24 +37,30 @@ var giteaCapabilities = []capability{
 	{"workflow_discovery", testWorkflowDiscovery},
 }
 
+var gitlabCapabilities = []capability[*gitlabFixture]{
+	{"publish_update", testGitLabPublish},
+}
+
+func runProfile[F any](t *testing.T, fixture F, capabilities []capability[F]) {
+	t.Helper()
+	if len(capabilities) == 0 {
+		t.Fatal("no capabilities enrolled")
+	}
+	for _, c := range capabilities {
+		runRequired(t, c.name, func(t *testing.T) { c.run(t, fixture) })
+	}
+}
+
 func TestForge(t *testing.T) {
 	failOnSkip(t)
 	selected, specified := os.LookupEnv("UPDATECLI_TEST_FORGE")
 	matched := false
 	for _, profile := range profiles {
-		if specified && selected != profile.server {
+		if specified && selected != profile.name {
 			continue
 		}
 		matched = true
-		runRequired(t, profile.server, func(t *testing.T) {
-			if len(profile.capabilities) == 0 {
-				t.Fatal("no capabilities enrolled")
-			}
-			s := startServer(t, profile.server)
-			for _, c := range profile.capabilities {
-				runRequired(t, c.name, func(t *testing.T) { c.run(t, s) })
-			}
-		})
+		runRequired(t, profile.name, profile.run)
 	}
 	if !matched {
 		t.Fatalf("no forge profile matches UPDATECLI_TEST_FORGE=%q", selected)

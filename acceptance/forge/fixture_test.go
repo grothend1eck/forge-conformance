@@ -3,18 +3,11 @@
 package forge
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
-	"encoding/base64"
-	"fmt"
 	"net"
 	"net/http"
 	"net/netip"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -181,19 +174,17 @@ func (s *server) apiFailure(t *testing.T, action string, resp *gitea.Response, e
 }
 
 type repository struct {
-	server          *server
-	name, base, dir string
-	home            string
+	*gitRepository
+	server *server
+	name   string
 }
 
 func (s *server) newRepo(t *testing.T) *repository {
 	t.Helper()
 	r := &repository{
-		server: s,
-		name:   "acceptance-" + strings.ToLower(rand.Text()),
-		base:   "stable",
-		dir:    t.TempDir(),
-		home:   t.TempDir(),
+		gitRepository: newGitRepository(t, s.url, s.owner, s.token),
+		server:        s,
+		name:          "acceptance-" + strings.ToLower(rand.Text()),
 	}
 	// Provision through the site administrator so the pipeline PAT does not
 	// need write:user to create repositories in the actor's namespace.
@@ -209,24 +200,8 @@ func (s *server) newRepo(t *testing.T) *repository {
 		t.Fatalf("%s fixture repository is not private and owned by the fixture actor", s.provider)
 	}
 
-	// The forge's default branch remains main. Seed both branches at the
-	// same commit without relying on provider-specific auto-init content.
-	r.git(t, "clone", "--", s.url+"/"+s.owner+"/"+r.name+".git", ".")
-	r.git(t, "switch", "--orphan", "main")
-	r.git(t, "config", "--local", "user.name", s.owner)
-	r.git(t, "config", "--local", "user.email", s.owner+"@example.test")
-	r.git(t, "config", "--local", "commit.gpgsign", "false")
-	r.write(t, "version.yaml", "version: v1.0.0\nkeep: untouched\n")
-	r.git(t, "add", "--", "version.yaml")
-	r.git(t, "commit", "-m", "Seed fixture repository")
-	r.git(t, "push", "--set-upstream", "origin", "main")
-	r.git(t, "switch", "-c", r.base)
-	r.git(t, "push", "--set-upstream", "origin", r.base)
-	refs := r.awaitBranches(t, "main", r.base)
-	seed := strings.TrimSpace(r.git(t, "rev-parse", "HEAD"))
-	if refs["refs/heads/main"] != seed || refs["refs/heads/"+r.base] != seed {
-		t.Fatalf("both fixture branches must point to seed %s", seed)
-	}
+	r.seed(t, s.url+"/"+s.owner+"/"+r.name+".git")
+	r.awaitBranches(t, "main", r.base)
 	r.assertNotPublic(t)
 	return r
 }
@@ -285,90 +260,5 @@ func (r *repository) assertNotPublic(t *testing.T) {
 	_, resp, err := anon.Repositories.GetRepo(t.Context(), s.owner, r.name)
 	if resp == nil || resp.StatusCode != http.StatusNotFound {
 		s.apiFailure(t, "anonymous read of private repository (want HTTP 404)", resp, err)
-	}
-}
-
-// git preserves stdout, including newlines, but always redacts authentication.
-// The PAT is sent in a URL-scoped header supplied through the child environment.
-func (r *repository) git(t *testing.T, args ...string) string {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Dir = r.dir
-	cmd.WaitDelay = 3 * time.Second
-	encoded := base64.StdEncoding.EncodeToString([]byte(r.server.owner + ":" + r.server.token))
-	safe := strings.NewReplacer(r.server.token, "[redacted]", encoded, "[redacted]")
-	cmd.Env = []string{
-		"PATH=" + os.Getenv("PATH"),
-		"HOME=" + r.home,
-		"LANG=C",
-		"GIT_CONFIG_NOSYSTEM=1",
-		"GIT_CONFIG_GLOBAL=" + os.DevNull,
-		"GIT_TERMINAL_PROMPT=0",
-		"GIT_CONFIG_COUNT=2",
-		"GIT_CONFIG_KEY_0=http." + r.server.url + "/.extraHeader",
-		"GIT_CONFIG_VALUE_0=Authorization: Basic " + encoded,
-		"GIT_CONFIG_KEY_1=http.followRedirects",
-		"GIT_CONFIG_VALUE_1=false",
-	}
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	stdout, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("git %s: %v\n%s", safe.Replace(strings.Join(args, " ")), err, safe.Replace(stderr.String()))
-	}
-	return safe.Replace(string(stdout))
-}
-
-func (r *repository) refs(t *testing.T) map[string]string {
-	t.Helper()
-	out := r.git(t, "ls-remote", "--refs", "origin", "refs/heads/*", "refs/tags/*")
-	refs := make(map[string]string)
-	for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
-		if line == "" {
-			continue
-		}
-		sha, ref, ok := strings.Cut(line, "\t")
-		if !ok {
-			t.Fatal("unexpected output from git ls-remote")
-		}
-		refs[ref] = sha
-	}
-	return refs
-}
-
-func (r *repository) stage(t *testing.T, branch, filename, contents string) {
-	t.Helper()
-	r.git(t, "check-ref-format", "--branch", branch)
-	r.git(t, "fetch", "--prune", "origin")
-	remoteRef := "refs/remotes/origin/" + branch
-	branches := r.git(t, "for-each-ref", "--format=%(refname)", "refs/remotes/origin", "refs/heads")
-	switch refs := strings.Split(branches, "\n"); {
-	case slices.Contains(refs, remoteRef):
-		// The CLI may have advanced this branch since our fixture clone.
-		r.git(t, "switch", "-C", branch, remoteRef)
-	case slices.Contains(refs, "refs/heads/"+branch):
-		r.git(t, "switch", branch)
-	default:
-		r.git(t, "switch", "-c", branch, "refs/remotes/origin/"+r.base)
-	}
-	r.write(t, filename, contents)
-	r.git(t, "--literal-pathspecs", "add", "--", filename)
-	r.git(t, "--literal-pathspecs", "commit", "-m", fmt.Sprintf("Stage fixture change to %s", filename), "--", filename)
-	r.git(t, "push", "origin", "HEAD:refs/heads/"+branch)
-}
-
-func (r *repository) write(t *testing.T, filename, contents string) {
-	t.Helper()
-	if !filepath.IsLocal(filename) || filepath.Clean(filename) == "." {
-		t.Fatalf("fixture filename must be a relative file path: %q", filename)
-	}
-	path := filepath.Join(r.dir, filename)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatalf("create fixture file directory: %v", err)
-	}
-	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
-		t.Fatalf("write fixture file: %v", err)
 	}
 }

@@ -25,7 +25,8 @@ type Runner struct {
 }
 
 // New uses the binary named by UPDATECLI_BIN. Supply fixture variables as
-// KEY=value; the candidate does not inherit the parent process environment.
+// KEY=value, including PATH to replace the inherited PATH default. No other
+// parent variables are copied, and runner-controlled settings take precedence.
 func New(t *testing.T, env ...string) *Runner {
 	t.Helper()
 	bin := os.Getenv("UPDATECLI_BIN")
@@ -40,8 +41,9 @@ func New(t *testing.T, env ...string) *Runner {
 	t.Cleanup(proxy.Close)
 	r := &Runner{Dir: t.TempDir(), Home: t.TempDir(), binary: bin}
 	const loopback = "127.0.0.1,localhost,::1"
-	r.env = slices.Concat(env, []string{
-		"HOME=" + r.Home, "PATH=" + os.Getenv("PATH"),
+	// exec.Cmd uses the last value for duplicate keys.
+	r.env = slices.Concat([]string{"PATH=" + os.Getenv("PATH")}, env, []string{
+		"HOME=" + r.Home,
 		"GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0", "LC_ALL=C", "NO_COLOR=1",
 		"UPDATECLI_DISABLE_VERSION_CHECK=true",
 		"http_proxy=" + proxy.URL, "https_proxy=" + proxy.URL, "no_proxy=" + loopback,
