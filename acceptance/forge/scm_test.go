@@ -23,7 +23,7 @@ func testSCM(t *testing.T, s *server) {
 
 		// Keep the shallow reader separate from the full-history writer: the
 		// direct push must be fast-forward, not rely on forcing a shallow push.
-		readDir := filepath.Join(c.dir, "shallow")
+		readDir := filepath.Join(c.runner.Dir, "shallow")
 		readSpec := scmTestSpec(r)
 		readSpec["directory"] = readDir
 		readSpec["singlebranch"] = true
@@ -105,11 +105,11 @@ func testSCM(t *testing.T, s *server) {
 		}
 		// A skipped apply can leave local changes; isolate it from the publish.
 		skipCLI := newCLI(t, s)
-		out := skipCLI.ok(t, "apply", manifest(skipCLI.dir, "first\n"), "--existing-only")
+		out := skipCLI.ok(t, "apply", manifest(skipCLI.runner.Dir, "first\n"), "--existing-only")
 		require.Contains(t, out, "existing-only mode")
 		require.Equal(t, before, r.refs(t), "existing-only must not publish a missing branch")
 
-		c.ok(t, "apply", manifest(c.dir, "first\n"))
+		c.ok(t, "apply", manifest(c.runner.Dir, "first\n"))
 		assertSCMRefChange(t, before, r.refs(t), workingRef)
 		r.git(t, "fetch", "origin", workingRef)
 		require.Equal(t, before[baseRef]+"\n", r.git(t, "rev-parse", "FETCH_HEAD^"), "working branch must start at the configured base")
@@ -119,7 +119,7 @@ func testSCM(t *testing.T, s *server) {
 		// stale. An existing-only update must preserve the remote commit.
 		r.stage(t, branch, "remote-marker.txt", "added independently\n")
 		advanced := r.refs(t)
-		c.ok(t, "apply", manifest(c.dir, "second\n"), "--existing-only")
+		c.ok(t, "apply", manifest(c.runner.Dir, "second\n"), "--existing-only")
 		assertSCMRefChange(t, advanced, r.refs(t), workingRef)
 		r.git(t, "fetch", "origin", workingRef)
 		require.Equal(t, advanced[workingRef]+"\n", r.git(t, "rev-parse", "FETCH_HEAD^"), "must preserve the independently advanced tip")
@@ -182,7 +182,7 @@ func testSCM(t *testing.T, s *server) {
 		const tagRef = "refs/tags/" + tag
 
 		// Annotated tags need a tagger; use only the isolated candidate home.
-		require.NoError(t, os.WriteFile(filepath.Join(c.home, ".gitconfig"),
+		require.NoError(t, os.WriteFile(filepath.Join(c.runner.Home, ".gitconfig"),
 			[]byte("[user]\n\tname = Forge Acceptance\n\temail = forge@example.invalid\n"), 0o600))
 		spec := scmTestSpec(r)
 		spec["workingbranch"] = false
@@ -201,10 +201,9 @@ func testSCM(t *testing.T, s *server) {
 		})
 
 		// Preview the private repo with only a PAT, exercising the SCM's username fallback.
-		preview := newCLI(t, &server{token: s.token}).run(t, "diff", manifest)
-		output := redactCredential(preview.output, "oauth2", s.token)
-		require.Zero(t, preview.code, "%s", output)
-		require.Contains(t, output, `git tag "v1.1.0" should be created`)
+		preview := newCLIWithCredentials(t, "", s.token).run(t, "diff", manifest)
+		require.Zero(t, preview.ExitCode, "%s", preview.Output)
+		require.Contains(t, preview.Output, `git tag "v1.1.0" should be created`)
 		require.Equal(t, before, r.refs(t), "diff must not write remote refs")
 
 		// The target publishes the tag itself; there are no files to commit.

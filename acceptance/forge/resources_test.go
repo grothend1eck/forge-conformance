@@ -129,7 +129,7 @@ func testReleases(t *testing.T, s *server) {
 		testResourceConditions(t, s, r.name, "release", "tag", "v2.0.0")
 		t.Run("condition/ignores-selector-age-and-excludes-drafts", func(t *testing.T) {
 			c := newCLI(t, s)
-			writeResourceFile(t, c.dir, resourceOutput, resourceUntouched)
+			writeResourceFile(t, c.runner.Dir, resourceOutput, resourceUntouched)
 			fresh := resourceNode(s, r.name, "release", map[string]any{
 				"tag": "v2.0.0", "age": map[string]string{"minimum": "30d"},
 			})
@@ -141,7 +141,7 @@ func testReleases(t *testing.T, s *server) {
 				"conditions": map[string]any{"published": fresh, "notPublished": draft},
 				"targets":    map[string]any{"check": resourceFileNode(resourceOutput, "passed")},
 			}))
-			assertResourceFile(t, c.dir, resourceOutput, "passed")
+			assertResourceFile(t, c.runner.Dir, resourceOutput, "passed")
 		})
 		if got := r.refs(t); !maps.Equal(got, before) {
 			t.Fatalf("release selectors and conditions changed remote refs: got %v, want %v", got, before)
@@ -153,7 +153,7 @@ func testReleases(t *testing.T, s *server) {
 		c := newCLI(t, s)
 		before := resourceReleaseReady(t, r, r.base)
 		const tag, title, description = "v4.0.0-rc.1", "Test candidate", "Release notes\n\n- Ship the fixture"
-		writeResourceFile(t, c.dir, resourceInput, "v0.0.1")
+		writeResourceFile(t, c.runner.Dir, resourceInput, "v0.0.1")
 		spec := map[string]any{
 			"tag": tag, "title": title, "description": description, "commitish": r.base, "prerelease": true,
 		}
@@ -213,7 +213,7 @@ func testReleases(t *testing.T, s *server) {
 		}
 		const tag = "v5.0.0"
 		c := newCLI(t, s)
-		writeResourceFile(t, c.dir, resourceInput, tag)
+		writeResourceFile(t, c.runner.Dir, resourceInput, tag)
 		target := resourceNode(s, r.name, "release", nil)
 		target["sourceid"] = "version"
 		c.ok(t, "apply", manifestYAML(t, map[string]any{
@@ -281,14 +281,14 @@ func checkResourceSelection(t *testing.T, s *server, repo, kind string, tc resou
 	if tc.wantError != "" {
 		// Leave the source as a leaf so its error isn't masked by skipped dependents.
 		res := c.run(t, "apply", manifestYAML(t, manifest))
-		if res.code != 1 {
-			t.Fatalf("source failure: apply status=%d, want 1:\n%s", res.code, res.output)
+		if res.ExitCode != 1 {
+			t.Fatalf("source failure: apply status=%d, want 1:\n%s", res.ExitCode, res.Output)
 		}
-		requireResourceOutput(t, res.output, tc.wantError)
+		requireResourceOutput(t, res.Output, tc.wantError)
 		return
 	}
 
-	writeResourceFile(t, c.dir, resourceOutput, resourceUntouched)
+	writeResourceFile(t, c.runner.Dir, resourceOutput, resourceUntouched)
 	condition := resourceNode(s, repo, kind, nil)
 	condition["sourceid"] = "selection"
 	target := resourceFileNode(resourceOutput, "")
@@ -298,10 +298,10 @@ func checkResourceSelection(t *testing.T, s *server, repo, kind string, tc resou
 	out := c.ok(t, "apply", manifestYAML(t, manifest))
 	if tc.hold {
 		requireResourceOutput(t, out, "matches the age filter yet")
-		assertResourceFile(t, c.dir, resourceOutput, resourceUntouched)
+		assertResourceFile(t, c.runner.Dir, resourceOutput, resourceUntouched)
 		return
 	}
-	assertResourceFile(t, c.dir, resourceOutput, tc.want)
+	assertResourceFile(t, c.runner.Dir, resourceOutput, tc.want)
 }
 
 func testResourceConditions(t *testing.T, s *server, repo, kind, field, present string) {
@@ -320,7 +320,7 @@ func testResourceConditions(t *testing.T, s *server, repo, kind, field, present 
 	} {
 		t.Run("condition/"+tc.name, func(t *testing.T) {
 			c := newCLI(t, s)
-			writeResourceFile(t, c.dir, resourceOutput, resourceUntouched)
+			writeResourceFile(t, c.runner.Dir, resourceOutput, resourceUntouched)
 			spec := map[string]any{}
 			if tc.explicit != "" {
 				spec[field] = tc.explicit
@@ -335,7 +335,7 @@ func testResourceConditions(t *testing.T, s *server, repo, kind, field, present 
 				"targets":    map[string]any{"check": target},
 			}
 			if tc.fed {
-				writeResourceFile(t, c.dir, resourceInput, resourceMissing)
+				writeResourceFile(t, c.runner.Dir, resourceInput, resourceMissing)
 				manifest["sources"] = map[string]any{"input": resourceFileNode(resourceInput, "")}
 				condition["sourceid"] = "input"
 			} else {
@@ -347,7 +347,7 @@ func testResourceConditions(t *testing.T, s *server, repo, kind, field, present 
 			if tc.wantPassed {
 				want = "passed"
 			}
-			assertResourceFile(t, c.dir, resourceOutput, want)
+			assertResourceFile(t, c.runner.Dir, resourceOutput, want)
 		})
 	}
 }
@@ -362,10 +362,10 @@ func testUnsupportedRefTarget(t *testing.T, s *server, repo, kind, wantError str
 			"name":    "Reject an unsupported Gitea target",
 			"targets": map[string]any{"unsupported": target},
 		}))
-		if res.code != 1 {
-			t.Fatalf("unsupported target: apply status=%d, want 1:\n%s", res.code, res.output)
+		if res.ExitCode != 1 {
+			t.Fatalf("unsupported target: apply status=%d, want 1:\n%s", res.ExitCode, res.Output)
 		}
-		requireResourceOutput(t, res.output, wantError)
+		requireResourceOutput(t, res.Output, wantError)
 	})
 }
 

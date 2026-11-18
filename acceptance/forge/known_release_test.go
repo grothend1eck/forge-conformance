@@ -25,13 +25,13 @@ func TestExistingReleaseOnLaterPage(t *testing.T) {
 			})
 
 			preview := c.run(t, "diff", manifest)
-			assert.Zero(t, preview.code, "%s", preview.output)
-			assert.NotContains(t, preview.output, "doesn't exist and should be created",
+			assert.Zero(t, preview.ExitCode, "%s", preview.Output)
+			assert.NotContains(t, preview.Output, "doesn't exist and should be created",
 				"diff must not plan creation of existing release %s (ID %d)", release.TagName, release.ID)
 			assert.Equal(t, before, r.refs(t), "diff must not change remote refs")
 
 			applied := c.run(t, "apply", manifest)
-			assert.Zero(t, applied.code, "ensuring existing release %s (ID %d) must succeed:\n%s", release.TagName, release.ID, applied.output)
+			assert.Zero(t, applied.ExitCode, "ensuring existing release %s (ID %d) must succeed:\n%s", release.TagName, release.ID, applied.Output)
 			assert.Equal(t, before, r.refs(t), "apply must not change remote refs")
 			got, resp, err := s.client.Releases.GetReleaseByTag(t.Context(), s.owner, r.name, release.TagName)
 			if err != nil {

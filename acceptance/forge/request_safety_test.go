@@ -60,9 +60,9 @@ func testRequestSafety(t *testing.T, s *server) {
 			"title": title, "reviewers": []string{"acceptance-nonexistent-reviewer"},
 			"merge": map[string]any{"strategy": "auto"},
 		}))
-		t.Logf("apply with nonexistent reviewer exited %d", result.code)
-		assert.NotZero(t, result.code, "review failure must fail the CLI:\n%s", result.output)
-		assert.Contains(t, result.output, "requesting reviewers for Gitea pull request",
+		t.Logf("apply with nonexistent reviewer exited %d", result.ExitCode)
+		assert.NotZero(t, result.ExitCode, "review failure must fail the CLI:\n%s", result.Output)
+		assert.Contains(t, result.Output, "requesting reviewers for Gitea pull request",
 			"the action must fail at the review request, not another stage")
 
 		const phase = "after the forge rejects the nonexistent reviewer"

@@ -139,7 +139,7 @@ runs:
 			}
 			initial := make(map[string]string)
 			for _, f := range files {
-				path := filepath.Join(c.dir, f.path)
+				path := filepath.Join(c.runner.Dir, f.path)
 				template := `name: Local action workflow
 on: push
 jobs:
@@ -172,7 +172,7 @@ runs:
 
 			diff := c.ok(t, "diff", manifest, "--disable-changelog")
 			for _, f := range files {
-				if got := readWorkflowFixture(t, c.dir, f.path); got != initial[f.path] {
+				if got := readWorkflowFixture(t, c.runner.Dir, f.path); got != initial[f.path] {
 					t.Fatalf("diff changed %s:\n%s", f.path, got)
 				}
 			}
@@ -182,7 +182,7 @@ runs:
 					if strings.Contains(diff, fmt.Sprintf("in file %q", f.path)) {
 						t.Errorf("diff proposed a change to neighboring workflow %s:\n%s", f.path, diff)
 					}
-					if got := readWorkflowFixture(t, c.dir, f.path); got != initial[f.path] {
+					if got := readWorkflowFixture(t, c.runner.Dir, f.path); got != initial[f.path] {
 						t.Errorf("neighboring workflow %s changed:\n%s", f.path, got)
 					}
 					continue
@@ -202,9 +202,9 @@ runs:
 					t.Errorf("diff did not propose %s:\n%s", wantDiff, diff)
 				}
 				if f.path == composite {
-					assertCompositeUses(t, c.dir, f.path, wantUses, comment)
+					assertCompositeUses(t, c.runner.Dir, f.path, wantUses, comment)
 				} else {
-					assertWorkflowUses(t, c.dir, f.path, wantUses, comment)
+					assertWorkflowUses(t, c.runner.Dir, f.path, wantUses, comment)
 				}
 			}
 		})

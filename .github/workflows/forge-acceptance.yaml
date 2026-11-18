@@ -18,6 +18,8 @@ jobs:
     name: Build candidate
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      CGO_ENABLED: '0'
     outputs:
       binaries: ${{ steps.upload.outputs.artifact-id }}
     steps:
@@ -31,13 +33,18 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Build CLI and acceptance tests
-        env:
-          CGO_ENABLED: '0'
         run: |
           mkdir "$RUNNER_TEMP/forge-bin"
           go build -ldflags='-s -w' -o "$RUNNER_TEMP/forge-bin/updatecli" .
           go test -c -tags=acceptance -ldflags='-s -w' -o "$RUNNER_TEMP/forge-bin/forge.test" ./acceptance/forge
           go build -o "$RUNNER_TEMP/forge-bin/test2json" cmd/test2json
+      - name: Test shared CLI runner
+        env:
+          UPDATECLI_BIN: ${{ runner.temp }}/forge-bin/updatecli
+        shell: bash
+        run: |
+          go test -tags=acceptance -count=1 -v ./acceptance/internal/cli | tee "$RUNNER_TEMP/cli-test.log"
+          grep -q '^--- PASS: TestLocalYAMLPipeline ' "$RUNNER_TEMP/cli-test.log"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         id: upload
         with:
