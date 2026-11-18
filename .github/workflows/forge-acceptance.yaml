@@ -4,7 +4,14 @@ name: Forge acceptance
 on:
   pull_request:
     branches: [main]
+  schedule:
+    - cron: '27 3 * * *'
   workflow_dispatch:
+    inputs:
+      fuzz_only:
+        description: Run the nightly draft title fuzz test instead of the forge matrix
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -16,6 +23,7 @@ concurrency:
 jobs:
   build:
     name: Build candidate
+    if: github.event_name != 'schedule' && !inputs.fuzz_only
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -59,6 +67,11 @@ jobs:
           UPDATECLI_BIN: ${{ runner.temp }}/forge-bin/updatecli
           UPDATECLI_EXPECTED_VERSION: ${{ steps.snapshot.outputs.version }}
         run: go test -tags=acceptance,candidate -count=1 -v ./acceptance/internal/cli
+      - name: Replay draft title fuzz corpus
+        working-directory: pkg/plugins/resources/gitea/pullrequest
+        run: |
+          go test -list '^FuzzExistingPullRequestTitle$' | grep -Fx FuzzExistingPullRequestTitle
+          go test -count=1 -v -run '^FuzzExistingPullRequestTitle$'
       - name: Identify tested candidate
         id: digest
         run: |
@@ -107,3 +120,28 @@ jobs:
           echo "$CANDIDATE_SHA256  updatecli" | sha256sum --check --strict
           chmod +x updatecli forge.test
           ./forge.test -test.v -test.timeout=12m -test.paniconexit0
+
+  fuzz:
+    name: Fuzz Gitea draft titles
+    if: github.event_name == 'schedule' || inputs.fuzz_only
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Fuzz draft title edits
+        id: fuzz
+        working-directory: pkg/plugins/resources/gitea/pullrequest
+        run: |
+          go test -list '^FuzzExistingPullRequestTitle$' | grep -Fx FuzzExistingPullRequestTitle
+          go test -run '^$' -fuzz '^FuzzExistingPullRequestTitle$' -fuzztime=1m -parallel=2 -timeout=3m
+      - name: Save failing inputs for replay
+        if: failure() && steps.fuzz.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: draft-title-fuzz-inputs
+          path: pkg/plugins/resources/gitea/pullrequest/testdata/fuzz/FuzzExistingPullRequestTitle/
