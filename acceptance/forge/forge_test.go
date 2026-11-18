@@ -23,7 +23,8 @@ var profiles = []struct {
 
 var giteaCapabilities = []capability[*server]{
 	{"authentication", testAuthentication},
-	{"publish_update", testPublish},
+	publishUpdate[*server](),
+	{"publish_review_metadata", testPublishReviewMetadata},
 	{"request_safety", testRequestSafety},
 	{"close_obsolete_request", testClean},
 	{"fork_isolation", testFork},
@@ -38,7 +39,7 @@ var giteaCapabilities = []capability[*server]{
 }
 
 var gitlabCapabilities = []capability[*gitlabFixture]{
-	{"publish_update", testGitLabPublish},
+	publishUpdate[*gitlabFixture](),
 }
 
 func runProfile[F any](t *testing.T, fixture F, capabilities []capability[F]) {

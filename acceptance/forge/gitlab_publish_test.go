@@ -14,43 +14,26 @@ import (
 	gitlabsdk "gitlab.com/gitlab-org/api/client-go"
 )
 
-type gitLabPublicationDriver struct {
+type gitLabPublication struct {
 	fixture *gitlabFixture
 	project *gitlabsdk.Project
 	repo    *gitRepository
 	cli     *forgeCLI
-	id      string
-	head    string
 }
 
-func testGitLabPublish(t *testing.T, g *gitlabFixture) {
+func (g *gitlabFixture) newPublication(t *testing.T) publicationFixture {
 	t.Helper()
-	const (
-		id           = "publish"
-		firstVersion = "v1.1.0"
-		nextVersion  = "v1.2.0"
-	)
 	project := g.newProject(t)
 	r := seedGitLabPublication(t, g, project)
-	d := &gitLabPublicationDriver{
-		fixture: g, project: project, repo: r, id: id, head: "updatecli_" + r.base + "_" + id,
+	d := &gitLabPublication{
+		fixture: g, project: project, repo: r,
 		cli: &forgeCLI{
 			runner: cli.New(t, "UPDATECLI_GITLAB_USERNAME="+g.owner, "UPDATECLI_GITLAB_TOKEN="+g.token),
 			user:   g.owner,
 			token:  g.token,
 		},
 	}
-	p := openPublication(t, r, d, project.ID, d.head, firstVersion)
-	d.assertTitle(t, p.opened, firstVersion)
-
-	// Assert the identical apply's remote invariants, not a particular
-	// internal lookup call or log message.
-	p.reapply(t)
-	d.assertTitle(t, p.opened, firstVersion)
-
-	// A push can advance the SHA without editing the MR itself.
-	p.update(t, nextVersion)
-	d.assertTitle(t, p.opened, nextVersion)
+	return publicationFixture{repo: r, repoID: project.ID, driver: d}
 }
 
 func seedGitLabPublication(t *testing.T, g *gitlabFixture, project *gitlabsdk.Project) *gitRepository {
@@ -61,7 +44,6 @@ func seedGitLabPublication(t *testing.T, g *gitlabFixture, project *gitlabsdk.Pr
 	root := strings.TrimRight(g.url, "/")
 	r := newGitRepository(t, root, g.owner, g.token)
 	r.seed(t, root+"/"+project.PathWithNamespace+".git")
-	seedPublication(t, r)
 	head, _, _ := strings.Cut(r.git(t, "ls-remote", "--symref", "origin", "HEAD"), "\n")
 	require.Equal(t, "ref: refs/heads/main\tHEAD", head, "GitLab's advertised HEAD must point to main")
 
@@ -83,16 +65,16 @@ func seedGitLabPublication(t *testing.T, g *gitlabFixture, project *gitlabsdk.Pr
 	return r
 }
 
-func (d *gitLabPublicationDriver) run(t *testing.T, mode, version string) string {
+func (d *gitLabPublication) run(t *testing.T, mode string, input publicationInput) string {
 	t.Helper()
-	return d.cli.ok(t, mode, d.manifest(t, version))
+	return d.cli.ok(t, mode, d.manifest(t, input))
 }
 
-func (d *gitLabPublicationDriver) manifest(t *testing.T, version string) string {
+func (d *gitLabPublication) manifest(t *testing.T, input publicationInput) string {
 	t.Helper()
 	return manifestYAML(t, map[string]any{
 		"name":       "Update the fixture version",
-		"pipelineid": d.id,
+		"pipelineid": publicationID,
 		"scms": map[string]any{
 			"origin": map[string]any{
 				"kind": "gitlab",
@@ -107,49 +89,32 @@ func (d *gitLabPublicationDriver) manifest(t *testing.T, version string) string 
 		"targets": map[string]any{
 			"version": map[string]any{
 				"name": "Update the version", "kind": "yaml", "scmid": "origin",
-				"spec": map[string]any{"file": "version.yaml", "key": "$.version", "value": version},
+				"spec": map[string]any{"file": "version.yaml", "key": "$.version", "value": input.version},
 			},
 		},
 		"actions": map[string]any{
 			"request": map[string]any{
 				"kind": "gitlab/mergerequest", "scmid": "origin",
-				"spec": map[string]any{"title": gitLabPublicationTitle(version)},
+				"spec": map[string]any{"title": input.title},
 			},
 		},
 	})
 }
 
-func gitLabPublicationTitle(version string) string {
-	return "Bump the fixture to " + version
-}
-
-func (d *gitLabPublicationDriver) assertTitle(t *testing.T, opened publicationRequest, version string) {
-	t.Helper()
-	g := d.fixture
-	mr, resp, err := g.client.MergeRequests.GetMergeRequest(d.project.ID, opened.number, nil, gitlabsdk.WithContext(t.Context()))
-	if err != nil {
-		gitLabAPIFailure(t, "read published MR title", resp, err)
-	}
-	require.NotNil(t, mr)
-	require.Equal(t, d.project.ID, mr.ProjectID)
-	require.Equal(t, opened.id, mr.ID)
-	require.Equal(t, opened.number, mr.IID)
-	require.Equal(t, gitLabPublicationTitle(version), redactCredential(mr.Title, g.owner, g.token), "title of the original GitLab MR !%d", opened.number)
-}
-
-func (d *gitLabPublicationDriver) requests(t *testing.T) []publicationRequest {
+func (d *gitLabPublication) requests(t *testing.T) []publicationRequest {
 	t.Helper()
 	g := d.fixture
 	safe := func(s string) string { return redactCredential(s, g.owner, g.token) }
+	head := publicationHead(d.repo)
 	listed := listGitLabPublicationRequests(t, g, d.project.ID)
 	requests := make([]publicationRequest, 0, len(listed))
 	for _, mr := range listed {
 		require.NotNil(t, mr)
 		var baseSHA string
-		// The shared oracle checks cardinality and state. Only the expected
-		// local MR needs hydrated diff refs.
-		if len(listed) == 1 && mr.State == "opened" && mr.SourceBranch == d.head && mr.SourceProjectID == d.project.ID {
-			headSHA := d.repo.refs(t)["refs/heads/"+d.head]
+		// Unexpected MRs fail the shared cardinality/state/identity checks.
+		// Read the expected MR's diff refs and title from its detail endpoint.
+		if len(listed) == 1 && mr.State == "opened" && mr.SourceBranch == head && mr.SourceProjectID == d.project.ID {
+			headSHA := d.repo.refs(t)["refs/heads/"+head]
 			require.NotEmpty(t, headSHA, "GitLab MR source branch is missing from the remote")
 			detail := readGitLabPublicationRequest(t, g, d.project.ID, mr, headSHA)
 			mr = &detail.BasicMergeRequest
@@ -158,7 +123,7 @@ func (d *gitLabPublicationDriver) requests(t *testing.T) []publicationRequest {
 		requests = append(requests, publicationRequest{
 			id: mr.ID, number: mr.IID, headRepoID: mr.SourceProjectID, baseRepoID: mr.TargetProjectID,
 			open: mr.State == "opened", head: safe(mr.SourceBranch), base: safe(mr.TargetBranch),
-			headSHA: safe(mr.SHA), baseSHA: safe(baseSHA),
+			headSHA: safe(mr.SHA), baseSHA: safe(baseSHA), title: safe(mr.Title),
 		})
 	}
 	return requests
