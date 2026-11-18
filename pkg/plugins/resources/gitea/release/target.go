@@ -36,28 +36,29 @@ func (g Gitea) Target(ctx context.Context, source string, scm scm.ScmHandler, pa
 	ctx, cancelListQuery := context.WithTimeout(ctx, 30*time.Second)
 	defer cancelListQuery()
 
-	releases, resp, err := g.client.Releases.List(
-		ctx,
-		strings.Join([]string{g.spec.Owner, g.spec.Repository}, "/"),
-		goscm.ReleaseListOptions{
-			Page:   1,
-			Size:   30,
-			Open:   true,
-			Closed: true,
-		},
-	)
-	if err != nil {
-		log.Debugf("Gitea Api Response:\nReturn Code: %d\nBody:\n%s", resp.Status, resp.Body)
-		return err
+	repo := strings.Join([]string{g.spec.Owner, g.spec.Repository}, "/")
+	opts := goscm.ReleaseListOptions{
+		Page:   1,
+		Size:   30,
+		Open:   true,
+		Closed: true,
 	}
-
-	for _, r := range releases {
-		if r.Tag == g.spec.Tag {
-			resultTarget.Result = result.SUCCESS
-			resultTarget.Information = g.spec.Tag
-			resultTarget.Description = fmt.Sprintf("Release Tag %q already exist", g.spec.Tag)
-			return nil
+	// Listing also finds drafts and avoids putting tag names in the URL path.
+	for opts.Page != 0 {
+		releases, resp, err := g.client.Releases.List(ctx, repo, opts)
+		if err != nil {
+			return fmt.Errorf("list Gitea releases on page %d: %w", opts.Page, err)
 		}
+
+		for _, r := range releases {
+			if r.Tag == g.spec.Tag {
+				resultTarget.Result = result.SUCCESS
+				resultTarget.Information = g.spec.Tag
+				resultTarget.Description = fmt.Sprintf("Release Tag %q already exist", g.spec.Tag)
+				return nil
+			}
+		}
+		opts.Page = resp.Page.Next
 	}
 
 	resultTarget.Result = result.ATTENTION
@@ -81,7 +82,7 @@ func (g Gitea) Target(ctx context.Context, source string, scm scm.ScmHandler, pa
 
 	release, resp, err := g.client.Releases.Create(
 		ctx,
-		strings.Join([]string{g.spec.Owner, g.spec.Repository}, "/"),
+		repo,
 		&goscm.ReleaseInput{
 			Title:       g.spec.Title,
 			Description: g.spec.Description + "\n" + updatecliCredits,

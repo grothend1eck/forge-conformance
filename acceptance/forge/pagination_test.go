@@ -10,12 +10,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+const releasePageSize = 30
+
 func seedReleaseOnLaterPage(t *testing.T, s *server) (*repository, *gitea.Release) {
 	t.Helper()
 	r := s.newRepo(t)
-	const pageSize = 30
-	seeded := make(map[string]int64, pageSize+1)
-	for i := 1; i <= pageSize+1; i++ {
+	seeded := make(map[string]int64, releasePageSize+1)
+	for i := 1; i <= releasePageSize+1; i++ {
 		tag := fmt.Sprintf("v1.0.%d", i)
 		release, resp, err := s.client.Releases.CreateRelease(t.Context(), s.owner, r.name, gitea.CreateReleaseOption{
 			TagName: tag, Target: r.base, Title: tag,
@@ -27,18 +28,8 @@ func seedReleaseOnLaterPage(t *testing.T, s *server) (*repository, *gitea.Releas
 		seeded[tag] = release.ID
 	}
 
-	listPage := func(page int) []*gitea.Release {
-		t.Helper()
-		releases, resp, err := s.client.Releases.ListReleases(t.Context(), s.owner, r.name, gitea.ListReleasesOptions{
-			ListOptions: gitea.ListOptions{Page: page, PageSize: pageSize},
-		})
-		if err != nil {
-			s.apiFailure(t, fmt.Sprintf("read releases page %d", page), resp, err)
-		}
-		return releases
-	}
-	first, second := listPage(1), listPage(2)
-	require.Len(t, first, pageSize)
+	first, second := readReleasePage(t, s, r.name, 1), readReleasePage(t, s, r.name, 2)
+	require.Len(t, first, releasePageSize)
 	require.Len(t, second, 1)
 	later := second[0]
 	require.False(t, later.IsDraft)
@@ -50,4 +41,15 @@ func seedReleaseOnLaterPage(t *testing.T, s *server) (*repository, *gitea.Releas
 	}
 	t.Logf("release %s (ID %d) is on page 2 and absent from page 1", later.TagName, later.ID)
 	return r, later
+}
+
+func readReleasePage(t *testing.T, s *server, repo string, page int) []*gitea.Release {
+	t.Helper()
+	releases, resp, err := s.client.Releases.ListReleases(t.Context(), s.owner, repo, gitea.ListReleasesOptions{
+		ListOptions: gitea.ListOptions{Page: page, PageSize: releasePageSize},
+	})
+	if err != nil {
+		s.apiFailure(t, fmt.Sprintf("read releases page %d", page), resp, err)
+	}
+	return releases
 }

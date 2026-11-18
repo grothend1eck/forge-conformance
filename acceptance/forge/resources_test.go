@@ -3,6 +3,7 @@
 package forge
 
 import (
+	"fmt"
 	"maps"
 	"os"
 	"path/filepath"
@@ -146,6 +147,38 @@ func testReleases(t *testing.T, s *server) {
 			t.Fatalf("release selectors and conditions changed remote refs: got %v, want %v", got, before)
 		}
 	})
+	runRequired(t, "target/existing_on_later_page", func(t *testing.T) {
+		r, release := seedReleaseOnLaterPage(t, s)
+		c := newCLI(t, s)
+		before := r.refs(t)
+		target := resourceNode(s, r.name, "release", map[string]any{
+			"tag": release.TagName, "commitish": r.base, "title": "Do not replace the published release",
+		})
+		target["disablesourceinput"] = true
+		manifest := manifestYAML(t, map[string]any{
+			"name":    "Ensure a release already on page 2 exists",
+			"targets": map[string]any{"ensure": target},
+		})
+		existing := fmt.Sprintf("Release Tag %q already exist", release.TagName)
+		checkUnchanged := func(t *testing.T, mode string) {
+			t.Helper()
+			require.Equal(t, before, r.refs(t), "%s must not change remote refs", mode)
+			require.Len(t, readReleasePage(t, s, r.name, 1), releasePageSize)
+			second := readReleasePage(t, s, r.name, 2)
+			require.Len(t, second, 1)
+			require.Equal(t, release, second[0], "%s must preserve the existing release", mode)
+		}
+
+		preview := c.ok(t, "diff", manifest)
+		if strings.Contains(preview, "doesn't exist and should be created") {
+			t.Fatalf("diff must not plan creation of existing release %q", release.TagName)
+		}
+		requireOutput(t, preview, existing)
+		checkUnchanged(t, "diff")
+
+		requireOutput(t, c.ok(t, "apply", manifest), existing)
+		checkUnchanged(t, "apply")
+	})
 	runRequired(t, "target/explicit-create-preview-and-no-op", func(t *testing.T) {
 		r := s.newRepo(t)
 		r.stage(t, r.base, "stable.txt", "release commit\n")
@@ -229,7 +262,7 @@ func testReleases(t *testing.T, s *server) {
 	runRequired(t, "target/draft", func(t *testing.T) {
 		r := s.newRepo(t)
 		c := newCLI(t, s)
-		const tag = "v6.0.0"
+		const tag = "preview/v6.0.0"
 		target := resourceNode(s, r.name, "release", map[string]any{"tag": tag, "commitish": r.base, "draft": true})
 		target["disablesourceinput"] = true
 		before := r.refs(t)
@@ -237,10 +270,20 @@ func testReleases(t *testing.T, s *server) {
 			"name":    "Create a draft without publishing its Git tag",
 			"targets": map[string]any{"draft": target},
 		}))
-		assertResourceRelease(t, onlyResourceRelease(t, s, r.name), tag, tag, "", r.base, true, false)
+		draft := onlyResourceRelease(t, s, r.name)
+		assertResourceRelease(t, draft, tag, tag, "", r.base, true, false)
 		if got := r.refs(t); !maps.Equal(got, before) {
 			t.Fatalf("creating a draft changed remote refs: got %v, want %v", got, before)
 		}
+
+		// Ensuring the same tag as a published release must not publish the draft.
+		target["spec"] = resourceNode(s, r.name, "release", map[string]any{"tag": tag, "commitish": r.base})["spec"]
+		requireOutput(t, c.ok(t, "apply", manifestYAML(t, map[string]any{
+			"name":    "Leave the existing draft unpublished",
+			"targets": map[string]any{"ensure": target},
+		})), fmt.Sprintf("Release Tag %q already exist", tag))
+		require.Equal(t, draft, onlyResourceRelease(t, s, r.name), "apply must preserve the same draft")
+		require.Equal(t, before, r.refs(t), "ensuring an existing draft must not create its tag")
 	})
 }
 
