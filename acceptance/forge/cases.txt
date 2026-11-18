@@ -1,3 +1,6 @@
+authentication/private_without_credentials
+authentication/public_without_credentials
+authentication/token_without_username
 branch_resource/condition/explicit-overrides-source
 branch_resource/condition/failwhen-missing
 branch_resource/condition/failwhen-present
@@ -12,9 +15,12 @@ close_obsolete_request
 draft_request
 fork_isolation
 git_scm/custom_working_branch_existing_only
+git_scm/managed_history
+git_scm/native_gittag_target
 git_scm/private_branch_read_and_direct_push
 manual_merge
 publish_update
+release_resource/paginated_source
 release_resource/selection-and-conditions/condition/explicit-overrides-source
 release_resource/selection-and-conditions/condition/failwhen-missing
 release_resource/selection-and-conditions/condition/failwhen-present
@@ -31,8 +37,11 @@ release_resource/selection-and-conditions/source/semver
 release_resource/target/draft
 release_resource/target/explicit-create-preview-and-no-op
 release_resource/target/source-fed-defaults
+request_safety/draft_survives_edit
+request_safety/review_failure_blocks_automerge
 server_automerge/merges_after_required_status
 server_automerge/observably_scheduled
+server_automerge/repository_merge_method
 tag_resource/condition/explicit-overrides-source
 tag_resource/condition/failwhen-missing
 tag_resource/condition/failwhen-present

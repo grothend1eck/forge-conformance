@@ -3,14 +3,12 @@
 package forge
 
 import (
-	"context"
 	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	gitea "gitea.dev/sdk"
 	"go.yaml.in/yaml/v4"
@@ -24,31 +22,10 @@ func testWorkflowDiscovery(t *testing.T, s *server) {
 		newTag     = "v2.1.0"
 		branch     = "action-track"
 		decoy      = "zz-action-decoy"
+		composite  = ".gitea/actions/fixture/action.yml"
 	)
 
 	action := s.newRepo(t)
-	// Forgejo completes its first-push bookkeeping asynchronously and
-	// rejects release creation while the API still sees an empty repository.
-	// Poll only the read endpoint; do not retry release creation.
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-	defer cancel()
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		repo, resp, err := s.client.Repositories.GetRepo(ctx, s.owner, action.name)
-		if err != nil {
-			s.apiFailure(t, "read fixture repository readiness", resp, err)
-		}
-		if !repo.Empty {
-			break
-		}
-		select {
-		case <-ctx.Done():
-			t.Fatal("fixture action repository still empty after first push")
-		case <-ticker.C:
-		}
-	}
-
 	commits := make(map[string]string)
 	stage := func(ref, label string) string {
 		action.stage(t, ref, "action.yml", fmt.Sprintf(`name: Fixture action %s
@@ -156,13 +133,14 @@ runs:
 				// The branch is neither a release nor a tag. Keep its name
 				// when unpinned, or resolve that same branch's tip when pinned.
 				{".forgejo/workflows/branch.yml", branch, branch},
+				{composite, tagRef, newTag},
 				// Same stale dependency, but not directly in the workflows directory.
 				{".gitea/workflows/nested/ignored.yml", oldRelease, ""},
 			}
 			initial := make(map[string]string)
 			for _, f := range files {
 				path := filepath.Join(c.dir, f.path)
-				initial[f.path] = fmt.Sprintf(`name: Local action workflow
+				template := `name: Local action workflow
 on: push
 jobs:
   build:
@@ -170,7 +148,20 @@ jobs:
     steps:
       - uses: %s@%s
       - run: echo untouched
-`, actionURL, f.oldRef)
+`
+				if f.path == composite {
+					template = `name: Local composite action
+description: Local forge fixture, not run
+runs:
+  using: composite
+  steps:
+    - run: echo before
+      shell: sh
+    - uses: %s@%s
+    - uses: ./local-action # keep this
+`
+				}
+				initial[f.path] = fmt.Sprintf(template, actionURL, f.oldRef)
 				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 					t.Fatal(err)
 				}
@@ -182,7 +173,7 @@ jobs:
 			diff := c.ok(t, "diff", manifest, "--disable-changelog")
 			for _, f := range files {
 				if got := readWorkflowFixture(t, c.dir, f.path); got != initial[f.path] {
-					t.Fatalf("diff changed workflow %s:\n%s", f.path, got)
+					t.Fatalf("diff changed %s:\n%s", f.path, got)
 				}
 			}
 			c.ok(t, "apply", manifest, "--disable-changelog", "--commit=false", "--push=false")
@@ -210,7 +201,11 @@ jobs:
 				if !strings.Contains(diff, wantDiff) {
 					t.Errorf("diff did not propose %s:\n%s", wantDiff, diff)
 				}
-				assertWorkflowUses(t, c.dir, f.path, wantUses, comment)
+				if f.path == composite {
+					assertCompositeUses(t, c.dir, f.path, wantUses, comment)
+				} else {
+					assertWorkflowUses(t, c.dir, f.path, wantUses, comment)
+				}
 			}
 		})
 	}
@@ -242,7 +237,39 @@ func assertWorkflowUses(t *testing.T, dir, path, wantUses, wantComment string) {
 	if len(steps) != 2 || steps[1].Run != "echo untouched" || steps[1].Uses.Kind != 0 {
 		t.Fatalf("workflow %s: unexpected steps: %+v", path, steps)
 	}
-	if got := steps[0].Uses; got.Value != wantUses || got.LineComment != wantComment {
-		t.Errorf("workflow %s: uses = %q (comment %q), want %q (comment %q)", path, got.Value, got.LineComment, wantUses, wantComment)
+	assertUsesNode(t, path, steps[0].Uses, wantUses, wantComment)
+}
+
+func assertCompositeUses(t *testing.T, dir, path, wantUses, wantComment string) {
+	t.Helper()
+	var action struct {
+		Runs struct {
+			Using string
+			Steps []struct {
+				Uses  yaml.Node
+				Run   string
+				Shell string
+			}
+		}
+	}
+	if err := yaml.Unmarshal([]byte(readWorkflowFixture(t, dir, path)), &action); err != nil {
+		t.Fatalf("parse composite action %s: %v", path, err)
+	}
+	steps := action.Runs.Steps
+	if action.Runs.Using != "composite" || len(steps) != 3 {
+		t.Fatalf("composite action %s: unexpected runs: %+v", path, action.Runs)
+	}
+	if steps[0].Run != "echo before" || steps[0].Shell != "sh" || steps[0].Uses.Kind != 0 ||
+		steps[1].Run != "" || steps[1].Shell != "" || steps[2].Run != "" || steps[2].Shell != "" {
+		t.Errorf("composite action %s: unexpected steps: %+v", path, steps)
+	}
+	assertUsesNode(t, path+":runs.steps[1]", steps[1].Uses, wantUses, wantComment)
+	assertUsesNode(t, path+":runs.steps[2]", steps[2].Uses, "./local-action", "# keep this")
+}
+
+func assertUsesNode(t *testing.T, location string, got yaml.Node, wantUses, wantComment string) {
+	t.Helper()
+	if got.Kind != yaml.ScalarNode || got.Value != wantUses || got.LineComment != wantComment {
+		t.Errorf("%s: uses = %q (comment %q), want %q (comment %q)", location, got.Value, got.LineComment, wantUses, wantComment)
 	}
 }

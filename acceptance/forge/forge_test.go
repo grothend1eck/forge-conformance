@@ -12,7 +12,9 @@ var capabilities = []struct {
 	name string
 	run  func(*testing.T, *server)
 }{
+	{"authentication", testAuthentication},
 	{"publish_update", testPublish},
+	{"request_safety", testRequestSafety},
 	{"close_obsolete_request", testClean},
 	{"fork_isolation", testFork},
 	{"server_automerge", testProtectedMerge},

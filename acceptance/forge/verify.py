@@ -48,7 +48,13 @@ def verify(provider, cases, events):
         elif action == "pass" and not test:
             package_passed = True
     if failed:
-        raise ValueError(", ".join(f"{test} ({locations.get(test, 'see local run')})" for test in sorted(failed)))
+        # Include a copyable rerun for the most specific failed test, not only its parents.
+        names = failed - {PACKAGE}
+        test = max(sorted(names), key=lambda name: name.count("/"), default=root)
+        match = "/".join(f"^{part}$" for part in test.split("/"))
+        errors = ", ".join(f"{name} ({locations.get(name, 'see local run')})" for name in sorted(failed))
+        raise ValueError(f"{errors}\nWith UPDATECLI_BIN set, run: UPDATECLI_TEST_FORGE={provider} "
+                         f"go test -tags=acceptance -count=1 -v -run '{match}' ./acceptance/forge")
     if not package_passed or started != passed or not ({"TestForge", root} | leaves) <= passed:
         missing = ", ".join(sorted(leaves - passed))
         raise ValueError(f"incomplete test run; missing {missing or 'package or parent pass'}")

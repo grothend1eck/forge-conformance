@@ -5,8 +5,8 @@ package forge
 import (
 	"crypto/rand"
 	"encoding/base64"
-	"maps"
-	"strings"
+	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
@@ -35,13 +35,12 @@ func testPublish(t *testing.T, s *server) {
 	base := r.refs(t)[baseRef]
 	require.NotEmpty(t, base)
 	r.git(t, "push", "origin", base+":refs/heads/unrelated", base+":refs/tags/publish-anchor")
-	before := r.refs(t)
-	require.NotEqual(t, before["refs/heads/main"], base)
+	require.NotEqual(t, r.refs(t)["refs/heads/main"], base)
 
 	reviewerPassword := rand.Text()
 	s.createUser(t, reviewer, reviewerPassword)
-	s.user(t, assignee)
-	s.user(t, next)
+	s.createUser(t, assignee, rand.Text())
+	s.createUser(t, next, rand.Text())
 	for _, user := range []string{assignee, reviewer, next} {
 		write := gitea.AccessModeWrite
 		resp, err := s.client.Repositories.AddCollaborator(t.Context(), s.owner, r.name, user, gitea.AddCollaboratorOption{Permission: &write})
@@ -49,90 +48,80 @@ func testPublish(t *testing.T, s *server) {
 			s.apiFailure(t, "grant repository access to "+user, resp, err)
 		}
 	}
-	head := "updatecli_" + r.base + "_" + id
 	const (
 		firstTitle = "Bump the fixture to v1.1.0"
 		firstBody  = "Acceptance metadata for v1.1.0.\n\n- First update"
 		nextTitle  = "Bump the fixture to v1.2.0"
 		nextBody   = "Acceptance metadata for v1.2.0.\n\n- Follow-up update"
 	)
-	first := requestManifest(r, id, "v1.1.0", map[string]any{
-		"title": firstTitle, "body": firstBody,
-		"assignees": []string{assignee}, "reviewers": []string{reviewer},
+	var observed *gitea.PullRequest
+	var requestID, approvalID int64
+	assertPublicationLifecycle(t, publicationFixture{
+		publicationTarget: giteaPublicationTarget(r, repo.ID, "updatecli_"+r.base+"_"+id),
+		manifest: func(version string) string {
+			if version == firstPublicationVersion {
+				return requestManifest(r, id, version, map[string]any{
+					"title": firstTitle, "body": firstBody,
+					"assignees": []string{assignee}, "reviewers": []string{reviewer},
+				})
+			}
+			return requestManifest(r, id, version, map[string]any{
+				"title": nextTitle, "body": nextBody, "reviewers": []string{reviewer, next},
+			})
+		},
+		run: func(t *testing.T, mode, manifest string) string {
+			return c.ok(t, mode, manifest)
+		},
+		requests: func(t *testing.T) []publicationRequest {
+			prs := publishPRs(t, r)
+			requests := make([]publicationRequest, len(prs))
+			for i, pr := range prs {
+				observed = publishPR(t, r, pr.Index)
+				requests[i] = giteaPublicationRequest(t, observed)
+			}
+			return requests
+		},
+		check: func(t *testing.T, step publicationStep) {
+			require.Len(t, observed.Assignees, 1)
+			require.Equal(t, assignee, observed.Assignees[0].UserName)
+			reviews := publishReviews(t, r, observed.Index)
+			require.Contains(t, reviews, reviewer)
+			if step == publicationUpdated {
+				require.Equal(t, nextTitle, observed.Title)
+				require.Equal(t, nextBody, observed.Body)
+				require.Len(t, reviews, 2)
+				require.Equal(t, approvalID, reviews[reviewer].ID, "completed approval must not be replaced")
+				require.Equal(t, gitea.ReviewStateApproved, reviews[reviewer].State, "original reviewer must not be re-requested")
+				require.False(t, reviews[reviewer].Dismissed)
+				require.Contains(t, reviews, next)
+				require.Equal(t, gitea.ReviewStateRequestReview, reviews[next].State)
+				return
+			}
+
+			require.Equal(t, firstTitle, observed.Title)
+			require.Equal(t, firstBody, observed.Body)
+			require.Len(t, reviews, 1)
+			require.Equal(t, gitea.ReviewStateRequestReview, reviews[reviewer].State)
+			if step == publicationOpened {
+				requestID = reviews[reviewer].ID
+				return
+			}
+			require.Equal(t, requestID, reviews[reviewer].ID)
+
+			// Complete the first review as the actual collaborator before changing input.
+			asReviewer := s.sdkClient(t, gitea.SetToken(s.accessToken(t, reviewer, reviewerPassword)))
+			approval, resp, err := asReviewer.PullRequests.CreatePullReview(t.Context(), s.owner, r.name, observed.Index, gitea.CreatePullReviewOptions{
+				State: gitea.ReviewStateApproved, CommitID: observed.Head.Sha, Body: "Approved the first version",
+			})
+			if err != nil {
+				s.apiFailure(t, "approve the original published commit", resp, err)
+			}
+			require.NotNil(t, approval.Reviewer)
+			require.Equal(t, reviewer, approval.Reviewer.UserName)
+			require.Equal(t, gitea.ReviewStateApproved, approval.State)
+			approvalID = approval.ID
+		},
 	})
-	output := c.ok(t, "diff", first)
-	require.Contains(t, output, "version.yaml")
-	require.Contains(t, output, "v1.1.0")
-	require.Equal(t, before, r.refs(t), "diff must not write refs")
-	require.Empty(t, publishPRs(t, r), "diff must not create even a closed PR")
-
-	c.ok(t, "apply", first)
-	prs := publishPRs(t, r)
-	require.Len(t, prs, 1)
-	opened := publishPR(t, r, prs[0].Index)
-	firstSHA := assertPublishedHead(t, r, opened, repo.ID, head, before, "v1.1.0")
-	require.Equal(t, base+"\n", r.git(t, "rev-parse", firstSHA+"^"), "first commit must start at the configured base, not main")
-	require.Equal(t, firstTitle, opened.Title)
-	require.Equal(t, firstBody, opened.Body)
-	require.Len(t, opened.Assignees, 1)
-	require.Equal(t, assignee, opened.Assignees[0].UserName)
-	requested := publishReviews(t, r, opened.Index)
-	require.Contains(t, requested, reviewer)
-	require.Len(t, requested, 1)
-	require.Equal(t, gitea.ReviewStateRequestReview, requested[reviewer].State)
-
-	afterOpening := r.refs(t)
-	c.ok(t, "apply", first)
-	require.Equal(t, afterOpening, r.refs(t), "an identical apply must not add a commit or move any ref")
-	prs = publishPRs(t, r)
-	require.Len(t, prs, 1)
-	require.Equal(t, opened.ID, prs[0].ID)
-	require.Equal(t, opened.Index, prs[0].Index)
-	again := publishPR(t, r, opened.Index)
-	require.NotNil(t, again.Head)
-	require.Equal(t, firstSHA, again.Head.Sha)
-	require.Equal(t, gitea.StateOpen, again.State)
-	afterReapply := publishReviews(t, r, opened.Index)
-	require.Contains(t, afterReapply, reviewer)
-	require.Len(t, afterReapply, 1)
-	require.Equal(t, requested[reviewer].ID, afterReapply[reviewer].ID)
-	require.Equal(t, gitea.ReviewStateRequestReview, afterReapply[reviewer].State)
-
-	asReviewer := s.sdkClient(t, gitea.SetToken(s.accessToken(t, reviewer, reviewerPassword)))
-	approval, resp, err := asReviewer.PullRequests.CreatePullReview(t.Context(), s.owner, r.name, opened.Index, gitea.CreatePullReviewOptions{
-		State: gitea.ReviewStateApproved, CommitID: firstSHA, Body: "Approved the first version",
-	})
-	if err != nil {
-		s.apiFailure(t, "approve the original published commit", resp, err)
-	}
-	require.NotNil(t, approval.Reviewer)
-	require.Equal(t, reviewer, approval.Reviewer.UserName)
-	require.Equal(t, gitea.ReviewStateApproved, approval.State)
-
-	// Keep the completed review and add only the newly requested reviewer.
-	second := requestManifest(r, id, "v1.2.0", map[string]any{
-		"title": nextTitle, "body": nextBody, "reviewers": []string{reviewer, next},
-	})
-	c.ok(t, "apply", second)
-	prs = publishPRs(t, r)
-	require.Len(t, prs, 1, "changing input must update the existing PR, not replace it")
-	require.Equal(t, opened.ID, prs[0].ID)
-	require.Equal(t, opened.Index, prs[0].Index)
-	updated := publishPR(t, r, opened.Index)
-	secondSHA := assertPublishedHead(t, r, updated, repo.ID, head, before, "v1.2.0")
-	require.NotEqual(t, firstSHA, secondSHA)
-	require.Equal(t, nextTitle, updated.Title)
-	require.Equal(t, nextBody, updated.Body)
-	require.Len(t, updated.Assignees, 1)
-	require.Equal(t, assignee, updated.Assignees[0].UserName)
-	reviews := publishReviews(t, r, opened.Index)
-	require.Len(t, reviews, 2)
-	require.Contains(t, reviews, reviewer)
-	require.Equal(t, approval.ID, reviews[reviewer].ID, "completed approval must not be replaced")
-	require.Equal(t, gitea.ReviewStateApproved, reviews[reviewer].State, "original reviewer must not be re-requested")
-	require.False(t, reviews[reviewer].Dismissed)
-	require.Contains(t, reviews, next)
-	require.Equal(t, gitea.ReviewStateRequestReview, reviews[next].State)
 }
 
 func testClean(t *testing.T, s *server) {
@@ -205,15 +194,8 @@ func testClean(t *testing.T, s *server) {
 func testFork(t *testing.T, s *server) {
 	r := s.newRepo(t)
 	c := newCLI(t, s)
-	// Forgejo may accept the initial Git push before marking the repository
-	// nonempty in the API. Until then it rejects API PR creation.
-	require.EventuallyWithT(t, func(collect *assert.CollectT) {
-		repo, _, err := s.client.Repositories.GetRepo(t.Context(), s.owner, r.name)
-		require.NoError(collect, err)
-		require.False(collect, repo.Empty)
-		require.True(collect, repo.HasPullRequests)
-	}, 15*time.Second, 200*time.Millisecond)
 	upstream := publishRepo(t, r)
+	require.True(t, upstream.HasPullRequests)
 	const (
 		id        = "fork"
 		forkTitle = "Independent fork change"
@@ -224,7 +206,7 @@ func testFork(t *testing.T, s *server) {
 
 	// Seed a real fork and its PR through the native API using a different account.
 	// The upstream gitea SCM writes its own repo, not a cross-repository PR head.
-	forker := s.adminClient()
+	forker := s.admin
 	account, resp, err := forker.Users.GetMyUserInfo(t.Context())
 	if err != nil {
 		s.apiFailure(t, "identify fixture fork owner", resp, err)
@@ -267,9 +249,30 @@ func testFork(t *testing.T, s *server) {
 	require.Equal(t, upstream.ID, foreign.Base.RepoID)
 	require.Equal(t, change.Commit.SHA, foreign.Head.Sha)
 
+	assertForeignUntouched := func() {
+		t.Helper()
+		pr := publishPR(t, r, foreign.Index)
+		require.Equal(t, foreign.ID, pr.ID)
+		require.Equal(t, forkTitle, pr.Title)
+		require.Equal(t, forkBody, pr.Body)
+		require.Equal(t, gitea.StateOpen, pr.State)
+		require.NotNil(t, pr.Head)
+		require.Equal(t, fork.ID, pr.Head.RepoID)
+		require.Equal(t, head, pr.Head.Ref)
+		require.Equal(t, change.Commit.SHA, pr.Head.Sha)
+	}
+
+	// With no update to publish, neither lookup nor cleanup should claim the fork PR.
+	require.NotEmpty(t, foreign.HTMLURL)
+	output := c.ok(t, "apply", requestManifest(r, id, "v1.0.0", nil), "--clean-git-branches")
+	require.NotContains(t, output, foreign.HTMLURL)
+	require.Len(t, publishPRs(t, r), 1)
+	require.Equal(t, before, r.refs(t))
+	assertForeignUntouched()
+
 	// An otherwise matching fork PR must not be reused, edited, or closed.
 	const managedTitle = "Managed update on the upstream repository"
-	c.ok(t, "apply", requestManifest(r, id, "v1.1.0", map[string]any{"title": managedTitle}), "--clean-git-branches")
+	c.ok(t, "apply", requestManifest(r, id, firstPublicationVersion, map[string]any{"title": managedTitle}), "--clean-git-branches")
 	prs := publishPRs(t, r)
 	require.Len(t, prs, 2)
 	var managed *gitea.PullRequest
@@ -280,16 +283,8 @@ func testFork(t *testing.T, s *server) {
 	}
 	require.NotNil(t, managed)
 	require.Equal(t, managedTitle, managed.Title)
-	assertPublishedHead(t, r, managed, upstream.ID, head, before, "v1.1.0")
-	stillForeign := publishPR(t, r, foreign.Index)
-	require.Equal(t, foreign.ID, stillForeign.ID)
-	require.Equal(t, forkTitle, stillForeign.Title)
-	require.Equal(t, forkBody, stillForeign.Body)
-	require.Equal(t, gitea.StateOpen, stillForeign.State)
-	require.NotNil(t, stillForeign.Head)
-	require.Equal(t, fork.ID, stillForeign.Head.RepoID)
-	require.Equal(t, head, stillForeign.Head.Ref)
-	require.Equal(t, change.Commit.SHA, stillForeign.Head.Sha)
+	giteaPublicationTarget(r, upstream.ID, head).assertHead(t, giteaPublicationRequest(t, managed), before, firstPublicationVersion)
+	assertForeignUntouched()
 }
 
 func publishRepo(t *testing.T, r *repository) *gitea.Repository {
@@ -319,28 +314,24 @@ func publishPR(t *testing.T, r *repository, index int64) *gitea.PullRequest {
 	return pr
 }
 
-func assertPublishedHead(t *testing.T, r *repository, pr *gitea.PullRequest, repoID int64, head string, initialRefs map[string]string, value string) string {
+func giteaPublicationTarget(r *repository, repoID int64, head string) publicationTarget {
+	return publicationTarget{
+		repositoryID: strconv.FormatInt(repoID, 10), headBranch: head, baseBranch: r.base,
+		refs: r.refs, git: r.git,
+	}
+}
+
+func giteaPublicationRequest(t *testing.T, pr *gitea.PullRequest) publicationRequest {
 	t.Helper()
-	require.Equal(t, gitea.StateOpen, pr.State)
-	require.NotNil(t, pr.Head)
-	require.NotNil(t, pr.Base)
-	require.Equal(t, head, pr.Head.Ref)
-	require.Equal(t, r.base, pr.Base.Ref)
-	require.Equal(t, repoID, pr.Head.RepoID)
-	require.Equal(t, repoID, pr.Base.RepoID)
-
-	headRef := "refs/heads/" + head
-	base := initialRefs["refs/heads/"+r.base]
-	require.NotEmpty(t, pr.Head.Sha)
-	require.Equal(t, base, pr.Base.Sha)
-	wantRefs := maps.Clone(initialRefs)
-	wantRefs[headRef] = pr.Head.Sha
-	require.Equal(t, wantRefs, r.refs(t), "the PR head must match native Git, with all sibling refs untouched")
-
-	r.git(t, "fetch", "origin", headRef)
-	require.Equal(t, "version.yaml", strings.TrimSpace(r.git(t, "diff", "--name-only", base, pr.Head.Sha)))
-	require.Equal(t, "version: "+value+"\nkeep: untouched\n", r.git(t, "show", pr.Head.Sha+":version.yaml"))
-	return pr.Head.Sha
+	require.NotNil(t, pr)
+	req := publicationRequest{id: fmt.Sprintf("%d/%d", pr.ID, pr.Index), open: pr.State == gitea.StateOpen}
+	if pr.Head != nil {
+		req.head = publicationRef{repositoryID: strconv.FormatInt(pr.Head.RepoID, 10), branch: pr.Head.Ref, sha: pr.Head.Sha}
+	}
+	if pr.Base != nil {
+		req.base = publicationRef{repositoryID: strconv.FormatInt(pr.Base.RepoID, 10), branch: pr.Base.Ref, sha: pr.Base.Sha}
+	}
+	return req
 }
 
 func publishReviews(t *testing.T, r *repository, index int64) map[string]*gitea.PullReview {

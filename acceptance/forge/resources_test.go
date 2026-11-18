@@ -83,6 +83,14 @@ func testTags(t *testing.T, s *server) {
 }
 
 func testReleases(t *testing.T, s *server) {
+	t.Run("paginated_source", func(t *testing.T) {
+		r, release := seedReleaseOnLaterPage(t, s)
+		before := r.refs(t)
+		checkResourceSelection(t, s, r.name, "release", resourceSelection{
+			kind: "latest", pattern: release.TagName, want: release.TagName,
+		})
+		require.Equal(t, before, r.refs(t), "the selector and condition must not modify remote refs")
+	})
 	t.Run("selection-and-conditions", func(t *testing.T) {
 		r := s.newRepo(t)
 		resourceReleaseReady(t, r, r.base)

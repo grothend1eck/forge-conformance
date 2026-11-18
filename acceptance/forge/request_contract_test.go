@@ -41,10 +41,10 @@ const (
 	publicationUpdated   publicationStep = "updated"
 )
 
-// publicationFixture adapts a real seeded repository to the common CLI case.
-// manifest sets version.yaml to the supplied version; run invokes the candidate
-// and returns its output on success; requests observes all states, not only open
-// requests. check is optional and may verify provider-specific metadata.
+// publicationFixture adapts a fresh repository seeded with version.yaml and
+// sibling refs to the common CLI case. manifest sets the supplied version, run
+// invokes the candidate and returns its output on success, and requests observes
+// all states, not only open requests. check optionally verifies provider metadata.
 type publicationFixture struct {
 	publicationTarget
 	manifest func(version string) string

@@ -16,7 +16,6 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -32,9 +31,7 @@ type server struct {
 	provider, url, owner, token string
 	client                      *gitea.Client
 
-	admin        *gitea.Client
-	usersMu      sync.Mutex
-	checkPrivacy sync.Once
+	admin *gitea.Client
 }
 
 func startServer(t *testing.T, provider string) *server {
@@ -157,10 +154,6 @@ func (s *server) accessToken(t *testing.T, username, password string, scopes ...
 	return token.Token
 }
 
-func (s *server) adminClient() *gitea.Client {
-	return s.admin
-}
-
 func (s *server) createUser(t *testing.T, name, password string) {
 	t.Helper()
 	u, resp, err := s.admin.Admin.CreateUser(t.Context(), gitea.CreateUserOption{
@@ -175,25 +168,6 @@ func (s *server) createUser(t *testing.T, name, password string) {
 	if u.UserName != name || u.IsAdmin {
 		t.Fatalf("%s fixture user %q is not the expected non-admin user", s.provider, name)
 	}
-}
-
-// user creates an account, not repository access. Scenarios grant any
-// collaborator permissions they need on their private repository.
-func (s *server) user(t *testing.T, name string) {
-	t.Helper()
-	s.usersMu.Lock()
-	defer s.usersMu.Unlock()
-	u, resp, err := s.admin.Users.GetUserInfo(t.Context(), name)
-	if err == nil {
-		if u.IsAdmin {
-			t.Fatalf("%s fixture user %q must not be a site admin", s.provider, name)
-		}
-		return
-	}
-	if resp == nil || resp.StatusCode != http.StatusNotFound {
-		s.apiFailure(t, "look up fixture user "+name, resp, err)
-	}
-	s.createUser(t, name, rand.Text())
 }
 
 // SDK errors may contain response bodies. Do not log those from fixture
@@ -249,7 +223,7 @@ func (s *server) newRepo(t *testing.T) *repository {
 	r.git(t, "switch", "-c", r.base)
 	r.git(t, "push", "--set-upstream", "origin", r.base)
 	r.awaitSeed(t)
-	s.checkPrivacy.Do(func() { r.assertNotPublic(t) })
+	r.assertNotPublic(t)
 	return r
 }
 
