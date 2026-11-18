@@ -27,41 +27,49 @@ use the same `gitea` provider and run all the groups below. GitLab uses the
 | Contract | What we observe |
 | --- | --- |
 | Authentication | A token alone can read the non-default branch of a private repo. Anonymous Git access fails until the repo is made public; the public branch is also readable over REST. |
-| Publish and edit a PR/MR | `diff` leaves remote refs and requests alone. `apply` opens a single request on the non-default base with the intended file. An identical apply preserves the head; a newer input edits the same request. Gitea and Forgejo also check the assignee, requested reviewers and an existing approval. |
+| Publish and edit a PR/MR | `lifecycle`: preview without writes, publish on the non-default base, reapply without changes, then change the file and title on the original request. `already_current`: if the configured base already has the requested version, no branch or request is created. |
+| PR review metadata (Gitea and Forgejo) | An update keeps the assignee and completed approval on the same PR and requests only the new reviewer. |
 | Close and isolate requests | Keep nonempty PRs; identify and close an empty managed PR, and prune only its working branch. A same-named PR **from another fork** is not Updatecli's PR. |
 | Review safety | An edit keeps a maintainer-marked draft on the same PR. If the forge rejects a reviewer, Updatecli reports failure and does not schedule a merge, even after the required check passes. |
 | Protected automerge | The server records who scheduled the merge. Success on the wrong SHA or in the wrong status context cannot release it. Passing the required check on the PR head merges the original request without another CLI run. Manual and WIP requests stay open. Git ancestry distinguishes an explicit merge from the repository's default squash. |
 | Git SCM | Native Git verifies the private checkout, shallow/single-branch reads, direct and working-branch commits, `--existing-only`, and squash across two updates. A `gittag` target must create its annotated tag on the selected commit and leave it alone on reapply. |
-| Branches, tags and releases | Select real refs, feed a condition or target from the result, and distinguish absence from a held-back release. A release on page two must still reach the target file. Release creation, draft and no-op are checked against both Git and the API. |
+| Branches, tags and releases | Select real refs, feed a condition or target from the result, and distinguish absence from a held-back release. A release on page two must be selectable; ensuring it exists must keep its original ID, contents and Git refs. |
 | Action discovery | Resolve fully qualified actions in Gitea/Forgejo workflow and composite-action steps. Check release, tag and branch inputs, pins and version comments, and untouched neighbors. This tests Updatecli's crawler, not a forge Actions runner. |
 
 ## Adding a capability
 
-Add a case with `runRequired(t, name, ...)` inside its capability; every
-enrolled profile picks it up. For a new capability, add its test function to the profile's list.
+Add a regression where its behavior is defined. For example, the shared
+[`publish_update` cases](publication_test.go) run on every enrolled forge;
+an assertion about Gitea reviewers stays with the Gitea provider.
+For a new capability, add its test function to the profile's list.
 An enrolled case that calls `t.Skip` fails. The workflow runs the whole selected
 profile and reports failures under their Go subtest names.
 
 Drive the operation through Updatecli. Use Git or the forge API to set up
 the repository and verify what changed.
 
+The real `draft_survives_edit` case verifies that a maintainer's draft stays
+open. Its [package fuzz test](../../pkg/plugins/resources/gitea/pullrequest/title_fuzz_test.go)
+checks repeated title edits without a server. Ordinary `go test` replays the
+seeds; the nightly job explores new inputs for one minute. To run it locally:
+
+```sh
+go test -run '^$' -fuzz '^FuzzExistingPullRequestTitle$' -fuzztime=1m ./pkg/plugins/resources/gitea/pullrequest
+```
+
 ## Known failures
 
 With a `gitbranch` target and `scmid` pointing to `gitea`, an existing tag
 with the requested branch name can make `apply` exit zero **without creating
 the branch**. The [branch test](known_test.go) checks the remote branch and tag.
-The `gitea/release` target also misses [an existing release beyond page
-one](known_release_test.go): `diff` proposes creating it and `apply` gets a
-conflict. The source and condition can find that same release.
 
-Run both reproducers on Gitea and Forgejo with `UPDATECLI_BIN` set:
+Run the reproducer on Gitea and Forgejo with `UPDATECLI_BIN` set:
 
 ```sh
-go test -tags=acceptance,knownissues -count=1 -run '^Test(NativeGitBranchPush|ExistingReleaseOnLaterPage)$' ./acceptance/forge
+go test -tags=acceptance,knownissues -count=1 -run '^TestNativeGitBranchPush$' ./acceptance/forge
 ```
 
-Both tests assert the desired behavior. Move each into its capability when
-the corresponding fix lands. Neither counts as passing.
+Move the test into its capability when the fix lands. It does not count as passing.
 
 ## Scope
 

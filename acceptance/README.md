@@ -19,6 +19,10 @@ HTTP(S) from clients that use it; it isn't a network sandbox. The
 The [forge suite](forge/README.md) adds disposable servers and checks their
 state with Git and the forge API.
 
+Put a regression beside the behavior it protects. If the bug needs a real
+service to reproduce, add a case to that capability. If a Go function alone
+can reproduce it, keep the test and any minimized fuzz input in its package.
+
 CI runs an additional check against the native GoReleaser snapshot: an
 incompatible manifest must leave the target unchanged, while a compatible one
 can edit it. To run that check locally, use a full checkout with a reachable
