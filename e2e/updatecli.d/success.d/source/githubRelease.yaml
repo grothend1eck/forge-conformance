@@ -1,0 +1,13 @@
+---
+name: Test source githubRelease
+pipelineid: e2e/githubRelease
+
+sources:
+  helm:
+    name: Get Latest helm release version
+    kind: githubrelease
+    spec:
+      owner: "updatecli"
+      repository: "updatecli"
+      versionfilter:
+        kind: latest

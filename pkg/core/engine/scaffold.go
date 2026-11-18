@@ -1,0 +1,23 @@
+package engine
+
+import (
+	"fmt"
+
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"github.com/updatecli/updatecli/pkg/core/scaffold"
+)
+
+func (e *Engine) Scaffold(rootDir string) error {
+
+	log.Title("Scaffold a new Updatecli policy")
+
+	s := scaffold.Scaffold{}
+
+	if err := s.Run(rootDir); err != nil {
+		return fmt.Errorf("unable to scaffold a new Updatecli policy - %s", err)
+	}
+
+	log.Infof("A new Updatecli policy has been scaffolded in %s", rootDir)
+
+	return nil
+}

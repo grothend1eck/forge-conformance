@@ -1,0 +1,1229 @@
+package github
+
+/*
+	Keeping the pullrequest code under the github package to avoid cyclic dependencies between github <-> pullrequest
+	We need to completely refactor the github package to split the different component into specific sub packages
+
+		github/pullrequest
+		github/target
+		github/scm
+		github/source
+		github/condition
+*/
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/shurcooL/githubv4"
+	"github.com/updatecli/updatecli/pkg/core/log"
+
+	"github.com/updatecli/updatecli/pkg/core/reports"
+	"github.com/updatecli/updatecli/pkg/plugins/scms/github/client"
+	utils "github.com/updatecli/updatecli/pkg/plugins/utils/action"
+)
+
+const (
+	MergeStrategyAuto       string = "auto"
+	MergeStrategyClient     string = "client"
+	MergeStrategyManual     string = "manual"
+	DefaultMergeClientAfter string = "24h"
+)
+
+var (
+	// ErrAutomergeNotAllowOnRepository is returned when automerge is not allowed on the repository
+	ErrAutomergeNotAllowOnRepository = errors.New("automerge is not allowed on repository")
+	// ErrBadMergeMethod is returned when the merge method is not valid
+	ErrBadMergeMethod = errors.New("wrong merge method defined, accepting one of 'squash', 'merge', 'rebase', or ''")
+	// ErrPullRequestIsInCleanStatus is returned when the pull request is in clean status
+	ErrPullRequestIsInCleanStatus = errors.New("pull request Pull request is in clean status")
+	// AnnouncedExistingPullRequest keeps track of already announced existing pull requests to avoid multiple logs
+	AnnouncedExistingPullRequest map[string]bool
+)
+
+const (
+	/*
+		cleanupMaxAttempts defines how many times Updatecli queries the GitHub API to
+		retrieve a pull request state matching the head commit of its working branch,
+		before giving up cleaning that pull request.
+	*/
+	cleanupMaxAttempts int = 3
+	// cleanupRetryDelay defines how long Updatecli waits between two attempts.
+	cleanupRetryDelay time.Duration = time.Second
+)
+
+var (
+	// cleanupSleep is a variable so it can be overridden from the tests.
+	cleanupSleep = time.Sleep
+)
+
+// PullRequest contains multiple fields mapped to GitHub V4 api
+type PullRequestApi struct {
+	ChangedFiles int
+	BaseRefName  string
+	Body         string
+	CreatedAt    string
+	HeadRefName  string
+	HeadRefOid   string
+	ID           string
+	State        string
+	Title        string
+	Url          string
+	Number       int32
+}
+
+// MergeSpec defines how Updatecli merges a pull request.
+type MergeSpec struct {
+	// "strategy" defines how the pull request is merged.
+	//
+	// default:
+	//   manual
+	//
+	// remark:
+	//   * accepted values are "client", "auto", "manual" or empty.
+	//   * "client" merges the pull request through the GitHub API, without GitHub auto-merge.
+	//   * "auto" enables GitHub auto-merge, which requires branch protection rules on the repository.
+	//   * "manual" and empty never merge the pull request.
+	//
+	Strategy string `yaml:",omitempty"`
+	// "after" defines how long the pull request must stay open before Updatecli merges it.
+	//
+	// default:
+	//   24h
+	//
+	// remark:
+	//   * only used with the strategy "client".
+	//   * the value is a Go duration, such as "30m" or "24h".
+	//
+	// example:
+	//   * after: 24h
+	//
+	After string `yaml:",omitempty"`
+}
+
+/*
+"github/pullrequest" defines the specification for opening and updating GitHub pull requests.
+It requires an scm of kind "github", which provides the repository and the working branch.
+*/
+type ActionSpec struct {
+	// "automerge" defines whether GitHub auto-merge is enabled on the pull request.
+	//
+	// default:
+	//   false
+	//
+	// deprecated:
+	//   * use "merge.strategy" set to "auto" instead. When set, "automerge" overrides "merge.strategy".
+	//
+	AutoMerge *bool `yaml:",omitempty"`
+	// "title" defines the pull request title.
+	//
+	// default:
+	//   the first value found among:
+	//   1. the action title
+	//   2. the pipeline name
+	//   3. the title of the first target that has one
+	//
+	Title string `yaml:",omitempty"`
+	// "description" defines text added at the start of the pull request description.
+	//
+	// default:
+	//   empty
+	//
+	Description string `yaml:",omitempty"`
+	// "labels" defines the repository labels added to the pull request.
+	//
+	// default:
+	//   empty
+	//
+	// remark:
+	//   * the labels must already exist on the repository. Other labels are ignored.
+	//
+	Labels []string `yaml:",omitempty"`
+	// "draft" defines whether the pull request is opened as a draft.
+	//
+	// default:
+	//   false
+	//
+	Draft bool `yaml:",omitempty"`
+	// "maintainercannotmodify" defines whether maintainers are prevented from modifying the pull request.
+	//
+	// default:
+	//   false
+	//
+	MaintainerCannotModify bool `yaml:",omitempty"`
+	// "mergemethod" defines the merge method used to merge the pull request.
+	//
+	// default:
+	//   empty, which means the repository default.
+	//
+	// remark:
+	//   * accepted values are "merge", "squash", "rebase" or empty.
+	//
+	MergeMethod string `yaml:",omitempty"`
+	// "usetitleforautomerge" defines whether the pull request title is used as the commit message when merging.
+	//
+	// default:
+	//   false
+	//
+	// remark:
+	//   * only used with the "mergemethod" values "squash" and "rebase".
+	//
+	UseTitleForAutoMerge bool `yaml:",omitempty"`
+	// "parent" defines whether the pull request is opened against the parent of the forked repository.
+	//
+	// default:
+	//   false
+	//
+	Parent bool `yaml:",omitempty"`
+
+	// "reviewers" defines the users or teams requested to review the pull request.
+	//
+	// default:
+	//   empty
+	//
+	// remark:
+	//   * a team uses the format "organization/team", and the token needs the organization read permission.
+	//
+	Reviewers []string `yaml:",omitempty"`
+
+	// "assignees" defines the users assigned to the pull request.
+	//
+	// default:
+	//   empty
+	//
+	// remark:
+	//   * unlike "reviewers", "assignees" only accepts GitHub usernames.
+	//
+	Assignees []string `yaml:",omitempty"`
+	// "merge" defines how Updatecli merges the pull request.
+	//
+	// default:
+	//   strategy manual, so the pull request is never merged.
+	//
+	// example:
+	// ```
+	//   merge:
+	//     strategy: client
+	//     after: 24h
+	// ```
+	//
+	Merge MergeSpec `yaml:",omitempty"`
+}
+
+// PullRequest contains multiple fields mapped to GitHub V4 api
+type PullRequest struct {
+	gh                *Github
+	Report            string
+	Title             string
+	spec              ActionSpec
+	remotePullRequest PullRequestApi
+	repository        *Repository
+}
+
+// isMergeMethodValid ensure that we specified a valid merge method.
+func isMergeMethodValid(method string) (bool, error) {
+	if len(method) == 0 ||
+		strings.ToUpper(method) == "SQUASH" ||
+		strings.ToUpper(method) == "MERGE" ||
+		strings.ToUpper(method) == "REBASE" {
+		return true, nil
+	}
+	log.Debugf("%s - %s", method, ErrBadMergeMethod)
+	return false, ErrBadMergeMethod
+}
+
+// Validate ensures that the provided ActionSpec is valid
+func (s *ActionSpec) Validate() error {
+
+	if _, err := isMergeMethodValid(s.MergeMethod); err != nil {
+		return err
+	}
+
+	// Handle deprecated AutoMerge field
+	if s.AutoMerge != nil {
+		log.Warningln("'automerge' is deprecated, please use 'merge.strategy: auto' instead")
+		switch *s.AutoMerge {
+		case true:
+			s.Merge.Strategy = MergeStrategyAuto
+		case false:
+			s.Merge.Strategy = MergeStrategyManual
+		}
+		s.AutoMerge = nil
+	}
+
+	// Validate merge strategy
+	switch strings.ToLower(s.Merge.Strategy) {
+	case "", MergeStrategyAuto, MergeStrategyClient, MergeStrategyManual:
+		// valid
+	default:
+		return fmt.Errorf("invalid merge strategy %q, accepting one of '%s', '%s', '%s', or ''", s.Merge.Strategy, MergeStrategyClient, MergeStrategyAuto, MergeStrategyManual)
+	}
+
+	return nil
+}
+
+// Graphql mutation used with GitHub api to enable automerge on a existing
+// pullrequest
+type mutationEnablePullRequestAutoMerge struct {
+	EnablePullRequestAutoMerge struct {
+		PullRequest PullRequestApi
+	} `graphql:"enablePullRequestAutoMerge(input: $input)"`
+}
+
+// Graphql mutation used with GitHub api to merge a pull request from the client side
+type mutationMergePullRequest struct {
+	MergePullRequest struct {
+		PullRequest struct {
+			Url string
+		}
+	} `graphql:"mergePullRequest(input: $input)"`
+}
+
+func NewAction(spec ActionSpec, gh *Github) (PullRequest, error) {
+	err := spec.Validate()
+
+	return PullRequest{
+		gh:   gh,
+		spec: spec,
+	}, err
+}
+
+// CleanAction verifies if an existing action requires some cleanup such as closing a pullrequest with no changes.
+func (p *PullRequest) CleanAction(ctx context.Context, report *reports.Action) error {
+
+	repository, err := p.gh.queryRepository(ctx, "", "", 0)
+	if err != nil {
+		return err
+	}
+
+	p.repository = repository
+
+	// Check if there is already a pullRequest for current pipeline
+	err = p.getRemotePullRequest(ctx, false, 0)
+	if err != nil {
+		return err
+	}
+
+	if p.remotePullRequest.ID == "" {
+		log.Debugln("nothing to clean")
+		return nil
+	}
+
+	switch strings.ToLower(p.spec.Merge.Strategy) {
+	case MergeStrategyClient:
+		err = p.mergeAfterDuration()
+		if err != nil {
+			return err
+		}
+	}
+
+	/*
+		A pull request must only be closed once we are sure that it doesn't contain any
+		change anymore, otherwise the next Updatecli execution reopens a new pull request
+		with the same content.
+	*/
+	isEmpty, err := p.isPullRequestEmpty(ctx, cleanupMaxAttempts)
+	if err != nil {
+		return err
+	}
+
+	if !isEmpty {
+		return nil
+	}
+
+	log.Debugf("No changed file detected at pull request:\n\t%s", p.remotePullRequest.Url)
+	// Not returning an error if the comment failed to be added
+	// as the main purpose of this function is to close the pullrequest
+	if err = p.closePullRequest(ctx, 0); err != nil {
+		return fmt.Errorf("closing pull request: %w", err)
+	}
+
+	report.Link = ""
+	report.Description = "Pull request closed as no changed file detected"
+
+	return nil
+}
+
+/*
+isPullRequestEmpty checks if the remote pull request doesn't contain any changed file.
+
+GitHub computes a pull request diff asynchronously, which means that the "changedFiles"
+information is only meaningful once GitHub processed the commit currently at the top of
+the working branch. A pull request just opened, or which just had its working branch
+(force) pushed, temporarily reports zero changed file.
+Trusting such a stale value closes a pull request which actually contains changes and
+then the next Updatecli execution reopens a new one with the same content.
+
+To avoid it, the pull request state is queried until its head commit matches the head
+commit of the remote working branch. If they still diverge after maxAttempts, then we
+consider that we don't know enough to close the pull request and we let a future
+Updatecli execution deal with it.
+*/
+func (p *PullRequest) isPullRequestEmpty(ctx context.Context, maxAttempts int) (bool, error) {
+	_, workingBranch, _ := p.gh.GetBranches()
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		remoteBranch, err := p.gh.GetLatestCommitHash(ctx, workingBranch)
+		if err != nil {
+			return false, fmt.Errorf("retrieving latest commit hash for branch %q: %w", workingBranch, err)
+		}
+
+		if remoteBranch.HeadOid != "" && remoteBranch.HeadOid == p.remotePullRequest.HeadRefOid {
+			return p.remotePullRequest.ChangedFiles == 0, nil
+		}
+
+		log.Debugf("pull request head commit %q doesn't match the head commit %q of the working branch %q yet, retrying (%d/%d)",
+			p.remotePullRequest.HeadRefOid,
+			remoteBranch.HeadOid,
+			workingBranch,
+			attempt,
+			maxAttempts)
+
+		if attempt == maxAttempts {
+			break
+		}
+
+		cleanupSleep(cleanupRetryDelay)
+
+		remotePullRequest, err := p.queryRemotePullRequest(ctx, 0)
+		if err != nil {
+			return false, err
+		}
+
+		if remotePullRequest.ID == "" {
+			// The pull request is not open anymore so there is nothing to clean
+			return false, nil
+		}
+
+		p.remotePullRequest = remotePullRequest
+	}
+
+	log.Debugf("Skipping pull request cleanup as its state doesn't reflect the working branch %q yet:\n\t%s",
+		workingBranch,
+		p.remotePullRequest.Url)
+
+	return false, nil
+}
+
+// CheckActionExist checks if a pullrequest already exists and update the report object accordingly
+func (p *PullRequest) CheckActionExist(ctx context.Context, report *reports.Action) error {
+
+	repository, err := p.gh.queryRepository(ctx, "", "", 0)
+	if err != nil {
+		return fmt.Errorf("querying repository: %w", err)
+	}
+
+	p.repository = repository
+
+	err = p.getRemotePullRequest(ctx, false, 0)
+	if err != nil {
+		return fmt.Errorf("error getting remote pull request: %w", err)
+	}
+
+	if p.remotePullRequest.ID == "" {
+		return nil
+	}
+
+	report.Link = p.remotePullRequest.Url
+	report.Title = p.remotePullRequest.Title
+	report.Description = p.remotePullRequest.Body
+
+	return nil
+}
+
+// CreateAction creates a new GitHub Pull Request or update an existing one.
+func (p *PullRequest) CreateAction(ctx context.Context, report *reports.Action, resetDescription bool) error {
+
+	// One GitHub pullrequest body can contain multiple action report
+	// It would be better to refactor CreateAction
+	p.Report = report.ToActionsString()
+	p.Title = report.Title
+
+	if p.spec.Title != "" {
+		p.Title = p.spec.Title
+	}
+
+	sourceBranch, workingBranch, _ := p.gh.GetBranches()
+
+	repository, err := p.gh.queryRepository(ctx, sourceBranch, workingBranch, 0)
+	if err != nil {
+		return err
+	}
+
+	p.repository = repository
+
+	// Check if there is already a pullRequest for current pipeline
+	err = p.getRemotePullRequest(ctx, resetDescription, 0)
+	if err != nil {
+		return err
+	}
+
+	// If we didn't find a Pull Request ID then it means we need to create a new pullrequest.
+	if len(p.remotePullRequest.ID) == 0 {
+		if err := p.OpenPullRequest(ctx, 0); err != nil {
+			return err
+		}
+	}
+
+	if len(p.remotePullRequest.ID) == 0 {
+		return nil
+	}
+
+	report.Link = p.remotePullRequest.Url
+	report.Title = p.remotePullRequest.Title
+	report.Description = p.remotePullRequest.Body
+
+	// Once the remote Pull Request exists, we can than update it with additional information such as
+	// tags,assignee,etc.
+	if err := p.updatePullRequest(ctx, 0); err != nil {
+		return err
+	}
+
+	switch strings.ToLower(p.spec.Merge.Strategy) {
+	case MergeStrategyAuto:
+		if err := p.EnablePullRequestAutoMerge(ctx, 0); err != nil {
+			switch err.Error() {
+			case ErrAutomergeNotAllowOnRepository.Error():
+				log.Errorln("Automerge can't be enabled. Make sure to allow it on the repository.")
+			case ErrPullRequestIsInCleanStatus.Error():
+				log.Errorln("Automerge can't be enabled. Make sure to have branch protection rules enabled on the repository.")
+			default:
+				log.Debugf("Error enabling automerge: %s", err.Error())
+			}
+			return err
+		}
+	case MergeStrategyClient:
+
+		err = p.mergeAfterDuration()
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// closePullRequest closes an existing Pull Request using GitHub graphql api.
+func (p *PullRequest) closePullRequest(ctx context.Context, retry int) error {
+
+	rateLimit, err := queryRateLimit(p.gh.client, ctx)
+	if err != nil {
+		if client.IsRateLimitError(err) {
+			log.Debugln(rateLimit)
+			if retry < client.MaxRetry {
+				log.Warningf("GitHub API rate limit exceeded. Retrying... (%d/%d)", retry+1, client.MaxRetry)
+				rateLimit.Pause(ctx)
+				return p.closePullRequest(ctx, retry+1)
+			}
+			return errors.New(ErrAPIRateLimitExceededFinalAttempt)
+		}
+		return fmt.Errorf("unable to query GitHub API rate limit: %w", err)
+	}
+
+	log.Debugln(rateLimit)
+
+	// https://docs.github.com/en/graphql/reference/input-objects#closepullrequestinput
+	/*
+		  mutation($input: closePullRequestInput!){
+			closePullRequest(input:$input){
+			  pullRequest{
+				url
+			    title
+			    body
+			  }
+			}
+		  }
+
+		  {
+			"input": {
+			  "pullRequestId" : "yyy"
+			}
+		  }
+	*/
+	var mutation struct {
+		UpdatePullRequest struct {
+			PullRequest PullRequestApi
+		} `graphql:"closePullRequest(input: $input)"`
+	}
+
+	input := githubv4.ClosePullRequestInput{
+		PullRequestID: githubv4.ID(p.remotePullRequest.ID),
+	}
+
+	err = p.gh.client.Mutate(ctx, &mutation, input, nil)
+	if err != nil {
+		if client.IsRateLimitError(err) && retry < client.MaxRetry {
+			return p.closePullRequest(ctx, retry+1)
+		}
+		return fmt.Errorf("closing pull request: %w", err)
+	}
+
+	msg := "Pull request closed as no changed file detected"
+	log.Infof("%s at:\n\n\t%s\n\n", msg, mutation.UpdatePullRequest.PullRequest.Url)
+	err = p.addComment(ctx, msg, 0)
+	if err != nil {
+		if client.IsRateLimitError(err) && retry < client.MaxRetry {
+			return p.closePullRequest(ctx, retry+1)
+		}
+		log.Errorf("Commenting pull-request: %s", err.Error())
+	}
+
+	return nil
+}
+
+// updatePullRequest updates an existing Pull Request.
+func (p *PullRequest) updatePullRequest(ctx context.Context, retry int) error {
+
+	rateLimit, err := queryRateLimit(p.gh.client, ctx)
+	if err != nil {
+		if client.IsRateLimitError(err) {
+			log.Debugln(rateLimit)
+			if retry < client.MaxRetry {
+				log.Warningf("GitHub API rate limit exceeded. Retrying... (%d/%d)", retry+1, client.MaxRetry)
+				rateLimit.Pause(ctx)
+				return p.updatePullRequest(ctx, retry+1)
+			}
+			return errors.New(ErrAPIRateLimitExceededFinalAttempt)
+		}
+		return fmt.Errorf("unable to query GitHub API rate limit: %w", err)
+	}
+
+	log.Debugln(rateLimit)
+
+	/*
+		  mutation($input: UpdatePullRequestInput!){
+			updatePullRequest(input:$input){
+			  pullRequest{
+				url
+			    title
+			    body
+			  }
+			}
+		  }
+
+		  {
+			"input": {
+			  "title":"xxx",
+			  "pullRequestId" : "yyy"
+			}
+		  }
+	*/
+	var mutation struct {
+		UpdatePullRequest struct {
+			PullRequest PullRequestApi
+		} `graphql:"updatePullRequest(input: $input)"`
+	}
+
+	log.Debugf("Updating GitHub Pull Request")
+
+	title := p.Title
+
+	bodyPR, err := utils.GeneratePullRequestBody(p.spec.Description, p.Report)
+	if err != nil {
+		return err
+	}
+
+	labelsID := []githubv4.ID{}
+	repositoryLabels, err := p.gh.getRepositoryLabels(ctx, 0)
+	if err != nil {
+		log.Debugf("Error fetching repository labels: %s", err.Error())
+		return err
+	}
+
+	matchingLabels := []repositoryLabelApi{}
+	for _, l := range p.spec.Labels {
+		for _, repoLabel := range repositoryLabels {
+			if l == repoLabel.Name {
+				matchingLabels = append(matchingLabels, repoLabel)
+			}
+		}
+	}
+
+	remotePRLabels, err := p.GetPullRequestLabelsInformation(ctx, 0)
+	if err != nil {
+		log.Debugf("Error fetching labels information: %s", err.Error())
+		return err
+	}
+
+	// Build a list of labelID to update the pullrequest
+	for _, label := range mergeLabels(matchingLabels, remotePRLabels) {
+		labelsID = append(labelsID, githubv4.NewID(label.ID))
+	}
+
+	input := githubv4.UpdatePullRequestInput{
+		PullRequestID: githubv4.ID(p.remotePullRequest.ID),
+		Title:         githubv4.NewString(githubv4.String(title)),
+		Body:          githubv4.NewString(githubv4.String(bodyPR)),
+	}
+
+	if len(p.spec.Reviewers) != 0 {
+		err = p.addPullrequestReviewers(ctx, p.remotePullRequest.ID, 0)
+		if err != nil {
+			log.Debugln(err.Error())
+		}
+	}
+
+	if len(p.spec.Assignees) != 0 {
+		var assigneesID []githubv4.ID
+		for _, assignee := range p.spec.Assignees {
+			user, err := getUserInfo(ctx, p.gh.client, assignee, 0)
+			if err != nil {
+				log.Debugf("Failed to get user id for %s: %v", assignee, err)
+				continue
+			}
+
+			log.Debugf("Assignee ID %q found for %q", user.ID, assignee)
+			assigneesID = append(assigneesID, githubv4.NewID(user.ID))
+		}
+
+		if len(assigneesID) > 0 {
+			input.AssigneeIDs = &assigneesID
+		}
+	}
+
+	if len(p.spec.Labels) != 0 {
+		// deprecated since the field "merge.strategy" should now be used to specify the merge strategy and enable automerge with "auto" value.
+		input.LabelIDs = &labelsID
+	}
+
+	err = p.gh.client.Mutate(ctx, &mutation, input, nil)
+	if err != nil {
+		if client.IsRateLimitError(err) && retry < client.MaxRetry {
+			return p.updatePullRequest(ctx, retry+1)
+		}
+		return fmt.Errorf("updating pull request: %w", err)
+	}
+
+	log.Infof("\nPull Request available at:\n\n\t%s\n\n", mutation.UpdatePullRequest.PullRequest.Url)
+
+	return nil
+}
+
+// EnablePullRequestAutoMerge updates an existing pullrequest with the flag automerge
+func (p *PullRequest) EnablePullRequestAutoMerge(ctx context.Context, retry int) error {
+
+	rateLimit, err := queryRateLimit(p.gh.client, ctx)
+	if err != nil {
+		if client.IsRateLimitError(err) {
+			log.Debugln(rateLimit)
+			if retry < client.MaxRetry {
+				log.Warningf("GitHub API rate limit exceeded. Retrying... (%d/%d)", retry+1, client.MaxRetry)
+				rateLimit.Pause(ctx)
+				return p.EnablePullRequestAutoMerge(ctx, retry+1)
+			}
+			return errors.New(ErrAPIRateLimitExceededFinalAttempt)
+		}
+	}
+	log.Debugln(rateLimit)
+
+	// Test that automerge feature is enabled on repository but only if we plan to use it
+	autoMergeAllowed, err := p.isAutoMergedEnabledOnRepository(ctx, 0)
+	if err != nil {
+		return err
+	}
+
+	if !autoMergeAllowed {
+		return ErrAutomergeNotAllowOnRepository
+	}
+
+	input := githubv4.EnablePullRequestAutoMergeInput{
+		PullRequestID: githubv4.String(p.remotePullRequest.ID),
+	}
+
+	// The GitHub Api expects the merge method to be capital letter and don't allows empty value
+	// hence the reason to set input.MergeMethod only if the value is not nil
+	if len(p.spec.MergeMethod) > 0 {
+		mergeMethod := githubv4.PullRequestMergeMethod(strings.ToUpper(p.spec.MergeMethod))
+		input.MergeMethod = &mergeMethod
+	}
+
+	if p.spec.UseTitleForAutoMerge {
+		if strings.EqualFold(p.spec.MergeMethod, "squash") {
+			input.CommitHeadline = githubv4.NewString(githubv4.String(fmt.Sprintf("%s (#%d)", p.Title, p.remotePullRequest.Number)))
+		} else if strings.EqualFold(p.spec.MergeMethod, "rebase") {
+			input.CommitHeadline = githubv4.NewString(githubv4.String(p.Title))
+		}
+	}
+
+	var mutation mutationEnablePullRequestAutoMerge
+	err = p.gh.client.Mutate(ctx, &mutation, input, nil)
+
+	if err != nil {
+		if client.IsRateLimitError(err) && retry < client.MaxRetry {
+			return p.EnablePullRequestAutoMerge(ctx, retry+1)
+		}
+		return fmt.Errorf("enabling pull request automerge: %w", err)
+	}
+
+	return nil
+}
+
+// MergePullRequest merges a pull request from the client side by calling the GitHub GraphQL API directly.
+// Unlike EnablePullRequestAutoMerge (which relies on server-side auto-merge being enabled on the repo),
+// this method performs the merge immediately without requiring any repository-level settings.
+// The merge will fail if the pull request is not in a mergeable state (e.g. has unresolved conflicts or pending required checks).
+func (p *PullRequest) MergePullRequest(retry int) error {
+
+	ctx := context.Background()
+
+	rateLimit, err := queryRateLimit(p.gh.client, ctx)
+	if err != nil {
+		if client.IsRateLimitError(err) {
+			if rateLimit != nil {
+				log.Debugln(rateLimit)
+			}
+			if retry < client.MaxRetry {
+				log.Warningf("GitHub API rate limit exceeded. Retrying... (%d/%d)", retry+1, client.MaxRetry)
+				if rateLimit != nil {
+					rateLimit.Pause(ctx)
+				}
+				return p.MergePullRequest(retry + 1)
+			}
+			return errors.New(ErrAPIRateLimitExceededFinalAttempt)
+		}
+		return fmt.Errorf("querying GitHub API rate limit: %w", err)
+	}
+	log.Debugln(rateLimit)
+
+	input := githubv4.MergePullRequestInput{
+		PullRequestID: githubv4.String(p.remotePullRequest.ID),
+	}
+
+	// The GitHub Api expects the merge method to be capital letter and does not allow empty value,
+	// hence we only set MergeMethod when it is explicitly configured.
+	if len(p.spec.MergeMethod) > 0 {
+		mergeMethod := githubv4.PullRequestMergeMethod(strings.ToUpper(p.spec.MergeMethod))
+		input.MergeMethod = &mergeMethod
+	}
+
+	if p.spec.UseTitleForAutoMerge {
+		if strings.EqualFold(p.spec.MergeMethod, "squash") {
+			input.CommitHeadline = githubv4.NewString(githubv4.String(fmt.Sprintf("%s (#%d)", p.Title, p.remotePullRequest.Number)))
+		} else if strings.EqualFold(p.spec.MergeMethod, "rebase") {
+			input.CommitHeadline = githubv4.NewString(githubv4.String(p.Title))
+		}
+	}
+
+	var mutation mutationMergePullRequest
+	err = p.gh.client.Mutate(context.Background(), &mutation, input, nil)
+
+	if err != nil {
+		if client.IsRateLimitError(err) && retry < client.MaxRetry {
+			return p.MergePullRequest(retry + 1)
+		}
+		return fmt.Errorf("merging pull request: %w", err)
+	}
+
+	log.Infof("\nPull Request successfully merged:\n\n\t%s\n\n", mutation.MergePullRequest.PullRequest.Url)
+
+	return nil
+}
+
+// OpenPullRequest creates a new GitHub Pull Request.
+func (p *PullRequest) OpenPullRequest(ctx context.Context, retry int) error {
+
+	rateLimit, err := queryRateLimit(p.gh.client, ctx)
+	if err != nil {
+		if client.IsRateLimitError(err) {
+			log.Debugln(rateLimit)
+			if retry < client.MaxRetry {
+				log.Warningf("GitHub API rate limit exceeded. Retrying... (%d/%d)", retry+1, client.MaxRetry)
+				rateLimit.Pause(ctx)
+				return p.OpenPullRequest(ctx, retry+1)
+			}
+			return errors.New(ErrAPIRateLimitExceededFinalAttempt)
+		}
+	}
+	log.Debugln(rateLimit)
+
+	/*
+	   mutation($input: CreatePullRequestInput!){
+	     createPullRequest(input:$input){
+	       pullRequest{
+	         url
+	       }
+	     }
+	   }
+
+	   {
+	     "input":{
+	       "baseRefName": "x" ,
+	       "repositoryId":"y",
+	       "headRefName": "z",
+	       "headRepositoryId": "",
+	       "title",
+	       "body",
+	     }
+	   }
+
+
+	*/
+	bodyPR, err := utils.GeneratePullRequestBody(p.spec.Description, p.Report)
+	if err != nil {
+		return err
+	}
+
+	sourceBranch, workingBranch, targetBranch := p.gh.GetBranches()
+
+	log.Debugf("Branch %s is %s of %s", workingBranch, strings.ToLower(p.repository.Status), sourceBranch)
+
+	// Check if they are changes that need to be published otherwise exit
+	// It's worth mentioning that at this time, changes have already been published
+	// The goal is just to not open a pull request if there is no changes
+	// https://docs.github.com/en/graphql/reference/enums#comparisonstatus
+	switch p.repository.Status {
+	case "AHEAD":
+		log.Debugf("Opening GitHub pull request")
+	case "DIVERGED":
+		log.Debugf("Opening GitHub pull request even though the branch is diverged")
+	case "BEHIND", "IDENTICAL":
+		log.Debugf("GitHub pull request not needed")
+		return nil
+	default:
+		return fmt.Errorf("unknown status %q", p.repository.Status)
+	}
+
+	input := githubv4.CreatePullRequestInput{
+		RepositoryID:        githubv4.String(p.repository.ID),
+		BaseRefName:         githubv4.String(targetBranch),
+		HeadRefName:         githubv4.String(workingBranch),
+		Title:               githubv4.String(p.Title),
+		Body:                githubv4.NewString(githubv4.String(bodyPR)),
+		MaintainerCanModify: githubv4.NewBoolean(githubv4.Boolean(!p.spec.MaintainerCannotModify)),
+		Draft:               githubv4.NewBoolean(githubv4.Boolean(p.spec.Draft)),
+	}
+
+	if p.spec.Parent {
+		input.RepositoryID = githubv4.String(p.repository.ParentID)
+		input.HeadRepositoryID = githubv4.NewID(p.repository.ID)
+	}
+
+	log.Debugf("Opening pull-request against repo from %q to %q", input.BaseRefName, input.HeadRefName)
+
+	var mutation struct {
+		CreatePullRequest struct {
+			PullRequest PullRequestApi
+		} `graphql:"createPullRequest(input: $input)"`
+	}
+
+	err = p.gh.client.Mutate(ctx, &mutation, input, nil)
+	if err != nil {
+		return fmt.Errorf("creating pull request: %w", err)
+	}
+
+	p.remotePullRequest = mutation.CreatePullRequest.PullRequest
+
+	return nil
+
+}
+
+// isAutoMergedEnabledOnRepository checks if a remote repository allows automerging Pull Requests.
+func (p *PullRequest) isAutoMergedEnabledOnRepository(ctx context.Context, retry int) (bool, error) {
+
+	var query struct {
+		Repository struct {
+			AutoMergeAllowed bool
+		} `graphql:"repository(owner: $owner, name: $name)"`
+		RateLimit RateLimit
+	}
+
+	variables := map[string]interface{}{
+		keyOwner: githubv4.String(p.gh.Spec.Owner),
+		keyName:  githubv4.String(p.gh.Spec.Repository),
+	}
+
+	err := p.gh.client.Query(ctx, &query, variables)
+
+	if err != nil {
+		if client.IsRateLimitError(err) {
+			// If the query failed because we reached the rate limit,
+			// then we need to re-requery the rate limit to get the latest information
+			rateLimit, err := queryRateLimit(p.gh.client, ctx)
+			if err != nil {
+				log.Errorf("Error querying GitHub API rate limit: %s", err)
+			}
+
+			log.Debugln(rateLimit)
+			if retry < client.MaxRetry {
+				log.Warningf("GitHub API rate limit exceeded. Retrying... (%d/%d)", retry+1, client.MaxRetry)
+				rateLimit.Pause(ctx)
+				return p.isAutoMergedEnabledOnRepository(ctx, retry+1)
+			}
+			return false, errors.New(ErrAPIRateLimitExceededFinalAttempt)
+		}
+		return false, fmt.Errorf("querying GitHub API: %w", err)
+	}
+	log.Debugln(query.RateLimit)
+
+	return query.Repository.AutoMergeAllowed, nil
+
+}
+
+// queryRemotePullRequest returns the open pull request associated with the working branch
+// of the current pipeline, if any.
+func (p *PullRequest) queryRemotePullRequest(ctx context.Context, retry int) (PullRequestApi, error) {
+	/*
+		https://developer.github.com/v4/explorer/
+		# Query
+		query getPullRequests(
+			$owner: String!,
+			$name:String!,
+			$baseRefName:String!,
+			$headRefName:String!){
+				repository(owner: $owner, name: $name) {
+					pullRequests(baseRefName: $baseRefName, headRefName: $headRefName, last: 1) {
+						nodes {
+							state
+							id
+						}
+					}
+				}
+			}
+		}
+		# Variables
+		{
+			"owner": "olblak",
+			"name": "charts",
+			"baseRefName": "master",
+			"headRefName": "updatecli/HelmChart/2.4.0"
+		}
+	*/
+
+	var query struct {
+		Repository struct {
+			PullRequests struct {
+				Nodes []PullRequestApi
+			} `graphql:"pullRequests(baseRefName: $baseRefName, headRefName: $headRefName, last: 1, states: [OPEN])"`
+		} `graphql:"repository(owner: $owner, name: $name)"`
+		RateLimit RateLimit
+	}
+
+	owner := githubv4.String(p.repository.Owner)
+	name := githubv4.String(p.repository.Name)
+
+	if p.spec.Parent {
+		owner = githubv4.String(p.repository.ParentOwner)
+		name = githubv4.String(p.repository.ParentName)
+	}
+
+	_, workingBranch, targetBranch := p.gh.GetBranches()
+
+	variables := map[string]interface{}{
+		keyOwner:      owner,
+		keyName:       name,
+		"baseRefName": githubv4.String(targetBranch),
+		"headRefName": githubv4.String(workingBranch),
+	}
+
+	err := p.gh.client.Query(ctx, &query, variables)
+	if err != nil {
+		if client.IsRateLimitError(err) {
+			// If the query failed because we reached the rate limit,
+			// then we need to re-requery the rate limit to get the latest information
+			rateLimit, err := queryRateLimit(p.gh.client, ctx)
+			if err != nil {
+				log.Errorf("Error querying GitHub API rate limit: %s", err)
+			}
+
+			log.Debugln(rateLimit)
+			if retry < client.MaxRetry {
+				log.Warningf("GitHub API rate limit exceeded. Retrying... (%d/%d)", retry+1, client.MaxRetry)
+				rateLimit.Pause(ctx)
+				return p.queryRemotePullRequest(ctx, retry+1)
+			}
+			return PullRequestApi{}, errors.New(ErrAPIRateLimitExceededFinalAttempt)
+		}
+		return PullRequestApi{}, fmt.Errorf("getting existing pull request: %w", err)
+	}
+
+	// If no pull-request found, then we can exit
+	if len(query.Repository.PullRequests.Nodes) == 0 {
+		log.Debugf("No existing pull-request found in repo: %s/%s", owner, name)
+		return PullRequestApi{}, nil
+	}
+
+	return query.Repository.PullRequests.Nodes[0], nil
+}
+
+/*
+getRemotePullRequest retrieves the open pull request associated with the working branch of
+the current pipeline and updates the pull request object accordingly.
+
+The pull request body is merged with the report of the current execution unless resetBody
+is set to true.
+*/
+func (p *PullRequest) getRemotePullRequest(ctx context.Context, resetBody bool, retry int) error {
+	remotePullRequest, err := p.queryRemotePullRequest(ctx, retry)
+	if err != nil {
+		return err
+	}
+
+	p.remotePullRequest = remotePullRequest
+
+	if p.remotePullRequest.ID == "" {
+		return nil
+	}
+
+	// If a remote pullrequest already exist, then we reuse its body to generate the final one
+	switch resetBody {
+	case false:
+		log.Debugf("Merging existing pull-request body with new report")
+		p.Report = reports.MergeFromString(p.remotePullRequest.Body, p.Report)
+	case true:
+		log.Debugf("Resetting pull-request body with new report")
+	}
+
+	if AnnouncedExistingPullRequest == nil {
+		AnnouncedExistingPullRequest = make(map[string]bool)
+	}
+	if _, ok := AnnouncedExistingPullRequest[p.remotePullRequest.ID]; !ok {
+		log.Infof("Existing GitHub pull request found: %s", p.remotePullRequest.Url)
+		AnnouncedExistingPullRequest[p.remotePullRequest.ID] = true
+	}
+
+	return nil
+}
+
+// getPullRequestLabelsInformation queries GitHub Api to retrieve every labels assigned to a pullRequest
+func (p *PullRequest) GetPullRequestLabelsInformation(ctx context.Context, retry int) ([]repositoryLabelApi, error) {
+
+	/*
+		query getPullRequests(
+		  $owner: String!,
+		  $name:String!,
+		  $before:Int!){
+			repository(owner: $owner, name: $name) {
+			  pullRequest(number: 4){
+				labels(last: 5, before:$before){
+				  totalCount
+				  pageInfo {
+					hasNextPage
+					endCursor
+				  }
+				  edges {
+					node {
+					  id
+					  name
+					  description
+					}
+					cursor
+				  }
+				}
+			  }
+			}
+		  }
+	*/
+
+	owner := githubv4.String(p.repository.Owner)
+	repo := githubv4.String(p.repository.Name)
+
+	if p.spec.Parent {
+		owner = githubv4.String(p.repository.ParentOwner)
+		repo = githubv4.String(p.repository.ParentName)
+	}
+
+	variables := map[string]interface{}{
+		keyOwner:      owner,
+		keyRepository: repo,
+		"number":      githubv4.Int(p.remotePullRequest.Number),
+		keyBefore:     (*githubv4.String)(nil),
+	}
+
+	var query struct {
+		RateLimit  RateLimit
+		Repository struct {
+			PullRequest struct {
+				Labels struct {
+					TotalCount int
+					PageInfo   PageInfo
+					Edges      []struct {
+						Cursor string
+						Node   struct {
+							ID          string
+							Name        string
+							Description string
+						}
+					}
+				} `graphql:"labels(last: 5, before: $before)"`
+			} `graphql:"pullRequest(number: $number)"`
+		} `graphql:"repository(owner: $owner, name: $repository)"`
+	}
+
+	var pullRequestLabels []repositoryLabelApi
+	for {
+		err := p.gh.client.Query(ctx, &query, variables)
+		if err != nil {
+			if client.IsRateLimitError(err) {
+				// If the query failed because we reached the rate limit,
+				// then we need to re-requery the rate limit to get the latest information
+				rateLimit, err := queryRateLimit(p.gh.client, ctx)
+				if err != nil {
+					log.Errorf("Error querying GitHub API rate limit: %s", err)
+				}
+				log.Debugln(rateLimit)
+				if retry < client.MaxRetry {
+					log.Warningf("GitHub API rate limit exceeded. Retrying... (%d/%d)", retry+1, client.MaxRetry)
+					rateLimit.Pause(ctx)
+					return p.GetPullRequestLabelsInformation(ctx, retry+1)
+				}
+				return nil, errors.New(ErrAPIRateLimitExceededFinalAttempt)
+			}
+
+			return nil, fmt.Errorf("querying GitHub API: %w", err)
+		}
+
+		log.Debugln(query.RateLimit)
+
+		// Retrieve remote label information such as label ID, label name, labe description
+		for _, node := range query.Repository.PullRequest.Labels.Edges {
+			pullRequestLabels = append(
+				pullRequestLabels,
+				repositoryLabelApi{
+					ID:          node.Node.ID,
+					Name:        node.Node.Name,
+					Description: node.Node.Description,
+				})
+		}
+
+		if !query.Repository.PullRequest.Labels.PageInfo.HasPreviousPage {
+			break
+		}
+
+		variables[keyBefore] = githubv4.NewString(githubv4.String(query.Repository.PullRequest.Labels.PageInfo.StartCursor))
+	}
+	return pullRequestLabels, nil
+}
+
+// mergeAfterDuration checks if the pull request is old enough to be merged based on the provided duration string (e.g. "24h").
+func (p *PullRequest) mergeAfterDuration() error {
+
+	mergeClientAfter := p.spec.Merge.After
+	if mergeClientAfter == "" {
+		log.Debugf("No merge.after duration specified, using default value of %s", DefaultMergeClientAfter)
+		mergeClientAfter = DefaultMergeClientAfter
+	}
+
+	if mergeClientAfter != "" {
+		afterDuration, err := time.ParseDuration(mergeClientAfter)
+		if err != nil {
+			return fmt.Errorf("invalid merge.after duration %q: %w", mergeClientAfter, err)
+		}
+		if p.remotePullRequest.CreatedAt != "" {
+			createdAt, parseErr := time.Parse(time.RFC3339, p.remotePullRequest.CreatedAt)
+			if parseErr == nil && time.Since(createdAt) < afterDuration {
+				log.Infof("Pull request is only %s old — waiting for merge.after duration of %s",
+					time.Since(createdAt).Round(time.Minute), afterDuration)
+				return nil
+			}
+		}
+	}
+	if err := p.MergePullRequest(0); err != nil {
+		log.Debugf("Error merging pull request from client side: %s", err.Error())
+		return err
+	}
+
+	return nil
+}

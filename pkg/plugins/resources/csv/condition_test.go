@@ -1,0 +1,140 @@
+package csv
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/pathresolver"
+)
+
+func TestCondition(t *testing.T) {
+
+	testData := []struct {
+		name             string
+		spec             Spec
+		expectedResult   bool
+		expectedErrorMsg error
+		wantErr          bool
+	}{
+		{
+			name: "Default scenario",
+			spec: Spec{
+				File:  "testdata/data.csv",
+				Key:   ".[0].firstname",
+				Value: "John",
+			},
+			expectedResult: true,
+		},
+		{
+			name: "Deprecated Multiple query scenario",
+			spec: Spec{
+				File:     "testdata/data.csv",
+				Key:      ".[*].firstname",
+				Value:    "John",
+				Multiple: true,
+			},
+			expectedResult: false,
+		},
+		{
+			name: "Query scenario",
+			spec: Spec{
+				File:  "testdata/data.csv",
+				Query: ".[*].firstname",
+				Value: "John",
+			},
+			expectedResult: false,
+		},
+		{
+			name: "Multiple query scenario",
+			spec: Spec{
+				File:  "testdata/data.csv",
+				Query: ".[*].surname",
+				Value: "",
+			},
+			expectedResult: false,
+		},
+		{
+			name: "Default scenario 2",
+			spec: Spec{
+				File:  "testdata/data.2.csv",
+				Key:   ".[0].firstname",
+				Comma: ';',
+				Value: "John",
+			},
+			expectedResult: true,
+		},
+		{
+			name: "Default successful workflow with empty result",
+			spec: Spec{
+				File:  "testdata/data.csv",
+				Key:   ".[0].surname",
+				Value: "",
+			},
+			expectedResult: true,
+		},
+		{
+			name: "Default scenario with Dasel v2",
+			spec: Spec{
+				File:   "testdata/data.csv",
+				Key:    ".[0].firstname",
+				Value:  "John",
+				Engine: strPtr(ENGINEDASEL_V2),
+			},
+			expectedResult: true,
+		},
+		{
+			name: "Default scenario with Dasel v3",
+			spec: Spec{
+				File:   "testdata/data.csv",
+				Key:    "$this[0].firstname",
+				Value:  "John",
+				Engine: strPtr(ENGINEDASEL_V3),
+			},
+			expectedResult: true,
+		},
+		{
+			name: "Mismatching value with Dasel v3",
+			spec: Spec{
+				File:   "testdata/data.csv",
+				Key:    "$this[0].firstname",
+				Value:  "NotJohn",
+				Engine: strPtr(ENGINEDASEL_V3),
+			},
+			expectedResult: false,
+		},
+		{
+			name: "Test key do not exist",
+			spec: Spec{
+				File:  "testdata/data.csv",
+				Key:   ".doNotExist",
+				Value: "",
+			},
+			expectedResult:   false,
+			wantErr:          true,
+			expectedErrorMsg: errors.New("running query: could not find value for query \".doNotExist\" from file \"testdata/data.csv\""),
+		},
+	}
+
+	for _, tt := range testData {
+
+		t.Run(tt.name, func(t *testing.T) {
+			c, err := New(tt.spec)
+
+			require.NoError(t, err)
+
+			got, _, gotErr := c.Condition(context.Background(), "", nil, pathresolver.Resolver{})
+
+			if tt.wantErr {
+				require.Error(t, gotErr)
+				assert.Equal(t, tt.expectedErrorMsg.Error(), gotErr.Error())
+				return
+			}
+
+			require.NoError(t, gotErr)
+			assert.Equal(t, tt.expectedResult, got)
+		})
+	}
+}

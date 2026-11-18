@@ -1,0 +1,85 @@
+package bazelmod
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/Masterminds/semver/v3"
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"github.com/updatecli/updatecli/pkg/core/pipeline/scm"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/pathresolver"
+)
+
+// Condition checks if the version in MODULE.bazel matches the expected version
+func (b *Bazelmod) Condition(_ context.Context, source string, scm scm.ScmHandler, pathResolver pathresolver.Resolver) (pass bool, message string, err error) {
+	// Use source as the expected version if provided
+	expectedVersion := source
+	if expectedVersion == "" {
+		return false, "", fmt.Errorf("no version provided for condition check")
+	}
+
+	// Join, not Resolve: absolute and parent directory paths are allowed, even with an scm.
+	filePath := pathResolver.Join(b.spec.File)
+
+	// Check if file exists
+	if !b.contentRetriever.FileExists(filePath) {
+		return false, "", fmt.Errorf("MODULE.bazel file %q does not exist", filePath)
+	}
+
+	// Read file content
+	content, err := b.contentRetriever.ReadAll(filePath)
+	if err != nil {
+		return false, "", fmt.Errorf("reading MODULE.bazel file: %w", err)
+	}
+
+	// Parse the MODULE.bazel file
+	moduleFile, err := ParseModuleFile(content)
+	if err != nil {
+		return false, "", fmt.Errorf("parsing MODULE.bazel file: %w", err)
+	}
+
+	// Find the specified module
+	dep := moduleFile.FindDepByName(b.spec.Module)
+	if dep == nil {
+		return false, "", fmt.Errorf("module %q not found in MODULE.bazel file %q", b.spec.Module, filePath)
+	}
+
+	// Compare versions using semantic version comparison if possible,
+	// fall back to string comparison for non-semver versions
+	versionsMatch := false
+	depVer, depErr := semver.NewVersion(dep.Version)
+	expectedVer, expectedErr := semver.NewVersion(expectedVersion)
+
+	if depErr == nil && expectedErr == nil {
+		// Both versions are valid semver, use semantic comparison
+		versionsMatch = depVer.Equal(expectedVer)
+		if versionsMatch {
+			return true, fmt.Sprintf("module %q version in %q is correctly set to %q",
+				b.spec.Module,
+				filePath,
+				expectedVersion), nil
+		}
+		log.Debugf("Semantic version comparison: %q != %q", dep.Version, expectedVersion)
+	} else {
+		// At least one version is not valid semver, use string comparison
+		if depErr != nil {
+			log.Debugf("Version %q is not a valid semantic version, using string comparison: %v", dep.Version, depErr)
+		}
+		if expectedErr != nil {
+			log.Debugf("Version %q is not a valid semantic version, using string comparison: %v", expectedVersion, expectedErr)
+		}
+		versionsMatch = dep.Version == expectedVersion
+		if versionsMatch {
+			return true, fmt.Sprintf("module %q version in %q is correctly set to %q",
+				b.spec.Module,
+				filePath,
+				expectedVersion), nil
+		}
+	}
+
+	return false, fmt.Sprintf("module %q version in %q is incorrectly set to %q and should be %q",
+		b.spec.Module,
+		filePath,
+		dep.Version,
+		expectedVersion), nil
+}

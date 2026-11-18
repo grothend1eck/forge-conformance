@@ -1,0 +1,952 @@
+package config
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"text/template"
+
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"go.yaml.in/yaml/v4"
+
+	"github.com/updatecli/updatecli/pkg/core/cmdoptions"
+	"github.com/updatecli/updatecli/pkg/core/pipeline/action"
+	"github.com/updatecli/updatecli/pkg/core/pipeline/autodiscovery"
+	"github.com/updatecli/updatecli/pkg/core/pipeline/condition"
+	"github.com/updatecli/updatecli/pkg/core/pipeline/scm"
+	"github.com/updatecli/updatecli/pkg/core/pipeline/source"
+	"github.com/updatecli/updatecli/pkg/core/pipeline/target"
+	"github.com/updatecli/updatecli/pkg/core/result"
+	"github.com/updatecli/updatecli/pkg/core/text"
+	"github.com/updatecli/updatecli/pkg/core/version"
+
+	"github.com/hexops/gotextdiff"
+	"github.com/hexops/gotextdiff/myers"
+	"github.com/hexops/gotextdiff/span"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/gitgeneric"
+
+	"cuelang.org/go/cue"
+	"cuelang.org/go/cue/cuecontext"
+	cueformat "cuelang.org/go/cue/format"
+)
+
+const (
+	// LOCALSCMIDENTIFIER defines the scm id used to configure the local scm directory
+	LOCALSCMIDENTIFIER string = "local"
+	// EXTENSIONYAML defines the file extension for yaml files
+	EXTENSIONYAML string = ".yaml"
+	// EXTENSIONYML defines the file extension for yml files
+	EXTENSIONYML string = ".yml"
+	// EXTENSIONJSON defines the file extension for json files
+	EXTENSIONJSON string = ".json"
+	// EXTENSIONCUE defines the file extension for cue files
+	EXTENSIONCUE string = ".cue"
+	// EXTENSIONTPL defines the file extension for golang template files
+	EXTENSIONTPL string = ".tpl"
+	// EXTENSIONTMPL defines the file extension for golang template files
+	EXTENSIONTMPL string = ".tmpl"
+)
+
+// Config contains cli configuration
+type Config struct {
+	// filename contains the updatecli manifest filename
+	filename string
+	// manifestID contains the effective manifest identifier used by the engine.
+	manifestID string
+	// baseDir overrides the directory relative paths resolve against. It is only set for
+	// the manifests Updatecli generates in memory, which have no filename to be relative to.
+	baseDir string
+	// Spec describe an updatecli manifest
+	Spec Spec
+	// gitHandler holds a git client implementation to manipulate git SCMs
+	gitHandler gitgeneric.GitHandler
+}
+
+// Search SCM expansion copies Spec for each discovered repository, and every map field
+// must be cloned there. See expandSCMConfigurations in pkg/core/engine.
+
+// Spec contains pipeline configuration
+type Spec struct {
+	// "name" defines a pipeline name
+	//
+	// example:
+	// 	* "name: 'deps: update nodejs version to latest stable'"
+	//
+	// remark:
+	// 	* using a short sentence describing the pipeline is a good way to name your pipeline.
+	// 	* using conventional commits convention is a good way to name your pipeline.
+	// 	* "name" is often used a default values for other configuration such as pullrequest title.
+	// 	* "name" shouldn't contain any dynamic information such as source output.
+	// 	* "name" defaults to the manifest filename when not specified.
+	Name string `yaml:",omitempty"`
+	// "id" defines a manifest dependency identifier that can be referenced by other manifests.
+	//
+	// example:
+	// 	* "id: nodejs"
+	// 	* "id: docker/alpine"
+	//
+	// remark:
+	// 	* "id" only affects manifest execution ordering.
+	// 	* "id" is used by the root manifest "dependson" keyword.
+	// 	* multiple manifests may intentionally share the same "id".
+	// 	* unlike "pipelineid", "id" does not affect branch naming or workflow grouping.
+	ID string `yaml:",omitempty"`
+	// "dependson" defines which manifest IDs must run before the current manifest.
+	//
+	// example:
+	// ---
+	// dependson:
+	//   - base-images
+	//   - shared-policies
+	// ---
+	//
+	// remark:
+	// 	* entries reference root manifest "id" values.
+	// 	* if multiple manifests share the same "id" then all of them must run first.
+	// 	* "dependson" only affects manifest execution ordering.
+	DependsOn []string `yaml:",omitempty"`
+	// "pipelineid" allows to identify a full pipeline run.
+	//
+	// example:
+	// 	* "pipelineid: nodejs/dependencies"
+	// 	* "pipelineid: gomod/github.com/updatecli/updatecli"
+	// 	* "pipelineid: autodiscovery/gomodules/minor"
+	//
+	// remark:
+	// 	* "pipelineid" is used to generate uniq branch name for target update relying on scm configuration.
+	// 	* The same "pipelineid" may be used by different Updatecli manifest" to ensure they are updated in the same workflow including pullrequest.
+	PipelineID string `yaml:",omitempty"`
+	// "autodiscovery" defines the configuration to automatically discover new versions update.
+	//
+	// example:
+	// ---
+	// autodiscovery:
+	// 	scmid: default
+	// 	actionid:  default
+	// 	groupby: all
+	// 	crawlers:
+	// 	  golang/gomod:
+	// 	  	versionfilter:
+	// 	  	kind: semver
+	// 	  	pattern: patch
+	// ---
+	AutoDiscovery autodiscovery.Config `yaml:",omitempty"`
+	// title is deprecated, please use "name" instead.
+	Title string `yaml:",omitempty" jsonschema:"-"`
+	// pullrequets is deprecated in favor of `actions`
+	PullRequests map[string]action.Config `yaml:",omitempty" jsonschema:"-"`
+	// "actions" defines the list of action configurations which need to be managed.
+	// They are triggered if any of the depending target is updated.
+	//
+	// examples:
+	// ---
+	// actions:
+	// 	default:
+	// 	  kind: github/pullrequest
+	// 	  scmid: default
+	// 	  spec:
+	// 	  	automerge: true
+	// 	  	labels:
+	// 	  	  - "dependencies"
+	// ---
+	Actions map[string]action.Config `yaml:",omitempty"`
+	// "scms" defines the list of repository configuration used to fetch content from.
+	//
+	// examples:
+	// ---
+	// scms:
+	// 	default:
+	// 	  kind: github
+	// 	  spec:
+	// 	    owner: "updatecli"
+	// 	    repository: "updatecli"
+	// 	    token: "${{ env "GITHUB_TOKEN" }}"
+	// 	    branch: "main"
+	// ---
+	SCMs map[string]scm.Config `yaml:"scms,omitempty"`
+	// "sources" defines the list of Updatecli source definition.
+	//
+	// example:
+	// ---
+	// sources:
+	// 	# Source to retrieve the latest version of nodejs
+	//   nodejs:
+	// 	   name: Get latest nodejs version
+	// 	   kind: json
+	// 	   spec:
+	// 	     file: https://nodejs.org/dist/index.json
+	// 	     key: .(lts!=false).version
+	// ---
+	Sources map[string]source.Config `yaml:",omitempty"`
+	// "conditions" defines the list of Updatecli condition definition.
+	//
+	// example:
+	// ---
+	// conditions:
+	//   container:
+	//     name: Check if Updatecli container image for tag "v0.63.0" exists
+	//     kind: dockerimage
+	//     spec:
+	//       image: "updatecli/updatecli:latest"
+	//       tag: "v0.63.0"
+	// ---
+	Conditions map[string]condition.Config `yaml:",omitempty"`
+	// targets defines the list of Updatecli target definition.
+	//
+	// example:
+	//---
+	// targets:
+	//   default:
+	//     name: 'ci: update Golangci-lint version to {{ source "default" }}'
+	//     kind: yaml
+	//     spec:
+	//       file: .github/workflows/go.yaml
+	//       key: $.jobs.build.steps[2].with.version
+	//     scmid: default
+	//     sourceid: default
+	//	---
+	Targets map[string]target.Config `yaml:",omitempty"`
+	// "version" defines the minimum Updatecli version compatible with the manifest
+	Version string `yaml:",omitempty"`
+	// "options" defines the manifest level settings that change how Updatecli behaves,
+	// as opposed to the keys describing what the pipeline is made of.
+	//
+	// example:
+	// ---
+	// options:
+	//   relativepaths: manifest
+	// ---
+	Options ManifestOptions `yaml:",omitempty"`
+	// Labels contains user defined labels attached to the pipeline.
+	//
+	// Labels are arbitrary key/value pairs that can be used to categorize or
+	// select pipelines. They are typically used for filtering pipelines when
+	// running Updatecli, for example to only run pipelines matching a given
+	// environment, operating system, or team.
+	//
+	// example:
+	// ---
+	// name: "Update dependencies"
+	// labels:
+	//   os: debian
+	//   environment: staging
+	//   team: backend
+	// sources:
+	//   ...
+	// ---
+	Labels map[string]string `yaml:",omitempty"`
+}
+
+// Option contains configuration options such as filepath located on disk,etc.
+type Option struct {
+	// ManifestFile contains the updatecli manifest full file path
+	ManifestFile string
+	// PartialFiles contains the list of full file paths for updatecli partial manifests.
+	// A partial file is a default manifest snippet available to all manifests within the same directory.
+	PartialFiles []string
+	// ValuesFiles contains the list of updatecli values full file path
+	ValuesFiles []string
+	// ValuesInline contains the list of inline values for templating, accepted valid json/yaml string
+	ValuesInline []string
+	// SecretsFiles contains the list of updatecli sops secrets full file path
+	SecretsFiles []string
+	// DisableTemplating specifies if needs to be done
+	DisableTemplating bool
+	// ValidateSchema reports the manifest keys not matching the Updatecli schema, such as
+	// a misspelled one, which would otherwise be silently ignored.
+	// Loading a manifest never fails because of it, a caller wanting to act on the
+	// problems collects them through OnSchemaProblem.
+	ValidateSchema bool
+	// OnSchemaProblem receives every schema problem found while loading the manifest.
+	// Problems are logged as warnings when it is not set.
+	OnSchemaProblem func(SchemaProblem)
+}
+
+// Reset reset configuration
+func (config *Config) Reset() {
+	*config = Config{
+		gitHandler: &gitgeneric.GoGit{},
+	}
+}
+
+// BaseDir returns the directory the relative paths of this manifest resolve against.
+//
+// An empty value, the default, means they resolve against the process working directory.
+func (config *Config) BaseDir() string {
+	if config.Spec.Options.RelativePaths != RelativePathBaseManifest {
+		return config.baseDir
+	}
+
+	if config.filename == "" {
+		return config.baseDir
+	}
+
+	return filepath.Dir(config.filename)
+}
+
+// SetBaseDir pins the directory relative paths resolve against, for the manifests that
+// Updatecli generates in memory rather than reads from disk.
+func (config *Config) SetBaseDir(baseDir string) {
+	config.baseDir = baseDir
+}
+
+// ManifestID returns the internal manifest identifier used by the engine.
+func (config *Config) ManifestID() string {
+	return config.manifestID
+}
+
+// DependencyID returns the manifest identifier exposed to dependson resolution.
+func (config *Config) DependencyID() string {
+	return config.Spec.ID
+}
+
+// SetManifestID configures the effective manifest identifier.
+//
+// The provided seed is hashed so each manifest has a deterministic internal
+// identifier even when user-facing dependency IDs are shared across manifests.
+func (config *Config) SetManifestID(seed string) {
+	hash := sha256.New()
+	hash.Write([]byte(seed))
+	config.manifestID = fmt.Sprintf("%x", hash.Sum(nil))
+}
+
+// New reads an updatecli configuration file.
+//
+// manifestDefaults holds the "options" a manifest inherits when it does not set them
+// itself. It is kept apart from Option, which only controls how the file is read from
+// disk.
+//
+//nolint:funlen
+func New(option Option, manifestDefaults ManifestOptions, pipelineIDFilters []string, pipelineLabels map[string]string) (configs []Config, err error) {
+	_, basename := filepath.Split(option.ManifestFile)
+
+	// We need to be sure to generate a file checksum before we inject
+	// templates values as in some situation those values changes for each run
+	fileChecksum, err := FileChecksum(option.ManifestFile)
+	if err != nil {
+		return nil, err
+	}
+
+	readFile := func(path string) ([]byte, error) {
+		// Load updatecli manifest no matter the file extension
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+
+		return io.ReadAll(f)
+	}
+
+	var templatedManifestContent []byte
+	var rawManifestContent []byte
+	// manifestFragments tracks which file each line of rawManifestContent comes
+	// from, so that a templating error can be reported against that file.
+	var manifestFragments []manifestFragment
+
+	for _, partialFile := range option.PartialFiles {
+		partialContent, err := readFile(partialFile)
+		if err != nil {
+			return nil, fmt.Errorf("loading Updatecli partial manifest %q: %v", partialFile, err)
+		}
+
+		// Ignore partial files that are not in the same directory as the main manifest file
+		// This is to avoid loading partial files from other directories to reduce the complexity of the manifest.
+		if filepath.Dir(partialFile) != filepath.Dir(option.ManifestFile) {
+			log.Debugf("Ignoring partial from a different directory: %q", partialFile)
+			continue
+		}
+
+		log.Debugf("Partial content detected from: %q", partialFile)
+		manifestFragments, partialContent = appendFragment(manifestFragments, partialFile, partialContent)
+		rawManifestContent = append(rawManifestContent, partialContent...)
+	}
+
+	log.Infof("Loading Pipeline %q", option.ManifestFile)
+	// Load updatecli manifest no matter the file extension
+	rawManifestFileContent, err := readFile(option.ManifestFile)
+	if err != nil {
+		return nil, err
+	}
+
+	manifestFragments, rawManifestFileContent = appendFragment(manifestFragments, option.ManifestFile, rawManifestFileContent)
+	rawManifestContent = append(rawManifestContent, rawManifestFileContent...)
+
+	specs := []Spec{}
+
+	isCue := false
+
+	switch extension := filepath.Ext(basename); extension {
+	case EXTENSIONTPL, EXTENSIONTMPL, EXTENSIONYAML, EXTENSIONYML, EXTENSIONJSON:
+		//
+	case EXTENSIONCUE:
+		if !cmdoptions.Experimental {
+			return nil, fmt.Errorf("cuelang support is experimental, please use '--experimental' flag to enable it")
+		}
+		isCue = true
+
+	default:
+		log.Debugf("file extension '%s' not supported for file '%s'", extension, option.ManifestFile)
+		return configs, ErrConfigFileTypeNotSupported
+	}
+
+	var cueManifest cue.Value
+	if !option.DisableTemplating {
+		// Try to template manifest no matter the extension
+		// templated manifest must respect its extension before and after templating
+
+		cwd, err := os.Getwd()
+		if err != nil {
+			return nil, err
+		}
+		fs := os.DirFS(cwd)
+
+		t := Template{
+			CfgFile:      option.ManifestFile,
+			ValuesFiles:  option.ValuesFiles,
+			ValuesInline: option.ValuesInline,
+			SecretsFiles: option.SecretsFiles,
+			Fragments:    manifestFragments,
+			fs:           fs,
+		}
+
+		if isCue {
+			cueManifest, err = t.NewCueTemplate(rawManifestContent)
+		} else {
+			templatedManifestContent, err = t.NewStringTemplate(rawManifestContent)
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		if GolangTemplatingDiff {
+			if isCue {
+				// Reformat all the CUE sources so that they can be diffed.
+				rawManifestContent, err = cueformat.Source(rawManifestContent, cueformat.Simplify())
+				if err != nil {
+					log.Errorf("Error formatting %q for diff: %s", option.ManifestFile, err.Error())
+					return nil, err
+				}
+
+				node := cueManifest.Syntax(cue.Final(), cue.ErrorsAsValues(true))
+				templatedManifestContent, err = cueformat.Node(node, cueformat.Simplify())
+				if err != nil {
+					log.Errorf("Error formatting %q (templated) for diff: %s", option.ManifestFile, err.Error())
+					return nil, err
+				}
+			}
+
+			diff := text.Diff("raw manifest", "templated manifest", string(rawManifestContent), string(templatedManifestContent))
+			switch diff {
+			case "":
+				log.Debugln("no Golang templating detected")
+			default:
+				log.Debugf("Golang templating change detected:\n%s\n\n---\n", diff)
+			}
+		}
+	} else if isCue {
+		ctx := cuecontext.New()
+		cueManifest = ctx.CompileBytes(rawManifestContent)
+	}
+
+	if isCue {
+		var spec Spec
+		err = cueManifest.Decode(&spec)
+		if err != nil {
+			return configs, err
+		}
+		specs = append(specs, spec)
+	} else {
+		err := unmarshalConfigSpec(templatedManifestContent, &specs)
+		if err != nil {
+			return configs, err
+		}
+
+		// Reported before the specs are post-processed, so that a problem points at what
+		// the manifest actually says rather than at a value Updatecli defaulted.
+		// A cue manifest is skipped as it is not parsed from YAML.
+		if option.ValidateSchema {
+			reportSchemaProblems(option.ManifestFile, templatedManifestContent, option.OnSchemaProblem)
+		}
+	}
+
+	for id := range specs {
+
+		config := Config{}
+
+		config.filename = option.ManifestFile
+		config.Spec = specs[id]
+		config.SetManifestID(fmt.Sprintf("%s#%d", option.ManifestFile, id))
+		// config.PipelineID is required for config.Validate()
+		if len(config.Spec.PipelineID) == 0 {
+			log.Debugln("pipelineid undefined, we'll try to generate one")
+
+			// If pipeline name is defined then we use it to generate a pipeline id
+			// there is less change for the pipeline name to change.
+			switch config.Spec.Name {
+			case "":
+				log.Debugln("pipeline name undefined, we'll use the manifest file checksum")
+				config.Spec.PipelineID = fileChecksum
+			default:
+				log.Debugln("using pipeline name to generate the pipelineid")
+				hash := sha256.New()
+				hash.Write([]byte(config.Spec.Name))
+				config.Spec.PipelineID = fmt.Sprintf("%x", hash.Sum(nil))
+			}
+		}
+
+		// By default Set config.Version to the current updatecli version
+		if len(config.Spec.Version) == 0 {
+			config.Spec.Version = version.Version
+		}
+
+		// A manifest inherits the settings it did not pick itself.
+		//
+		// This has to happen before EnsureLocalScm below, which already resolves
+		// config.BaseDir(): merging later would make "--relative-paths manifest" silently
+		// skip local scm autoguessing while the manifest key did not.
+		config.Spec.Options.Merge(manifestDefaults)
+
+		// Ensure there is a local SCM defined as specified
+		if err = config.EnsureLocalScm(); err != nil {
+			log.Errorf("No local scm configured %s", err)
+			continue
+		}
+
+		/** Check for deprecated directives **/
+		// pullrequests deprecated over actions
+		if len(config.Spec.PullRequests) > 0 {
+			if len(config.Spec.Actions) > 0 {
+				err := fmt.Errorf("the `pullrequests` and `actions` keywords are mutually exclusive. Please use only `actions` as `pullrequests` is deprecated")
+				log.Errorf("Skipping manifest %q:\n\t%s", option.ManifestFile, err.Error())
+				continue
+			}
+
+			log.Warningf("The `pullrequests` keyword is deprecated in favor of `actions`, please update this manifest. Updatecli will continue the execution while trying to translate `pullrequests` to `actions`.")
+
+			config.Spec.Actions = config.Spec.PullRequests
+			config.Spec.PullRequests = nil
+		}
+
+		if len(config.Spec.Name) == 0 {
+			config.Spec.Name = strings.ToTitle(basename)
+		}
+
+		err = config.Validate()
+		if err != nil {
+			log.Errorf("manifest configuration failed: %s", err)
+			continue
+		}
+
+		if len(pipelineIDFilters) > 0 && !slices.Contains(pipelineIDFilters, config.Spec.PipelineID) {
+			log.Debugf("Manifest ID %q not referenced in the pipeline filter, skipping.", config.Spec.PipelineID)
+			continue
+		}
+
+		if isMatchingLabel := isMatchingLabel(config.Spec.Labels, pipelineLabels); !isMatchingLabel {
+			log.Debugf("Manifest ID %q labels %v did not match filter labels %v, skipping.", config.Spec.PipelineID, config.Spec.Labels, pipelineLabels)
+			continue
+		}
+
+		configs = append(configs, config)
+	}
+
+	return configs, err
+}
+
+// isMatchingLabel checks if a spec labels match filter labels
+func isMatchingLabel(specLabels map[string]string, filterLabels map[string]string) bool {
+	if len(filterLabels) == 0 {
+		return true
+	}
+
+	for key, value := range filterLabels {
+		if _, ok := specLabels[key]; !ok {
+			return false
+		}
+
+		if value != "" && specLabels[key] != value {
+			// Label key exists but value does not match
+			return false
+		}
+	}
+	// All filter labels matched
+	return true
+}
+
+// IsManifestDifferentThanOnDisk checks if an Updatecli manifest in memory is the same than the one on disk
+func (c *Config) IsManifestDifferentThanOnDisk() (bool, error) {
+	buf := bytes.NewBufferString("")
+
+	encoder := yaml.NewEncoder(buf)
+
+	defer func() {
+		err := encoder.Close()
+		if err != nil {
+			log.Errorln(err)
+		}
+	}()
+
+	encoder.SetIndent(YAMLSetIdent)
+
+	err := encoder.Encode(c.Spec)
+	if err != nil {
+		return false, err
+	}
+
+	data := buf.Bytes()
+
+	onDiskData, err := os.ReadFile(c.filename)
+	if err != nil {
+		return false, err
+	}
+
+	if string(onDiskData) == string(data) {
+		log.Infof("%s No Updatecli manifest change required", result.SUCCESS)
+		return false, nil
+	}
+
+	edits := myers.ComputeEdits(span.URIFromPath(c.filename), string(onDiskData), string(data))
+	diff := fmt.Sprint(gotextdiff.ToUnified(c.filename+"(old)", c.filename+"(updated)", string(onDiskData), edits))
+
+	log.Infof("%s Updatecli manifest change required\n%s", result.ATTENTION, diff)
+
+	return true, nil
+}
+
+// SaveOnDisk saves an updatecli manifest to disk
+func (c *Config) SaveOnDisk() error {
+	file, err := os.OpenFile(c.filename, os.O_WRONLY, os.ModePerm)
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		err = file.Close()
+		if err != nil {
+			log.Errorln(err)
+		}
+	}()
+
+	encoder := yaml.NewEncoder(file)
+
+	defer func() {
+		err = encoder.Close()
+		if err != nil {
+			log.Errorln(err)
+		}
+	}()
+
+	// Must be set to 4 so we align with the default behavior when
+	// we marshaled the inmemory yaml to compare with the one from disk
+	encoder.SetIndent(YAMLSetIdent)
+	err = encoder.Encode(c.Spec)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// Display shows updatecli configuration including secrets !
+func (config *Config) Display() error {
+	c, err := yaml.Marshal(&config.Spec)
+	if err != nil {
+		return err
+	}
+	log.Infof("%s", string(c))
+
+	return nil
+}
+
+func (config *Config) validateActions() error {
+	for id, a := range config.Spec.Actions {
+		if err := a.Validate(); err != nil {
+			log.Errorf("bad parameters for action %q", id)
+			return err
+		}
+
+		// Then validate that the action specifies an existing SCM
+		if len(a.ScmID) > 0 {
+			if _, ok := config.Spec.SCMs[a.ScmID]; !ok {
+				log.Errorf("The action %q specifies a scm id %q which does not exist", id, a.ScmID)
+				return ErrBadConfig
+			}
+		}
+
+		// a.Validate may modify the object during validation
+		// so we want to be sure that we save those modifications
+		config.Spec.Actions[id] = a
+	}
+	return nil
+}
+
+func (config *Config) validateAutodiscovery() error {
+	// Then validate that the action specifies an existing SCM
+	if len(config.Spec.AutoDiscovery.ScmId) > 0 {
+		if _, ok := config.Spec.SCMs[config.Spec.AutoDiscovery.ScmId]; !ok {
+			log.Errorf("The autodiscovery specifies a scm id %q which does not exist",
+				config.Spec.AutoDiscovery.ScmId)
+			return ErrBadConfig
+		}
+	}
+
+	if err := config.Spec.AutoDiscovery.GroupBy.Validate(); err != nil {
+		return ErrBadConfig
+	}
+
+	return nil
+}
+
+func (config *Config) validateSources() error {
+	for id, s := range config.Spec.Sources {
+		err := s.Validate()
+		if err != nil {
+			log.Errorf("bad parameters for source %q", id)
+			return ErrBadConfig
+		}
+
+		if IsTemplatedString(id) {
+			log.Errorf("sources key %q contains forbidden go template instruction", id)
+			return ErrNotAllowedTemplatedKey
+		}
+
+		// s.Validate may modify the object during validation
+		// so we want to be sure that we save those modifications
+		config.Spec.Sources[id] = s
+	}
+	return nil
+}
+
+func (config *Config) validateSCMs() error {
+	for id, scmConfig := range config.Spec.SCMs {
+		if err := scmConfig.Validate(); err != nil {
+			log.Errorf("bad parameter(s) for scm %q", id)
+			return err
+		}
+	}
+	return nil
+}
+
+func (config *Config) validateTargets() error {
+	for id, t := range config.Spec.Targets {
+
+		err := t.Validate()
+		if err != nil {
+			log.Errorf("bad parameters for target %q", id)
+			return ErrBadConfig
+		}
+
+		if len(t.SourceID) > 0 {
+			if _, ok := config.Spec.Sources[t.SourceID]; !ok {
+				log.Errorf("the specified sourceid %q for target %q does not exist", t.SourceID, id)
+				return ErrBadConfig
+			}
+		}
+
+		if t.DisableConditions && len(t.DeprecatedConditionIDs) > 0 {
+			log.Errorf("target %q has 'disableconditions' set to true and 'conditionids' defined (%v), it's not possible to disable conditions and define conditions at the same time", id, t.DeprecatedConditionIDs)
+			return ErrBadConfig
+		}
+
+		undefinedConditions := []string{}
+		for _, conditionID := range t.DeprecatedConditionIDs {
+			if _, ok := config.Spec.Conditions[conditionID]; !ok {
+				undefinedConditions = append(undefinedConditions, conditionID)
+			}
+		}
+
+		if len(undefinedConditions) > 0 {
+			log.Errorf("target %q has undefined conditionids: %v", id, undefinedConditions)
+			return ErrBadConfig
+		}
+
+		// Only check/guess the sourceID if the user did not disable it (default is enabled)
+		if !t.DisableSourceInput {
+			// Try to guess SourceID
+			if len(t.SourceID) == 0 && len(config.Spec.Sources) > 1 {
+
+				log.Errorf("empty 'sourceid' for target %q", id)
+				return ErrBadConfig
+			} else if len(t.SourceID) == 0 && len(config.Spec.Sources) == 1 {
+				for id := range config.Spec.Sources {
+					t.SourceID = id
+				}
+			}
+		}
+
+		if IsTemplatedString(id) {
+			log.Errorf("target key %q contains forbidden go template instruction", id)
+			return ErrNotAllowedTemplatedKey
+		}
+
+		// t.Validate may modify the object during validation
+		// so we want to be sure that we save those modifications
+		config.Spec.Targets[id] = t
+
+	}
+	return nil
+}
+
+func (config *Config) validateConditions() error {
+	for id, c := range config.Spec.Conditions {
+		err := c.Validate()
+		if err != nil {
+			log.Errorf("bad parameters for condition %q", id)
+			return ErrBadConfig
+		}
+
+		if len(c.SourceID) > 0 {
+			if _, ok := config.Spec.Sources[c.SourceID]; !ok {
+				log.Errorf("the specified sourceid %q for condition %q does not exist", c.SourceID, id)
+				return ErrBadConfig
+			}
+		}
+		// Only check/guess the sourceID if the user did not disable it (default is enabled)
+		if !c.DisableSourceInput {
+			// Try to guess SourceID
+			if len(c.SourceID) == 0 && len(config.Spec.Sources) > 1 {
+				log.Errorf("The condition %q has an empty 'sourceid' attribute.", id)
+				return ErrBadConfig
+			} else if len(c.SourceID) == 0 && len(config.Spec.Sources) == 1 {
+				for id := range config.Spec.Sources {
+					c.SourceID = id
+				}
+			}
+		}
+
+		if IsTemplatedString(id) {
+			log.Errorf("condition key %q contains forbidden go template instruction", id)
+			return ErrNotAllowedTemplatedKey
+		}
+
+		config.Spec.Conditions[id] = c
+
+	}
+	return nil
+}
+
+// Validate run various validation test on the configuration and update fields if necessary
+func (config *Config) Validate() error {
+	var errs []error
+	err := config.ValidateManifestCompatibility()
+	if err != nil {
+		errs = append(
+			errs,
+			fmt.Errorf("updatecli version compatibility error:\n%s", err))
+	}
+
+	if config.Spec.Title != "" {
+		log.Warningf("title is deprecated, please use name instead")
+	}
+
+	if err := config.Spec.Options.Validate(); err != nil {
+		errs = append(errs, fmt.Errorf("options validation error:\n%s", err))
+	}
+
+	err = config.validateConditions()
+	if err != nil {
+		errs = append(
+			errs,
+			fmt.Errorf("conditions validation error:\n%s", err))
+	}
+
+	err = config.validateActions()
+	if err != nil {
+		errs = append(
+			errs,
+			fmt.Errorf("actions validation error:\n%s", err))
+	}
+
+	err = config.validateAutodiscovery()
+	if err != nil {
+		errs = append(
+			errs,
+			fmt.Errorf("autodiscovery validation error:\n%s", err))
+	}
+
+	err = config.validateSCMs()
+	if err != nil {
+		errs = append(
+			errs,
+			fmt.Errorf("scms validation error:\n%s", err))
+	}
+
+	err = config.validateSources()
+	if err != nil {
+		errs = append(
+			errs,
+			fmt.Errorf("sources validation error:\n%s", err))
+	}
+
+	err = config.validateTargets()
+	if err != nil {
+		errs = append(
+			errs,
+			fmt.Errorf("targets validation error:\n%s", err))
+	}
+
+	// Concatenate error message
+	if len(errs) > 0 {
+		err = errs[0]
+		for i := range errs {
+			if i > 1 {
+				err = fmt.Errorf("%s\n%s", err, errs[i])
+			}
+		}
+		return err
+	}
+
+	return nil
+}
+
+func (config *Config) ValidateManifestCompatibility() error {
+	isCompatibleUpdatecliVersion, err := version.IsGreaterThan(
+		version.Version,
+		config.Spec.Version)
+	if err != nil {
+		return fmt.Errorf("pipeline %q - %q", config.Spec.Name, err)
+	}
+
+	// Ensure that the current updatecli version is compatible with the manifest
+	if !isCompatibleUpdatecliVersion {
+		return fmt.Errorf("pipeline %q requires Updatecli version greater than or equal to %q, skipping", config.Spec.Name, config.Spec.Version)
+	}
+
+	return nil
+}
+
+// Update updates its own configuration file
+// It's used when the configuration expected a value defined a runtime
+func (config *Config) Update(data interface{}) (err error) {
+	content, err := yaml.Marshal(config.Spec)
+	if err != nil {
+		return err
+	}
+
+	tmpl, err := template.New("cfg").Funcs(updatecliRuntimeFuncMap(data)).Parse(string(content))
+	if err != nil {
+		return err
+	}
+
+	b := bytes.Buffer{}
+	if err := tmpl.Execute(&b, &data); err != nil {
+		return err
+	}
+
+	err = yaml.Unmarshal(b.Bytes(), &config.Spec)
+	if err != nil {
+		return err
+	}
+
+	err = config.Validate()
+	if err != nil {
+		return err
+	}
+
+	return err
+}

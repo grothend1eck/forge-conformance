@@ -1,0 +1,97 @@
+package gittag
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"github.com/updatecli/updatecli/pkg/core/pipeline/scm"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/age"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/pathresolver"
+)
+
+// Condition checks that a git tag exists
+func (gt *GitTag) Condition(_ context.Context, source string, scm scm.ScmHandler, pathResolver pathresolver.Resolver) (pass bool, message string, err error) {
+
+	err = gt.Validate()
+	if err != nil {
+		return false, "", err
+	}
+
+	if gt.spec.URL != "" && scm != nil {
+		log.Warningf("URL setting value %q is overriding the scm configuration (value %q)",
+			gt.spec.URL,
+			scm.GetURL())
+	}
+
+	var tags map[string]string
+	var tagsList []string
+
+	if scm != nil {
+		gt.directory = scm.GetDirectory()
+	}
+
+	switch gt.lsRemote {
+	case true:
+		tagsList, tags, err = gt.listRemoteURLTags()
+		if err != nil {
+			return false, "", err
+		}
+
+	case false:
+		if gt.spec.Path != "" && scm != nil {
+			log.Warningf("Path setting value %q is overriding the scm configuration (value %q)",
+				gt.spec.Path,
+				scm.GetDirectory())
+		}
+
+		// A condition checks whether a specific tag exists, so the age filter,
+		// which only narrows down which tag to pick, doesn't apply here.
+		tagsList, tags, _, err = gt.listRemoteDirectoryTags(gt.directory, age.Spec{}, pathResolver)
+		if err != nil {
+			return false, "", fmt.Errorf("listing local tags: %w", err)
+		}
+	}
+
+	// If source input is empty, then it means that it was disabled by the user with `disablesourceinput: true`
+	if source != "" {
+		log.Infof("Source input value detected: using it as spec.versionfilter.pattern")
+		gt.versionFilter.Pattern = source
+	}
+
+	if len(tagsList) == 0 {
+		return false, "no tags found", nil
+	}
+
+	// If spec.Tag is provided, use it for exact match checking (priority over source)
+	// If source is provided and spec.Tag is empty, use source for exact match
+	// Otherwise, fall back to versionFilter pattern matching
+	tag := source
+	if gt.spec.Tag != "" {
+		tag = gt.spec.Tag
+	}
+
+	// If tag is specified (either via spec.Tag or source), check for exact match
+	if tag != "" {
+
+		if _, ok := tags[tag]; ok {
+			return true, fmt.Sprintf("git tag %q found", tag), nil
+		}
+
+		// Tag not found
+		return false, fmt.Sprintf("no git tag found matching %q", tag), nil
+	}
+
+	// Fall back to versionFilter pattern matching (existing behavior)
+	gt.foundVersion, err = gt.versionFilter.Search(tagsList)
+	if err != nil {
+		return false, "", err
+	}
+	foundTag := gt.foundVersion.GetVersion()
+
+	if len(foundTag) == 0 {
+		return false, fmt.Sprintf("no git tag matching pattern %q, found", gt.versionFilter.Pattern), nil
+	}
+
+	return true, fmt.Sprintf("git tag matching %q found\n", gt.versionFilter.Pattern), nil
+}

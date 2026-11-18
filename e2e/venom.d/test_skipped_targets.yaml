@@ -1,0 +1,23 @@
+---
+name: 'Updatecli Skipped Targets TestSuite'
+vars:
+  message:
+    warning: 'WARNING:'
+    error: 'ERROR:'
+testcases:
+  - name: "Test that all the manifests in skipped.targets.d have at least a target named shouldNeverRun"
+    steps:
+      - script: 'find ../updatecli.d/skipped.targets.d -type f -name "*yaml" -exec cat {} \;'
+        type: 'exec'
+        assertions:
+          - 'result.code ShouldEqual 0'
+          - 'result.systemout ShouldContainSubstring "shouldNeverRun:"'
+  - name: "Test that no target is ever run in this set of updatecli manifests"
+    steps:
+      - script: '../scripts/test_skipped_targets.bash'
+        type: 'exec'
+        assertions:
+          - 'result.code ShouldEqual 0'
+          - 'result.systemout ShouldNotContainSubstring "{{ .message.warning }}"'
+          - 'result.systemout ShouldNotContainSubstring "{{ .message.error }}"'
+          - 'result.systemout ShouldContainSubstring "- [shouldNeverRun]"'

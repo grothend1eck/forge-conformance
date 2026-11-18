@@ -1,0 +1,136 @@
+package terraform
+
+import (
+	"bytes"
+	"fmt"
+	"path"
+	"path/filepath"
+	"text/template"
+
+	terraformRegistryAddress "github.com/hashicorp/terraform-registry-address"
+	"github.com/updatecli/updatecli/pkg/core/log"
+)
+
+func (t Terraform) discoverTerraformProvidersManifests() ([][]byte, error) {
+	var manifests [][]byte
+
+	searchFromDir := t.rootDir
+	// If the spec.RootDir is an absolute path, then it as already been set
+	// correctly in the New function.
+	if t.spec.RootDir != "" && !path.IsAbs(t.spec.RootDir) {
+		searchFromDir = filepath.Join(t.rootDir, t.spec.RootDir)
+	}
+
+	foundFiles, err := searchTerraformLockFiles(searchFromDir)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, foundFile := range foundFiles {
+		log.Debugf("parsing file %q", foundFile)
+
+		relativeFoundFile, err := filepath.Rel(t.rootDir, foundFile)
+		if err != nil {
+			log.Debugln(err)
+			continue
+		}
+		providers, err := getTerraformLockContent(foundFile)
+		if err != nil {
+			log.Debugln(err)
+			continue
+		}
+
+		for provider, providerVersion := range providers {
+			// Test if the ignore rule based on path is respected
+			if len(t.spec.Ignore) > 0 {
+				if t.spec.Ignore.isMatchingRules(t.rootDir, relativeFoundFile, provider, providerVersion) {
+					log.Debugf("Ignoring provider %q from file %q, as matching ignore rule(s)\n", provider, relativeFoundFile)
+					continue
+				}
+			}
+
+			// Test if the only rule based on path is respected
+			if len(t.spec.Only) > 0 {
+				if !t.spec.Only.isMatchingRules(t.rootDir, relativeFoundFile, provider, providerVersion) {
+					log.Debugf("Ignoring provider %q from %q, as not matching only rule(s)\n", provider, relativeFoundFile)
+					continue
+				}
+			}
+
+			versionPattern, err := t.versionFilter.GreaterThanPattern(providerVersion)
+			if err != nil {
+				log.Debugf("skipping provider %q due to: %s", provider, err)
+				continue
+			}
+
+			moduleManifest, err := t.getTerraformManifest(
+				relativeFoundFile,
+				provider,
+				versionPattern,
+			)
+			if err != nil {
+				log.Debugf("skipping provider %q due to: %s", provider, err)
+				continue
+			}
+
+			manifests = append(manifests, moduleManifest)
+
+		}
+	}
+
+	log.Printf("%v manifests identified", len(manifests))
+
+	return manifests, nil
+}
+
+func (t Terraform) getTerraformManifest(filename, provider, versionFilterPattern string) ([]byte, error) {
+	tmpl, err := template.New("manifest").Parse(terraformProviderManifestTemplate)
+	if err != nil {
+		return nil, err
+	}
+
+	p, err := terraformRegistryAddress.ParseProviderSource(provider)
+	if err != nil {
+		return nil, err
+	}
+
+	var providerHostname string
+	if p.Hostname.String() != "registry.terraform.io" {
+		providerHostname = p.Hostname.String()
+	}
+
+	params := struct {
+		ActionID             string
+		TerraformLockFile    string
+		Platforms            []string
+		Provider             string
+		ProviderHostname     string
+		ProviderNamespace    string
+		ProviderName         string
+		VersionFilterKind    string
+		VersionFilterPattern string
+		VersionFilterRegex   string
+		ScmID                string
+		TargetName           string
+	}{
+		ActionID:             t.actionID,
+		TerraformLockFile:    filename,
+		Platforms:            t.spec.Platforms,
+		Provider:             p.ForDisplay(),
+		ProviderHostname:     providerHostname,
+		ProviderNamespace:    p.Namespace,
+		ProviderName:         p.Type,
+		VersionFilterKind:    t.versionFilter.Kind,
+		VersionFilterPattern: versionFilterPattern,
+		VersionFilterRegex:   t.versionFilter.Regex,
+		ScmID:                t.scmID,
+		TargetName:           fmt.Sprintf("Bump %s to {{ source \"latestVersion\" }}", p.ForDisplay()),
+	}
+
+	manifest := bytes.Buffer{}
+	if err := tmpl.Execute(&manifest, params); err != nil {
+		log.Debugln(err)
+		return nil, err
+	}
+	return manifest.Bytes(), nil
+}

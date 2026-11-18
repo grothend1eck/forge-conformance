@@ -1,0 +1,36 @@
+name: "NPM autodiscovery using git scm"
+scms:
+  #default:
+  #  kind: git
+  #  spec:
+  #    url: https://github.com/olblak/plugin-site.git
+  #    branch: master
+  #    #url: https://github.com/updatecli/app-dashboard.git
+  #    #branch: main
+  default:
+    kind: github
+    spec:
+      owner: updatecli
+      repository: app-dashboard
+      branch: main
+
+actions:
+  default:
+    kind: github/pullrequest
+    scmid: default
+
+autodiscovery:
+  scmid: default
+  actionid: default
+  groupby: all
+  #groupby: individual
+  crawlers:
+    npm:
+      ignoreversionconstraints: true
+      versionfilter:
+        kind: semver
+        pattern: "majoronly"
+      only:
+        - packages:
+            "axios": ""
+            "core-js": ""

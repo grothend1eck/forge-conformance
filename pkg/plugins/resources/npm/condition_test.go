@@ -1,0 +1,195 @@
+package npm
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/age"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/pathresolver"
+)
+
+func TestCondition(t *testing.T) {
+	dir, err := CreateDummyRc()
+	if err != nil {
+		require.NoError(t, err)
+	}
+	defer os.RemoveAll(dir)
+	tests := []struct {
+		name                 string
+		url                  string
+		spec                 Spec
+		expectedResult       bool
+		expectedError        bool
+		mockedResponse       bool
+		mockedBody           string
+		mockedUrl            string
+		mockedToken          string
+		mockedHTTPStatusCode int
+	}{
+		{
+			name: "Passing case of retrieving axios versions ",
+			spec: Spec{
+				Name:    "axios",
+				Version: "1.0.0",
+			},
+			expectedResult: true,
+			expectedError:  false,
+		},
+		{
+			name: "Passing case of retrieving latest axios version using latest rule ",
+			spec: Spec{
+				Name:    "axios",
+				Version: "99.99.99",
+			},
+			expectedResult: false,
+			expectedError:  false,
+		},
+		{
+			name: "Passing case of retrieving axios versions using custom default registry",
+			spec: Spec{
+				Name:          "axios",
+				Version:       "0.2.0",
+				URL:           "https://mycustomregistry.updatecli.io",
+				RegistryToken: "mytoken",
+			},
+			expectedResult:       true,
+			expectedError:        false,
+			mockedResponse:       true,
+			mockedBody:           existingPackageData,
+			mockedHTTPStatusCode: 200,
+			mockedToken:          "mytoken",
+			mockedUrl:            "https://mycustomregistry.updatecli.io",
+		},
+		{
+			name: "Passing case of retrieving latest axios version using latest rule using custom default registry ",
+			spec: Spec{
+				Name:          "axios",
+				Version:       "99.99.99",
+				URL:           "https://mycustomregistry.updatecli.io",
+				RegistryToken: "mytoken",
+			},
+			expectedResult:       false,
+			expectedError:        false,
+			mockedResponse:       true,
+			mockedBody:           existingPackageData,
+			mockedHTTPStatusCode: 200,
+			mockedToken:          "mytoken",
+			mockedUrl:            "https://mycustomregistry.updatecli.io",
+		},
+		{
+			name: "Passing case of retrieving axios versions using private registry in npmrc",
+			spec: Spec{
+				Name:      "@TestScope/test",
+				Version:   "0.2.0",
+				NpmrcPath: filepath.Join(dir, ".npmrc"),
+			},
+			expectedResult:       true,
+			expectedError:        false,
+			mockedResponse:       true,
+			mockedBody:           existingScopedPackageData,
+			mockedHTTPStatusCode: 200,
+			mockedToken:          "mytoken",
+			mockedUrl:            "https://mycustomregistry.updatecli.io",
+		},
+		{
+			name: "Passing case of retrieving latest axios version using latest rule using private registry in npmrc ",
+			spec: Spec{
+				Name:      "@TestScope/test",
+				Version:   "99.99.99",
+				NpmrcPath: filepath.Join(dir, ".npmrc"),
+			},
+			expectedResult:       false,
+			expectedError:        false,
+			mockedResponse:       true,
+			mockedBody:           existingScopedPackageData,
+			mockedHTTPStatusCode: 200,
+			mockedToken:          "mytoken",
+			mockedUrl:            "https://mycustomregistry.updatecli.io",
+		},
+		{
+			name: "Passing case of an existing axios version matching the minimum age",
+			spec: Spec{
+				Name:          "axios",
+				Version:       "0.2.0",
+				Age:           age.Spec{Minimum: "1y"},
+				URL:           "https://mycustomregistry.updatecli.io",
+				RegistryToken: "mytoken",
+			},
+			expectedResult:       true,
+			mockedResponse:       true,
+			mockedBody:           existingPackageData,
+			mockedHTTPStatusCode: 200,
+			mockedToken:          "mytoken",
+			mockedUrl:            "https://mycustomregistry.updatecli.io",
+		},
+		{
+			name: "Failing case of an existing axios version not matching the minimum age",
+			spec: Spec{
+				Name:          "axios",
+				Version:       "0.2.0",
+				Age:           age.Spec{Minimum: "100y"},
+				URL:           "https://mycustomregistry.updatecli.io",
+				RegistryToken: "mytoken",
+			},
+			expectedResult:       false,
+			mockedResponse:       true,
+			mockedBody:           existingPackageData,
+			mockedHTTPStatusCode: 200,
+			mockedToken:          "mytoken",
+			mockedUrl:            "https://mycustomregistry.updatecli.io",
+		},
+		{
+			name: "Passing case of an existing axios version matching the maximum age",
+			spec: Spec{
+				Name:          "axios",
+				Version:       "0.2.0",
+				Age:           age.Spec{Maximum: "100y"},
+				URL:           "https://mycustomregistry.updatecli.io",
+				RegistryToken: "mytoken",
+			},
+			expectedResult:       true,
+			mockedResponse:       true,
+			mockedBody:           existingPackageData,
+			mockedHTTPStatusCode: 200,
+			mockedToken:          "mytoken",
+			mockedUrl:            "https://mycustomregistry.updatecli.io",
+		},
+		{
+			name: "Failing case of an existing axios version not matching the maximum age",
+			spec: Spec{
+				Name:          "axios",
+				Version:       "0.2.0",
+				Age:           age.Spec{Maximum: "1s"},
+				URL:           "https://mycustomregistry.updatecli.io",
+				RegistryToken: "mytoken",
+			},
+			expectedResult:       false,
+			mockedResponse:       true,
+			mockedBody:           existingPackageData,
+			mockedHTTPStatusCode: 200,
+			mockedToken:          "mytoken",
+			mockedUrl:            "https://mycustomregistry.updatecli.io",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := New(tt.spec)
+			require.NoError(t, err)
+			if tt.mockedResponse {
+				got.webClient = GetMockClient(tt.mockedUrl, tt.mockedToken, tt.mockedBody, tt.mockedHTTPStatusCode)
+			}
+			if tt.expectedError {
+				assert.Error(t, err)
+				return
+			}
+			gotResult, _, gotErr := got.Condition(context.Background(), "", nil, pathresolver.Resolver{})
+			require.NoError(t, gotErr)
+			assert.Equal(t, tt.expectedResult, gotResult)
+		})
+	}
+
+}

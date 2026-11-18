@@ -1,0 +1,53 @@
+package cmd
+
+import (
+	"os"
+
+	"github.com/updatecli/updatecli/pkg/core/log"
+
+	"github.com/spf13/cobra"
+)
+
+var (
+	udashAccessToken    string
+	udashEndpointURL    string
+	udashEndpointAPIURL string
+
+	udashLoginCmd = &cobra.Command{
+		Use:     "login url",
+		Short:   "[Experimental] login authenticates with the Udash.",
+		Example: "updatecli udash login app.updatecli.io",
+		Run: func(cmd *cobra.Command, args []string) {
+
+			// TODO: To be removed once not experimental anymore
+			if !experimental {
+				log.Warningf("The 'login' feature requires the flag experimental to work, such as:\n\t`updatecli udash login --experimental https://app.updatecli.io`")
+				os.Exit(1)
+			}
+
+			switch len(args) {
+			case 0:
+				log.Errorf("missing URL to login to")
+				os.Exit(1)
+			case 1:
+				udashEndpointURL = args[0]
+			default:
+				log.Errorf("can only login to one URL at a time")
+				os.Exit(1)
+			}
+
+			err := run("udash/login")
+			if err != nil {
+				log.Errorf("command failed")
+				os.Exit(1)
+			}
+		},
+	}
+)
+
+func init() {
+	udashLoginCmd.Flags().StringVar(&udashAccessToken, "token", "", "token defines the Udash API token. Without it, Updatecli prompts for one")
+	udashLoginCmd.Flags().StringVar(&udashEndpointAPIURL, "api-url", "", "api-url defines the udash API URL, <url>/api/v1beta1 by default")
+
+	udashCmd.AddCommand(udashLoginCmd)
+}

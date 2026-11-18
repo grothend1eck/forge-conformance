@@ -1,0 +1,140 @@
+package release
+
+import (
+	"context"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/updatecli/updatecli/pkg/core/result"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/age"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/pathresolver"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/version"
+)
+
+func TestSource(t *testing.T) {
+
+	tests := []struct {
+		name     string
+		manifest struct {
+			URL           string
+			Token         string
+			Owner         string
+			Repository    string
+			VersionFilter version.Filter
+			Age           age.Spec
+		}
+		wantResult  string
+		wantSkipped bool
+		wantErr     bool
+	}{
+		{
+			name: "repository updatecli/updatecli-nonexistent should not exist",
+			manifest: struct {
+				URL           string
+				Token         string
+				Owner         string
+				Repository    string
+				VersionFilter version.Filter
+				Age           age.Spec
+			}{
+				URL:        "codeberg.org",
+				Token:      "",
+				Owner:      "updatecli",
+				Repository: "updatecli-nonexistent",
+			},
+			wantResult: "",
+			wantErr:    true,
+		},
+		{
+			name: "repository updatecli/demo-terminal should exist but no release",
+			manifest: struct {
+				URL           string
+				Token         string
+				Owner         string
+				Repository    string
+				VersionFilter version.Filter
+				Age           age.Spec
+			}{
+				URL:        "codeberg.org",
+				Token:      "",
+				Owner:      "updatecli",
+				Repository: "demo-terminal",
+			},
+			wantResult: "",
+			wantErr:    true,
+		},
+		{
+			name: "repository should exist with release 0.0.3",
+			manifest: struct {
+				URL           string
+				Token         string
+				Owner         string
+				Repository    string
+				VersionFilter version.Filter
+				Age           age.Spec
+			}{
+				URL:        "codeberg.org",
+				Token:      "",
+				Owner:      "updatecli",
+				Repository: "updatecli-action",
+				VersionFilter: version.Filter{
+					Kind:    "semver",
+					Pattern: "~2.15",
+				},
+			},
+			wantResult: "v2.15.0",
+			wantErr:    false,
+		},
+		{
+			name: "the source is skipped while every release is still in cooldown",
+			manifest: struct {
+				URL           string
+				Token         string
+				Owner         string
+				Repository    string
+				VersionFilter version.Filter
+				Age           age.Spec
+			}{
+				URL:        "codeberg.org",
+				Token:      "",
+				Owner:      "updatecli",
+				Repository: "updatecli-action",
+				VersionFilter: version.Filter{
+					Kind:    "semver",
+					Pattern: "~2.15",
+				},
+				// No release can ever be that old, so the age filter discards all of them.
+				Age: age.Spec{Minimum: "100y"},
+			},
+			wantResult:  "",
+			wantSkipped: true,
+		},
+	}
+
+	for _, tt := range tests {
+
+		t.Run(tt.name, func(t *testing.T) {
+
+			g, gotErr := New(tt.manifest)
+			require.NoError(t, gotErr)
+
+			gotResult := result.Source{}
+			gotErr = g.Source(context.Background(), pathresolver.Resolver{}, &gotResult)
+
+			if tt.wantErr {
+				require.Error(t, gotErr)
+			} else {
+				require.NoError(t, gotErr)
+			}
+
+			if tt.wantSkipped {
+				assert.Equal(t, result.SKIPPED, gotResult.Result)
+			}
+
+			assert.Equal(t, tt.wantResult, gotResult.Information)
+
+		})
+
+	}
+}

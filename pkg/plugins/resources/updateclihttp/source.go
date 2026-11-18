@@ -1,0 +1,48 @@
+package updateclihttp
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"github.com/updatecli/updatecli/pkg/core/result"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/pathresolver"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/redact"
+)
+
+// Source returns content from the response of the specified HTTP request (defaults to the body).
+func (h *Http) Source(_ context.Context, pathResolver pathresolver.Resolver, resultSource *result.Source) error {
+	resultSource.Result = result.FAILURE
+
+	httpRes, err := h.performHttpRequest()
+	if err != nil {
+		return err
+	}
+	defer httpRes.Body.Close()
+
+	if httpRes.StatusCode >= http.StatusBadRequest {
+		return &ErrHttpError{resStatusCode: httpRes.StatusCode}
+	}
+
+	resultSource.Result = result.SUCCESS
+	resultSource.Description = fmt.Sprintf("[http] response received from %q.", redact.URL(h.spec.Url))
+
+	if h.spec.ReturnResponseHeader != "" {
+		resultSource.Information = httpRes.Header.Get(h.spec.ReturnResponseHeader)
+		log.Debugf("[http] source: header %q found with %d characters", h.spec.ReturnResponseHeader, len(resultSource.Information))
+	} else {
+		b, err := io.ReadAll(httpRes.Body)
+		if err != nil {
+			return err
+		}
+		bodyContent := string(b)
+
+		log.Debugf("[http] source: response body received (with %d characters)", len(bodyContent))
+
+		resultSource.Information = bodyContent
+	}
+
+	return nil
+}

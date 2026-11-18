@@ -1,0 +1,145 @@
+package udash
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+
+	"github.com/skratchdot/open-golang/open"
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"golang.org/x/term"
+)
+
+// TokenPagePath is the Udash frontend path where a user manages their API tokens.
+const TokenPagePath = "/profile/tokens"
+
+// DefaultAPIPath is where Udash serves its versioned API, relative to the service URL.
+const DefaultAPIPath = "/api/v1beta1"
+
+// Login stores an Udash API token in the Updatecli configuration file.
+//
+// Udash issues the token itself, so it does not expire and Updatecli never has to
+// talk to the identity provider: it only ever carries the token as a bearer.
+func Login(udashEndpoint, udashAPIEndpoint, token string) error {
+
+	envVariableURL := os.Getenv(DefaultEnvVariableURL)
+	envVariableAccessToken := os.Getenv(DefaultEnvVariableAccessToken)
+	envVariableAPIURL := os.Getenv(DefaultEnvVariableAPIURL)
+
+	setParam := func(flagParam *string, envParam, flagParamName, envParamName string) {
+		if *flagParam != "" && envParam != "" {
+			log.Debugf("%s provided via flag and environment variable %q, prioritizing flag", flagParamName, envParamName)
+			return
+		} else if *flagParam == "" && envParam != "" {
+			*flagParam = envParam
+		}
+	}
+
+	setParam(&udashEndpoint, envVariableURL, "URL", DefaultEnvVariableURL)
+	setParam(&udashAPIEndpoint, envVariableAPIURL, "API URL", DefaultEnvVariableAPIURL)
+	setParam(&token, envVariableAccessToken, "api access token", DefaultEnvVariableAccessToken)
+
+	if udashEndpoint == "" {
+		return fmt.Errorf("service URL is required")
+	}
+
+	udashEndpoint = setDefaultHTTPSScheme(udashEndpoint)
+
+	if udashAPIEndpoint == "" {
+		udashAPIEndpoint = strings.TrimSuffix(udashEndpoint, "/") + DefaultAPIPath
+	}
+	udashAPIEndpoint = setDefaultHTTPSScheme(udashAPIEndpoint)
+
+	// Without it, a wrong base answering 404 everywhere would pass for a service
+	// without authentication, and every publish would fail later on.
+	if err := checkAPIBase(udashAPIEndpoint); err != nil {
+		return fmt.Errorf("reaching %s: %w", udashAPIEndpoint, err)
+	}
+
+	if token == "" {
+		// A service running without authentication has no token to ask for, and
+		// that is the default deployment.
+		needed, err := requiresToken(udashAPIEndpoint)
+		if err != nil {
+			return fmt.Errorf("reaching %s: %w", udashAPIEndpoint, err)
+		}
+
+		if needed {
+			token, err = readToken(udashEndpoint)
+			if err != nil {
+				return err
+			}
+
+			if token == "" {
+				return fmt.Errorf("no token provided")
+			}
+		} else {
+			log.Debugf("%s does not require authentication, storing the endpoint only", udashEndpoint)
+		}
+	}
+
+	// Fail here rather than silently later on, when a pipeline tries to publish.
+	identity, err := whoami(udashAPIEndpoint, token)
+	switch {
+	case errors.Is(err, errNoAuthentication):
+		if token != "" {
+			log.Infof("%s does not require authentication, the token is not stored", udashEndpoint)
+			token = ""
+		}
+		identity = &whoamiResponse{}
+	case err != nil:
+		return fmt.Errorf("validating token: %w", err)
+	}
+
+	if err := updateConfigFile(authData{
+		URL:   udashEndpoint,
+		API:   udashAPIEndpoint,
+		Token: token,
+	}); err != nil {
+		return fmt.Errorf("update Updatecli config file: %w", err)
+	}
+
+	switch {
+	case identity.Name != "":
+		log.Printf("Successfully logged in to %s as %s.", udashEndpoint, identity.Name)
+	case identity.Subject != "":
+		log.Printf("Successfully logged in to %s as %s.", udashEndpoint, identity.Subject)
+	default:
+		log.Printf("Successfully logged in to %s.", udashEndpoint)
+	}
+
+	return nil
+}
+
+// readToken obtains a token from the user, either by prompting for one on an
+// interactive terminal or by reading standard input when it is piped in.
+func readToken(udashEndpoint string) (string, error) {
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		// Support `echo $TOKEN | updatecli udash login <url>`
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return "", fmt.Errorf("reading token from stdin: %w", err)
+		}
+		return strings.TrimSpace(string(data)), nil
+	}
+
+	tokenPageURL := strings.TrimSuffix(udashEndpoint, "/") + TokenPagePath
+
+	log.Printf("Create an API token at %s", tokenPageURL)
+	if err := open.Start(tokenPageURL); err != nil {
+		// Not fatal: the URL was printed above, the user can open it themselves.
+		log.Debugf("can't open browser to URL %s: %s", tokenPageURL, err)
+	}
+
+	// Interactive prompt, it must reach the terminal and never a report
+	fmt.Print("Paste your Udash API token: ") //nolint:forbidigo
+	data, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Println() //nolint:forbidigo
+	if err != nil {
+		return "", fmt.Errorf("reading token: %w", err)
+	}
+
+	return strings.TrimSpace(string(data)), nil
+}

@@ -1,0 +1,330 @@
+package action
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/go-viper/mapstructure/v2"
+	jschema "github.com/invopop/jsonschema"
+	"github.com/updatecli/updatecli/pkg/core/jsonschema"
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"github.com/updatecli/updatecli/pkg/core/pipeline/scm"
+	"github.com/updatecli/updatecli/pkg/core/reports"
+	azuredevops "github.com/updatecli/updatecli/pkg/plugins/resources/azuredevops/pullrequest"
+	bitbucket "github.com/updatecli/updatecli/pkg/plugins/resources/bitbucket/pullrequest"
+	gitea "github.com/updatecli/updatecli/pkg/plugins/resources/gitea/pullrequest"
+	gitlab "github.com/updatecli/updatecli/pkg/plugins/resources/gitlab/mergerequest"
+	stash "github.com/updatecli/updatecli/pkg/plugins/resources/stash/pullrequest"
+	azuredevopsscm "github.com/updatecli/updatecli/pkg/plugins/scms/azuredevops"
+	bitbucketscm "github.com/updatecli/updatecli/pkg/plugins/scms/bitbucket"
+	giteascm "github.com/updatecli/updatecli/pkg/plugins/scms/gitea"
+	"github.com/updatecli/updatecli/pkg/plugins/scms/github"
+	gitlabscm "github.com/updatecli/updatecli/pkg/plugins/scms/gitlab"
+	stashscm "github.com/updatecli/updatecli/pkg/plugins/scms/stash"
+)
+
+const (
+	azuredevopsIdentifier = "azuredevops"
+	gitlabIdentifier      = "gitlab"
+	githubIdentifier      = "github"
+	giteaIdentifier       = "gitea"
+	stashIdentifier       = "stash"
+	bitbucketIdentifier   = "bitbucket"
+
+	githubPullRequestIdentifier      = "github/pullrequest"
+	giteaPullRequestIdentifier       = "gitea/pullrequest"
+	azureDevopsPullRequestIdentifier = "azuredevops/pullrequest"
+	stashPullRequestIdentifier       = "stash/pullrequest"
+	gitlabMergeRequestIdentifier     = "gitlab/mergerequest"
+	bitbucketPullRequestIdentifier   = "bitbucket/pullrequest"
+)
+
+// ErrWrongConfig is returned when an action has missing mandatory attributes.
+var ErrWrongConfig = errors.New("wrong action configuration")
+
+// ActionHandler interface defines required functions to be an action
+type ActionHandler interface {
+	CreateAction(ctx context.Context, report *reports.Action, resetDescription bool) error
+	CleanAction(ctx context.Context, report *reports.Action) error
+	CheckActionExist(ctx context.Context, report *reports.Action) error
+}
+
+// Config define action provided via an updatecli configuration
+type Config struct {
+	// Title defines the action title
+	Title string `yaml:",omitempty"`
+	// Kind defines the action `kind` which affects accepted "spec" values
+	Kind string `yaml:",omitempty"`
+	// Spec defines parameters for a specific "kind"
+	Spec interface{} `yaml:",omitempty"`
+	// scmid references a scm configuration defined within the updatecli manifest
+	ScmID string `yaml:",omitempty"`
+	// !Deprecated in favor of `scmid`
+	DeprecatedScmID string `yaml:"scmID,omitempty" jsonschema:"-"`
+	/*
+		pipelineurl defines if a link to the Updatecli pipeline CI job should be added to the report.
+
+		remarks:
+		* Only available for GitHub Action, GitLab, Jenkins
+	*/
+	DisablePipelineURL bool `yaml:",omitempty"`
+}
+
+// Action is a struct used by an updatecli pipeline.
+type Action struct {
+	Title   string
+	Config  Config
+	Scm     *scm.Scm
+	Handler ActionHandler
+	Report  reports.Action
+	/*
+		Published is set to true when the action has been created or updated during the
+		current Updatecli execution.
+
+		Such an action must not be cleaned up by the same execution as the cleanup relies
+		on remote information which may not reflect what Updatecli just published.
+	*/
+	Published bool
+}
+
+// CleanupKey identifies the remote object the action cleans up, such as a pull request,
+// shared by every pipeline using the same working branch. Empty when the action has no scm.
+func (a Action) CleanupKey() string {
+	if a.Scm == nil || a.Scm.Handler == nil {
+		return ""
+	}
+	_, workingBranch, targetBranch := a.Scm.Handler.GetBranches()
+	return fmt.Sprintf("%s|%s|%s|%s|%v", a.Config.Kind, a.Scm.Handler.GetURL(), workingBranch, targetBranch, a.Config.Spec)
+}
+
+// Validate ensures that an action configuration has required parameters.
+func (c *Config) Validate() (err error) {
+	missingParameters := []string{}
+
+	if c.Kind == "" {
+		missingParameters = append(missingParameters, "kind")
+	}
+
+	// Ensure kind is lowercase
+	if c.Kind != strings.ToLower(c.Kind) {
+		log.Warningf("kind value %q must be lowercase", c.Kind)
+		c.Kind = strings.ToLower(c.Kind)
+	}
+
+	/** Deprecated items **/
+	if c.Kind == githubIdentifier {
+		log.Warnf("The kind %q for actions is deprecated in favor of '%s/pullrequest'", githubIdentifier, githubIdentifier)
+		c.Kind = githubPullRequestIdentifier
+	}
+	if c.Kind == giteaIdentifier {
+		log.Warnf("The kind %q for actions is deprecated in favor of '%s/pullrequest'", giteaIdentifier, giteaIdentifier)
+		c.Kind = giteaPullRequestIdentifier
+	}
+	if c.DeprecatedScmID != "" {
+		if c.ScmID == "" {
+			log.Warningf("%q is deprecated in favor of %q.", "scmID", "scmid")
+			c.ScmID = c.DeprecatedScmID
+		} else {
+			log.Warningf("deprecatedscmID: %q", c.DeprecatedScmID)
+			log.Warningf("scmid: %q", c.ScmID)
+			log.Warningf("%q and %q are mutually exclusive, ignoring %q",
+				"scmid", "deprecatedscmID", "deprecatedscmID")
+		}
+		c.DeprecatedScmID = ""
+	}
+
+	if c.ScmID == "" {
+		missingParameters = append(missingParameters, "scmid")
+	}
+
+	if len(missingParameters) > 0 {
+		err = fmt.Errorf("missing value for parameter(s) [%q]", strings.Join(missingParameters, ","))
+	}
+
+	return err
+}
+
+// New returns a new Action based on an action config and an scm
+func New(config *Config, sourceControlManager *scm.Scm) (Action, error) {
+	newAction := Action{
+		Title:  config.Title,
+		Config: *config,
+		Scm:    sourceControlManager,
+	}
+
+	err := newAction.generateActionHandler()
+	if err != nil {
+		return Action{}, err
+	}
+
+	return newAction, nil
+}
+
+// Update updates an action object based on its configuration
+func (a *Action) Update() error {
+
+	err := a.generateActionHandler()
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (a *Action) generateActionHandler() error {
+	// Don't forget to update the JSONSchema() method when adding/updating/removing a case
+	switch a.Config.Kind {
+	case azureDevopsPullRequestIdentifier:
+		if a.Scm.Config.Kind != azuredevopsIdentifier {
+			return fmt.Errorf("scm of kind %q is not compatible with action of kind %q",
+				a.Scm.Config.Kind,
+				a.Config.Kind)
+		}
+
+		ge, ok := a.Scm.Handler.(*azuredevopsscm.AzureDevOps)
+		if !ok {
+			return fmt.Errorf("scm is not of kind 'azuredevops'")
+		}
+
+		g, err := azuredevops.New(a.Config.Spec, ge)
+		if err != nil {
+			return err
+		}
+
+		a.Handler = &g
+
+	case bitbucketPullRequestIdentifier, bitbucketIdentifier:
+		if a.Scm.Config.Kind != bitbucketIdentifier {
+			return fmt.Errorf("scm of kind %q is not compatible with action of kind %q",
+				a.Scm.Config.Kind,
+				a.Config.Kind)
+		}
+
+		ge, ok := a.Scm.Handler.(*bitbucketscm.Bitbucket)
+
+		if !ok {
+			return fmt.Errorf("scm is not of kind 'bitbucket'")
+		}
+
+		g, err := bitbucket.New(a.Config.Spec, ge)
+		if err != nil {
+			return err
+		}
+
+		a.Handler = &g
+
+	case giteaPullRequestIdentifier, giteaIdentifier:
+		if a.Scm.Config.Kind != giteaIdentifier {
+			return fmt.Errorf("scm of kind %q is not compatible with action of kind %q",
+				a.Scm.Config.Kind,
+				a.Config.Kind)
+		}
+
+		ge, ok := a.Scm.Handler.(*giteascm.Gitea)
+
+		if !ok {
+			return fmt.Errorf("scm is not of kind 'gitea'")
+		}
+
+		g, err := gitea.New(a.Config.Spec, ge)
+		if err != nil {
+			return err
+		}
+
+		a.Handler = &g
+
+	case gitlabMergeRequestIdentifier, gitlabIdentifier:
+		if a.Scm.Config.Kind != gitlabIdentifier {
+			return fmt.Errorf("scm of kind %q is not compatible with action of kind %q",
+				a.Scm.Config.Kind,
+				a.Config.Kind)
+		}
+
+		ge, ok := a.Scm.Handler.(*gitlabscm.Gitlab)
+
+		if !ok {
+			return fmt.Errorf("scm is not of kind 'gitlab'")
+		}
+
+		g, err := gitlab.New(a.Config.Spec, ge)
+		if err != nil {
+			return err
+		}
+
+		a.Handler = &g
+
+	case githubPullRequestIdentifier, githubIdentifier:
+		actionSpec := github.ActionSpec{}
+
+		if a.Scm.Config.Kind != githubIdentifier {
+			return fmt.Errorf("scm of kind %q is not compatible with action of kind %q",
+				a.Scm.Config.Kind,
+				a.Config.Kind)
+		}
+
+		err := mapstructure.Decode(a.Config.Spec, &actionSpec)
+		if err != nil {
+			return err
+		}
+
+		gh, ok := a.Scm.Handler.(*github.Github)
+
+		if !ok {
+			return fmt.Errorf("scm is not of kind 'github'")
+		}
+
+		g, err := github.NewAction(actionSpec, gh)
+		if err != nil {
+			return err
+		}
+
+		a.Handler = &g
+
+	case stashPullRequestIdentifier, stashIdentifier:
+		if a.Scm.Config.Kind != stashIdentifier {
+			return fmt.Errorf("scm of kind %q is not compatible with action of kind %q",
+				a.Scm.Config.Kind,
+				a.Config.Kind)
+		}
+
+		ge, ok := a.Scm.Handler.(*stashscm.Stash)
+
+		if !ok {
+			return fmt.Errorf("scm is not of kind 'stash'")
+		}
+
+		g, err := stash.New(a.Config.Spec, ge)
+		if err != nil {
+			return err
+		}
+
+		a.Handler = &g
+
+	default:
+		log.Errorf("action of kind %q is not supported", a.Config.Kind)
+	}
+
+	return nil
+}
+
+// GetActionMapping returns the mapping between an action kind and its specification.
+// Don't forget to update it when adding/updating/removing a case from New().
+func GetActionMapping() map[string]interface{} {
+	return map[string]interface{}{
+		azureDevopsPullRequestIdentifier: &azuredevops.Spec{},
+		githubPullRequestIdentifier:      &github.ActionSpec{},
+		giteaPullRequestIdentifier:       &gitea.Spec{},
+		stashPullRequestIdentifier:       &stash.Spec{},
+		gitlabMergeRequestIdentifier:     &gitlab.Spec{},
+		bitbucketPullRequestIdentifier:   &bitbucket.Spec{},
+	}
+}
+
+// JSONSchema implements the json schema interface to generate the "action" jsonschema
+func (Config) JSONSchema() *jschema.Schema {
+	type configAlias Config
+
+	return jsonschema.AppendOneOfToJsonSchema(configAlias{}, GetActionMapping())
+}

@@ -1,0 +1,382 @@
+package cmd
+
+import (
+	"context"
+	"os"
+	"strings"
+	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+	"golang.org/x/exp/slices"
+
+	"github.com/updatecli/updatecli/pkg/core/cmdoptions"
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"github.com/updatecli/updatecli/pkg/core/registry"
+	"github.com/updatecli/updatecli/pkg/core/telemetry"
+	"github.com/updatecli/updatecli/pkg/core/tmp"
+	"github.com/updatecli/updatecli/pkg/core/udash"
+	"github.com/updatecli/updatecli/pkg/core/version"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/ci"
+
+	"github.com/updatecli/updatecli/pkg/core/engine"
+	"github.com/updatecli/updatecli/pkg/core/result"
+
+	"github.com/spf13/cobra"
+)
+
+var (
+	pipelineIds         []string
+	labels              []string
+	manifestFiles       []string
+	valuesFiles         []string
+	valuesInline        []string
+	secretsFiles        []string
+	assetsFiles         []string
+	policyReferences    []string
+	e                   engine.Engine
+	verbose             bool
+	experimental        bool
+	disableTLS          bool
+	disableChangelog    bool
+	validateSchema      bool
+	relativePaths       string
+	uniqueTmpDir        bool
+	disableVersionCheck bool
+	exportReportToYAML  bool
+	disableUdashReport  bool
+
+	rootCmd = &cobra.Command{
+		Use:   "updatecli",
+		Short: "Updatecli is a declarative dependency manager command line tool",
+		Long: `
+Updatecli is a declarative dependency manager command line tool.
+Based on Updatecli manifest(s), It ensures that target files are up to date.
+Updatecli  works into three stages:
+
+1. Source: Retrieve a value from a third location like file, api, etc..
+2. Condition: Ensure conditions are met based on the value retrieved during the source stage.
+3. Target: Update the target based on the value retrieved from the source stage.
+`,
+	}
+)
+
+// Execute executes the root command.
+func Execute() {
+	if err := rootCmd.Execute(); err != nil {
+		log.Errorf("%s %s", result.FAILURE, err)
+		os.Exit(1)
+	}
+}
+
+// skipVersionCheckCommands lists commands where the version check is skipped
+// to avoid unnecessary network requests and prevent banner output from
+// corrupting generated content.
+var skipVersionCheckCommands = []string{
+	"completion",
+	"__complete",
+	"__completeNoDesc",
+	"docs",
+	"man",
+	jsonschemaCmdName,
+}
+
+func init() {
+
+	rootCmd.PersistentPostRun = func(cmd *cobra.Command, args []string) {
+		if disableVersionCheck {
+			return
+		}
+		for c := cmd; c != nil; c = c.Parent() {
+			if slices.Contains(skipVersionCheckCommands, c.Name()) {
+				return
+			}
+		}
+		err := engine.CheckLatestPublishedVersion()
+		if err != nil {
+			log.Debugf("Unable to check for the latest version of updatecli: %v", err)
+		}
+	}
+
+	rootCmd.PersistentFlags().BoolVarP(&verbose, "debug", "", false, "Debug Output")
+	rootCmd.PersistentFlags().BoolVarP(&experimental, "experimental", "", false, "Enable Experimental mode")
+	rootCmd.PersistentFlags().BoolVar(&uniqueTmpDir, "unique-tmp-dir", false, "Use a unique temporary directory to allow running multiple Updatecli instances in parallel")
+	rootCmd.PersistentFlags().BoolVar(&disableVersionCheck, "disable-version-check", getEnvBoolOrDefault(DisableVersionCheckEnvVar, false), "Disable version check (env: "+DisableVersionCheckEnvVar+")")
+	rootCmd.PersistentPreRun = func(cmd *cobra.Command, args []string) {
+		if verbose {
+			log.SetLevel(log.DebugLevel)
+		} else {
+			detectedCi, err := ci.New()
+			if err == nil && detectedCi.IsDebug() {
+				log.Infof("CI pipeline detected in Debug Mode - hence enabling debug mode")
+				log.SetLevel(log.DebugLevel)
+			}
+		}
+		if experimental {
+			cmdoptions.Experimental = true
+			log.Infof("Experimental Mode Enabled")
+		}
+		if uniqueTmpDir {
+			if err := tmp.InitUnique(); err != nil {
+				log.Errorf("failed to initialize unique tmp dir: %s", err)
+				os.Exit(1)
+			}
+			log.Infof("Using unique temporary directory: %s", tmp.Directory)
+		}
+	}
+	rootCmd.AddCommand(
+		applyCmd,
+		diffCmd,
+		prepareCmd,
+		manifestCmd,
+		pipelineCmd,
+		udashCmd,
+		showCmd,
+		composeCmd,
+		versionCmd,
+		docsCmd,
+		manCmd,
+		jsonschemaCmd)
+}
+
+func run(command string) error {
+	ctx := context.Background()
+	shutdown := telemetry.Init(ctx, "updatecli", version.Version)
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdown(shutdownCtx); err != nil {
+			log.Warnf("telemetry shutdown: %v", err)
+		}
+	}()
+
+	tracer := telemetry.Tracer("updatecli")
+	e.SetTracer(tracer)
+	ctx, span := tracer.Start(ctx, "updatecli",
+		trace.WithAttributes(
+			attribute.String("updatecli.command", command),
+			attribute.String("updatecli.version", version.Version),
+		),
+	)
+	defer span.End()
+
+	for _, id := range pipelineIds {
+		e.Options.PipelineIDs = append(e.Options.PipelineIDs, strings.Split(id, ",")...)
+	}
+
+	if parsed := parseLabels(labels); parsed != nil {
+		e.Options.Labels = parsed
+	}
+
+	e.Options.ExportToYAML = exportReportToYAML
+	e.Options.DisableUdashReport = disableUdashReport
+
+	switch command {
+	case "apply", "compose/apply", "pipeline/apply":
+		udash.APIURLSelector = udashAPIURL
+
+		if applyClean {
+			defer func() {
+				if err := e.Clean(); err != nil {
+					log.Errorf("error in apply clean - %s", err)
+				}
+			}()
+		}
+
+		err := e.Prepare(ctx)
+		if err != nil {
+			log.Errorf("%s %s", result.FAILURE, err)
+			return err
+		}
+
+		err = e.Run(ctx)
+		if err != nil {
+			log.Errorf("%s %s", result.FAILURE, err)
+			return err
+		}
+	case "diff", "compose/diff", "pipeline/diff":
+		udash.APIURLSelector = udashAPIURL
+		if diffClean {
+			defer func() {
+				if err := e.Clean(); err != nil {
+					log.Errorf("error in diff clean - %s", err)
+				}
+			}()
+		}
+
+		err := e.Prepare(ctx)
+		if err != nil {
+			log.Errorf("%s %s", result.FAILURE, err)
+			return err
+		}
+
+		err = e.Run(ctx)
+		if err != nil {
+			log.Errorf("%s %s", result.FAILURE, err)
+			return err
+		}
+
+	case "prepare", "pipeline/prepare":
+		if prepareClean {
+			defer func() {
+				if err := e.Clean(); err != nil {
+					log.Errorf("error in prepare clean - %s", err)
+				}
+			}()
+		}
+
+		err := e.Prepare(ctx)
+		if err != nil {
+			log.Errorf("%s %s", result.FAILURE, err)
+			return err
+		}
+
+	case "manifest/init":
+
+		err := e.Scaffold(manifestInitPolicyRootDir)
+		if err != nil {
+			log.Errorf("%s %s", result.FAILURE, err)
+		}
+
+	case "manifest/upgrade":
+		err := e.ManifestUpgrade(manifestUpgradeInPlace)
+		if err != nil {
+			log.Errorf("%s %s", result.FAILURE, err)
+			return err
+		}
+
+	case "manifest/validate":
+		err := e.ValidateManifests(manifestValidateStrict)
+		if err != nil {
+			log.Errorf("%s %s", result.FAILURE, err)
+			return err
+		}
+
+	case "manifest/pull":
+		err := e.PullFromRegistry(manifestPullPolicyReference, disableTLS)
+		if err != nil {
+			log.Errorf("%s %s", result.FAILURE, err)
+			return err
+		}
+
+	case "manifest/push":
+		err := e.PushToRegistry(
+			manifestFiles,
+			valuesFiles,
+			secretsFiles,
+			assetsFiles,
+			manifestPushPolicyReference,
+			disableTLS,
+			manifestPushPolicyFile,
+			manifestPushFileStore,
+			manifestPushOverwrite)
+
+		if err != nil {
+			log.Errorf("%s %s", result.FAILURE, err)
+			return err
+		}
+
+	// Show is deprecated
+	case "manifest/show", "show", "compose/show":
+		if showClean {
+			defer func() {
+				if err := e.Clean(); err != nil {
+					log.Errorf("error in show clean - %s", err)
+				}
+			}()
+		}
+
+		if !showDisablePrepare {
+			err := e.Prepare(ctx)
+			if err != nil {
+				log.Errorf("%s %s", result.FAILURE, err)
+				return err
+			}
+		}
+
+		err := e.Show()
+		if err != nil {
+			log.Errorf("%s %s", result.FAILURE, err)
+			return err
+		}
+
+	case "udash/config":
+		configFilePath, err := udash.ConfigFilePath()
+		if err != nil {
+			log.Errorf("%s %s", result.FAILURE, err)
+			return err
+		}
+
+		log.Infof("Config file located at %q", configFilePath)
+
+	case "udash/login":
+		err := udash.Login(udashEndpointURL, udashEndpointAPIURL, udashAccessToken)
+		if err != nil {
+			log.Errorf("%s %s", result.FAILURE, err)
+			return err
+		}
+
+	case "udash/logout":
+		err := udash.Logout(udashEndpointURL)
+		if err != nil {
+			log.Errorf("%s %s", result.FAILURE, err)
+			return err
+		}
+
+	case jsonschemaCmdName:
+		err := engine.GenerateSchema(jsonschemaBaseID, jsonschemaDirectory)
+		if err != nil {
+			log.Errorf("%s %s", result.FAILURE, err)
+			return err
+		}
+	default:
+		log.Warnf("Wrong command")
+	}
+	return nil
+}
+
+// parseLabels converts a slice of "key:value" or "key" strings into a label map.
+// Returns nil when the input produces no valid labels.
+func parseLabels(labels []string) map[string]string {
+	var result map[string]string
+
+	for _, label := range labels {
+		for _, entry := range strings.Split(label, ",") {
+			kv := strings.SplitN(entry, ":", 2)
+			if kv[0] == "" {
+				log.Warnf("Ignoring label with empty key: %q", entry)
+				continue
+			}
+			if result == nil {
+				result = make(map[string]string)
+			}
+			if len(kv) == 2 {
+				result[kv[0]] = kv[1]
+			} else {
+				result[kv[0]] = ""
+			}
+		}
+	}
+
+	return result
+}
+
+func getPolicyFilesFromRegistry() error {
+
+	if slices.Equal(policyReferences, []string{""}) || slices.Equal(policyReferences, []string{}) {
+		return nil
+	}
+
+	for _, policy := range policyReferences {
+		pulled, err := registry.Pull(policy, disableTLS)
+		if err != nil {
+			return err
+		}
+
+		manifestFiles = append(pulled.Manifests, manifestFiles...)
+		valuesFiles = append(pulled.Values, valuesFiles...)
+		secretsFiles = append(pulled.Secrets, secretsFiles...)
+	}
+
+	return nil
+}

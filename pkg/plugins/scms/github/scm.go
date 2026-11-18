@@ -1,0 +1,527 @@
+package github
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"syscall"
+
+	"github.com/shurcooL/githubv4"
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"github.com/updatecli/updatecli/pkg/plugins/scms/github/client"
+	"github.com/updatecli/updatecli/pkg/plugins/scms/github/token"
+	"github.com/updatecli/updatecli/pkg/plugins/utils"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/gitgeneric"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/redact"
+)
+
+// GetBranches returns source, working and target branch
+func (g *Github) GetBranches() (sourceBranch, workingBranch, targetBranch string) {
+	sourceBranch = g.Spec.Branch
+	workingBranch = g.Spec.Branch
+	targetBranch = g.Spec.Branch
+
+	if len(g.pipelineID) > 0 && g.workingBranch {
+		workingBranch = g.nativeGitHandler.SanitizeBranchName(
+			strings.Join([]string{g.workingBranchPrefix, targetBranch, g.pipelineID}, g.workingBranchSeparator))
+	}
+
+	return sourceBranch, workingBranch, targetBranch
+}
+
+// CleanWorkingBranch checks if the working branch is diverged from the target branch
+// and remove it if not.
+func (g *Github) CleanWorkingBranch() (bool, error) {
+	_, workingBranch, targetBranch := g.GetBranches()
+
+	if workingBranch == targetBranch {
+		log.Infof("Skipping cleaning working branch %q on %q (same as target branch)\n", workingBranch, redact.URL(g.GetURL()))
+		return false, nil
+	}
+
+	isSimilarBranch, err := g.nativeGitHandler.IsSimilarBranch(workingBranch, targetBranch, g.GetDirectory())
+	if err != nil {
+		return false, fmt.Errorf("failed to compare working branch %q with target branch %q: %w", workingBranch, targetBranch, err)
+	}
+
+	if isSimilarBranch {
+		accessToken, err := token.GetAccessToken(g.token)
+		if err != nil {
+			return false, fmt.Errorf("failed to get access token: %w", err)
+		}
+		if err = g.nativeGitHandler.DeleteBranch(workingBranch, g.GetDirectory(), g.username, accessToken); err != nil {
+			return false, fmt.Errorf("failed to delete working branch %q from %q: %w", workingBranch, g.GetDirectory(), err)
+		}
+		return true, nil
+	}
+
+	return false, nil
+}
+
+// GetURL returns a "GitHub " git URL
+func (g *Github) GetURL() string {
+	URL, err := url.JoinPath(g.URL, g.Spec.Owner, g.Spec.Repository+".git")
+	if err != nil {
+		log.Errorln(err)
+		return ""
+	}
+
+	return URL
+}
+
+// GetDirectory returns the local git repository path.
+func (g *Github) GetDirectory() (directory string) {
+	return g.Spec.Directory
+}
+
+// Clean deletes github working directory.
+func (g *Github) Clean() error {
+	err := os.RemoveAll(g.Spec.Directory)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// Clone run `git clone`.
+func (g *Github) Clone() (string, error) {
+	g.setDirectory()
+
+	accessToken, err := token.GetAccessToken(g.token)
+	if err != nil {
+		return "", fmt.Errorf("failed to get access token: %w", err)
+	}
+
+	err = g.nativeGitHandler.Clone(
+		g.username,
+		accessToken,
+		g.GetURL(),
+		g.GetDirectory(),
+		g.Spec.Submodules,
+		g.Spec.Depth,
+		g.Spec.Branch,
+		g.Spec.SingleBranch != nil && *g.Spec.SingleBranch,
+	)
+	if err != nil {
+		log.Errorf("failed cloning GitHub repository %q", redact.URL(g.GetURL()))
+		return "", err
+	}
+
+	return g.Spec.Directory, nil
+}
+
+// Commit run `git commit`.
+func (g *Github) Commit(ctx context.Context, message string) error {
+	workingDir := g.GetDirectory()
+
+	// Generate the conventional commit message
+	commitMessage, err := g.Spec.CommitMessage.Generate(message)
+	if err != nil {
+		return err
+	}
+
+	if g.commitUsingApi {
+
+		log.Debugf("Creating commit using GitHub API")
+		_, workingBranch, _ := g.GetBranches()
+
+		commitHashPrePull, err := g.nativeGitHandler.GetLatestCommitHash(workingDir)
+		if err != nil {
+			return err
+		}
+
+		commitHasPostApiQuery, err := g.CreateCommit(ctx, workingDir, commitMessage, 0)
+		if err != nil {
+			return err
+		}
+
+		accessToken, err := token.GetAccessToken(g.token)
+		if err != nil {
+			return fmt.Errorf("failed to get access token: %w", err)
+		}
+
+		if err = g.nativeGitHandler.Pull(
+			g.username,
+			accessToken,
+			workingDir,
+			workingBranch,
+			true,
+			true,
+			g.Spec.Depth,
+		); err != nil {
+			return err
+		}
+
+		commitHashPostPull, err := g.nativeGitHandler.GetLatestCommitHash(workingDir)
+		if err != nil {
+			return err
+		}
+
+		// Probably due to some caching, the commit is not immediately available after creation
+		// We retry to pull the commit a few times until we find it or we reach the max retry
+		maxRetry := 3
+		for counter := 0; counter < maxRetry; counter++ {
+
+			// Ideally we should check that the latest local commit hash
+			// is an ancestor of the newly created commit hash
+			// but this operation is expensive so we just check that
+			// the latest local commit hash is different from the newly created one.
+			// This should be enough in most of the cases considering the working branch
+			// is created and maintained by Updatecli.
+			if commitHashPostPull == commitHasPostApiQuery {
+				break
+			}
+
+			log.Debugf("Latest local commit %q should have been %q", commitHashPrePull, commitHasPostApiQuery)
+			log.Debugf("Waiting for GitHub to make the commit %q available", commitHasPostApiQuery)
+
+			log.Debugf("Commit not found yet, retrying to pull it")
+
+			accessToken, err := token.GetAccessToken(g.token)
+			if err != nil {
+				return fmt.Errorf("failed to get access token: %w", err)
+			}
+
+			if err = g.nativeGitHandler.Pull(
+				g.username,
+				accessToken,
+				workingDir,
+				workingBranch,
+				true,
+				true,
+				g.Spec.Depth,
+			); err != nil {
+				return err
+			}
+
+			commitHashPostPull, err = g.nativeGitHandler.GetLatestCommitHash(workingDir)
+			if err != nil {
+				return err
+			}
+
+			log.Debugf("Latest commit after creating a new one: %q", commitHasPostApiQuery)
+
+			if counter == maxRetry-1 {
+				log.Debugf("Giving up trying to pull the newly created commit")
+			}
+		}
+
+		if g.Spec.CommitMessage.IsSquash() {
+			log.Warningf("Squash commit is not supported when using GitHub API to create the commit. Ignoring the squash option.")
+		}
+
+	} else {
+		log.Debugf("Creating commit using native git")
+
+		if err = g.nativeGitHandler.Commit(
+			g.Spec.User,
+			g.Spec.Email,
+			commitMessage,
+			workingDir,
+			g.Spec.GPG.SigningKey,
+			g.Spec.GPG.Passphrase,
+		); err != nil {
+			return err
+		}
+
+		if g.Spec.CommitMessage.IsSquash() {
+			sourceBranch, workingBranch, _ := g.GetBranches()
+			if err = g.nativeGitHandler.SquashCommit(workingDir, sourceBranch, workingBranch, gitgeneric.SquashCommitOptions{
+				IncludeCommitTitles: true,
+				Message:             commitMessage,
+				SigninKey:           g.Spec.GPG.SigningKey,
+				SigninPassphrase:    g.Spec.GPG.Passphrase,
+			}); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// CommitQuery defines a github v4 API mutation to create a commit on a branch
+type commitQuery struct {
+	CreateCommitOnBranch struct {
+		Commit struct {
+			URL string
+			OID string
+		}
+	} `graphql:"createCommitOnBranch(input:$input)"`
+}
+
+// CreateCommit creates a commit on a branch using GitHub API
+func (g *Github) CreateCommit(ctx context.Context, workingDir string, commitMessage string, retry int) (createdCommitHash string, err error) {
+	var m commitQuery
+
+	sourceBranch, workingBranch, _ := g.GetBranches()
+
+	files, err := g.nativeGitHandler.GetChangedFiles(workingDir)
+	if err != nil {
+		return "", err
+	}
+
+	additions, deletions, err := processChangedFiles(workingDir, files)
+	if err != nil {
+		return "", err
+	}
+
+	if g.nativeGitHandler.IsForceReset() {
+		// Ensure that locally reset branch is pushed to remote branch
+		// before continuing with commit creation as that will otherwise
+		// be lost.
+		log.Debugf("local branch %q was reset, pushing to remote to ensure correct state", workingBranch)
+		if _, err = g.Push(); err != nil {
+			return "", fmt.Errorf("failed to push branch %q before creating commit: %w", workingBranch, err)
+		}
+	}
+
+	repoRef, err := g.GetLatestCommitHash(ctx, workingBranch)
+	if err != nil {
+		return "", fmt.Errorf("retrieving latest commit hash for branch %q: %w", workingBranch, err)
+	}
+
+	headOid := repoRef.HeadOid
+	if headOid == "" {
+		sourceBranchRepoRef, err := g.GetLatestCommitHash(ctx, sourceBranch)
+		if err != nil {
+			return "", fmt.Errorf("retrieving latest commit hash for source branch %q: %w", sourceBranch, err)
+		}
+
+		headOid = sourceBranchRepoRef.HeadOid
+		log.Debugf("Branch %s does not exist, creating it from commit %q", workingBranch, headOid)
+		if err := g.createBranch(ctx, workingBranch, repoRef.ID, headOid, 0); err != nil {
+			return "", fmt.Errorf("creating branch %q from commit %q: %w", workingBranch, headOid, err)
+		}
+	}
+
+	repositoryName := fmt.Sprintf("%s/%s", g.Spec.Owner, g.Spec.Repository)
+
+	fileChanges := &githubv4.FileChanges{Additions: &additions}
+	if len(deletions) > 0 {
+		fileChanges.Deletions = &deletions
+	}
+
+	log.Debugf("creating commit with %d addition(s) and %d deletion(s)", len(additions), len(deletions))
+
+	input := githubv4.CreateCommitOnBranchInput{
+		Branch: githubv4.CommittableBranch{
+			RepositoryNameWithOwner: githubv4.NewString(githubv4.String(repositoryName)),
+			BranchName:              githubv4.NewString(githubv4.String(fmt.Sprintf("refs/heads/%s", workingBranch))),
+		},
+		ExpectedHeadOid: githubv4.GitObjectID(headOid),
+		Message: githubv4.CommitMessage{
+			Headline: githubv4.String(commitMessage),
+		},
+		FileChanges: fileChanges,
+	}
+
+	rateLimit, err := queryRateLimit(g.client, ctx)
+	log.Debugln(rateLimit)
+	if err != nil {
+		if client.IsRateLimitError(err) {
+			if retry < client.MaxRetry {
+				log.Warningf("GitHub API rate limit exceeded. Retrying... (%d/%d)", retry+1, client.MaxRetry)
+				rateLimit.Pause(ctx)
+				return g.CreateCommit(ctx, workingDir, commitMessage, retry+1)
+			}
+			return "", errors.New(ErrAPIRateLimitExceededFinalAttempt)
+		}
+		return "", fmt.Errorf("querying GitHub API rate limit: %w", err)
+
+	}
+
+	if err := g.client.Mutate(ctx, &m, input, nil); err != nil {
+		// In some occasions, GitHub API may respond with
+		// "Expected branch to point to <commit hash> but was <commit hash>"
+		// even if we provide the correct commit hash.
+		// In that case, we retry a few times before giving up.
+		// This is probably due to some caching on GitHub side.
+		if retry < client.MaxRetry && strings.Contains(err.Error(), "Expected branch to point to") {
+			return g.CreateCommit(ctx, workingDir, commitMessage, retry+1)
+		}
+		return "", fmt.Errorf("creating commit on branch %q: %w", workingBranch, err)
+	}
+
+	log.Debugf("commit created: %s", m.CreateCommitOnBranch.Commit.URL)
+
+	return m.CreateCommitOnBranch.Commit.OID, nil
+}
+
+// processChangedFiles reads the content of the files and prepare them to be
+// sent to the GitHub API. A file that no longer exists on disk, or whose
+// parent directory was replaced by a regular file, is treated as a deletion.
+// A symlink is rejected: FileAddition has no file mode, so the GitHub API
+// cannot represent a symlink, only a regular file. Any other stat error (for
+// example a permission error) aborts the operation instead of being silently
+// treated as a deletion.
+func processChangedFiles(workingDir string, files []string) ([]githubv4.FileAddition, []githubv4.FileDeletion, error) {
+	additions := make([]githubv4.FileAddition, 0, len(files))
+	deletions := make([]githubv4.FileDeletion, 0)
+	for _, f := range files {
+		fullPath := filepath.Join(workingDir, f)
+		info, err := os.Lstat(fullPath)
+		switch {
+		case err == nil && info.Mode()&os.ModeSymlink != 0:
+			return nil, nil, fmt.Errorf("file %q is a symlink: the GitHub API cannot commit a symlink, set commitUsingApi to false", f)
+		case err == nil:
+			enc, err := utils.Base64EncodeFile(fullPath)
+			if err != nil {
+				return nil, nil, fmt.Errorf("encoding file %q: %w", f, err)
+			}
+			additions = append(additions, githubv4.FileAddition{
+				Path:     githubv4.String(f),
+				Contents: githubv4.Base64String(enc),
+			})
+		case errors.Is(err, fs.ErrNotExist), errors.Is(err, syscall.ENOTDIR):
+			log.Debugf("file %q was deleted, adding it to the commit deletions", f)
+			deletions = append(deletions, githubv4.FileDeletion{Path: githubv4.String(f)})
+		default:
+			return nil, nil, fmt.Errorf("checking file %q: %w", f, err)
+		}
+	}
+	return additions, deletions, nil
+}
+
+// GetLatestCommitHash returns the latest commit hash of the specified branch
+func (g *Github) GetLatestCommitHash(ctx context.Context, workingBranch string) (*RepositoryRef, error) {
+	repoRef, err := g.queryHeadOid(ctx, workingBranch, 0)
+	if err != nil {
+		return nil, err
+	}
+	return repoRef, nil
+}
+
+// Checkout create and then uses a temporary git branch.
+func (g *Github) Checkout() error {
+	sourceBranch, workingBranch, _ := g.GetBranches()
+
+	accessToken, err := token.GetAccessToken(g.token)
+	if err != nil {
+		return fmt.Errorf("failed to get access token: %w", err)
+	}
+
+	return g.nativeGitHandler.Checkout(
+		g.username,
+		accessToken,
+		sourceBranch,
+		workingBranch,
+		g.Spec.Directory,
+		g.force,
+		g.Spec.Depth,
+	)
+}
+
+// Add run `git add`.
+func (g *Github) Add(files []string) error {
+	err := g.nativeGitHandler.Add(files, g.Spec.Directory)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// IsRemoteBranchUpToDate checks if the local working branch is up to date with the remote branch.
+func (g *Github) IsRemoteBranchUpToDate() (bool, error) {
+	sourceBranch, workingBranch, _ := g.GetBranches()
+
+	accessToken, err := token.GetAccessToken(g.token)
+	if err != nil {
+		return false, fmt.Errorf("failed to get access token: %w", err)
+	}
+
+	return g.nativeGitHandler.IsLocalBranchSyncedWithRemote(
+		sourceBranch,
+		workingBranch,
+		g.username,
+		accessToken,
+		g.GetDirectory())
+}
+
+// IsRemoteWorkingBranchExist checks if the remote working branch exists.
+func (g *Github) IsRemoteWorkingBranchExist() (bool, error) {
+	_, workingBranch, _ := g.GetBranches()
+
+	accessToken, err := token.GetAccessToken(g.token)
+	if err != nil {
+		return false, fmt.Errorf("failed to get access token: %w", err)
+	}
+
+	return g.nativeGitHandler.IsRemoteBranchExist(
+		workingBranch,
+		g.username,
+		accessToken,
+		g.GetDirectory())
+}
+
+// Push run `git push` on the GitHub remote branch if not already created.
+func (g *Github) Push() (bool, error) {
+	// If the commit is done using the GitHub API, we don't need to push
+	// the commit as it is done in the same operation.
+	if g.commitUsingApi {
+		log.Debugf("commit done using GitHub API, normally nothing need to be push but we may have left over.")
+	}
+
+	accessToken, err := token.GetAccessToken(g.token)
+	if err != nil {
+		return false, fmt.Errorf("failed to get access token: %w", err)
+	}
+
+	return g.nativeGitHandler.Push(
+		g.username,
+		accessToken,
+		g.GetDirectory(),
+		g.force,
+	)
+}
+
+// PushTag push tags
+func (g *Github) PushTag(tag string) error {
+	accessToken, err := token.GetAccessToken(g.token)
+	if err != nil {
+		return fmt.Errorf("failed to get access token: %w", err)
+	}
+
+	err = g.nativeGitHandler.PushTag(
+		tag,
+		g.username,
+		accessToken,
+		g.GetDirectory(),
+		g.force,
+	)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// PushBranch push tags
+func (g *Github) PushBranch(branch string) error {
+	accessToken, err := token.GetAccessToken(g.token)
+	if err != nil {
+		return fmt.Errorf("failed to get access token: %w", err)
+	}
+
+	err = g.nativeGitHandler.PushBranch(
+		branch,
+		g.username,
+		accessToken,
+		g.GetDirectory(),
+		g.force)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// GetChangedFiles returns a list of changed files in the working directory
+func (g *Github) GetChangedFiles(workingDir string) ([]string, error) {
+	return g.nativeGitHandler.GetChangedFiles(workingDir)
+}

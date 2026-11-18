@@ -1,0 +1,224 @@
+package github
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/shurcooL/githubv4"
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"github.com/updatecli/updatecli/pkg/plugins/scms/github/client"
+)
+
+// releasesQuery defines a github v4 API query to retrieve a list of releases sorted by reverse order of created time.
+/*
+https://developer.github.com/v4/explorer/
+# Query
+query getLatestRelease($owner: String!, $repository: String!, $before: String, $orderBy: ReleaseOrder) {
+  rateLimit {
+    cost
+    remaining
+    resetAt
+  }
+  repository(owner: $owner, name: $repository) {
+    releases(last: 100, before: $before, orderBy: $orderBy) {
+      totalCount
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+      edges {
+        node {
+          name
+          tagName
+          tagCommit {
+            oid
+          }
+          isDraft
+          isPrerelease
+          createdAt
+          publishedAt
+        }
+        cursor
+      }
+    }
+  }
+}# Variables
+{
+  "owner": "updatecli",
+  "repository": "updatecli",
+  "before": null,
+  "orderBy": {
+    "field": "CREATED_AT",
+    "direction": "DESC"
+  }
+}*/
+// releasesQuery defines a github v4 API query to retrieve a list of releases sorted by reverse order of created time.
+type releasesQuery struct {
+	RateLimit  RateLimit
+	Repository struct {
+		Releases repositoryRelease `graphql:"releases(last: 100, before: $before, orderBy: $orderBy)"`
+	} `graphql:"repository(owner: $owner, name: $repository)"`
+}
+type ReleaseNode struct {
+	Name         string
+	TagName      string
+	TagCommit    TagCommit
+	IsDraft      bool
+	IsLatest     bool
+	IsPrerelease bool
+	CreatedAt    githubv4.DateTime
+	PublishedAt  githubv4.DateTime
+}
+
+// PublicationDate returns the date at which the release became public.
+// Draft releases have no publication date, so their creation date is used instead.
+func (r ReleaseNode) PublicationDate() time.Time {
+	if !r.PublishedAt.IsZero() {
+		return r.PublishedAt.Time
+	}
+	return r.CreatedAt.Time
+}
+
+type TagCommit struct {
+	Oid string
+}
+type releaseEdge struct {
+	Cursor string
+	Node   ReleaseNode
+}
+type repositoryRelease struct {
+	TotalCount int
+	PageInfo   PageInfo
+	Edges      []releaseEdge
+}
+
+// SearchReleases return every releaseNode from the github api
+// ordered by reverse order of created time.
+// Draft and pre-releases are filtered out.
+func (g *Github) SearchReleases(ctx context.Context, releaseType ReleaseType, retry int) (releases []ReleaseNode, err error) {
+
+	var query releasesQuery
+
+	variables := map[string]interface{}{
+		keyOwner:      githubv4.String(g.Spec.Owner),
+		keyRepository: githubv4.String(g.Spec.Repository),
+		keyBefore:     (*githubv4.String)(nil),
+		"orderBy": githubv4.ReleaseOrder{
+			Field:     "CREATED_AT",
+			Direction: "DESC",
+		},
+	}
+
+	for {
+		err := g.client.Query(ctx, &query, variables)
+		if err != nil {
+			if client.IsRateLimitError(err) {
+
+				rateLimit, err := queryRateLimit(g.client, ctx)
+				if err != nil {
+					log.Errorf("Error querying GitHub API rate limit: %s", err)
+				}
+
+				log.Debugln(rateLimit)
+
+				if retry < client.MaxRetry {
+					log.Warningf("GitHub API rate limit exceeded. Retrying... (%d/%d)", retry+1, client.MaxRetry)
+					rateLimit.Pause(ctx)
+					return g.SearchReleases(ctx, releaseType, retry+1)
+				}
+				return nil, errors.New(ErrAPIRateLimitExceededFinalAttempt)
+			}
+			return nil, fmt.Errorf("querying GitHub API: %w", err)
+		}
+
+		log.Debugln(query.RateLimit)
+
+		for i := len(query.Repository.Releases.Edges) - 1; i >= 0; i-- {
+			node := query.Repository.Releases.Edges[i]
+
+			// If releaseType.Latest is set to true, then it means
+			// we only care about identifying the latest release
+			if releaseType.Latest {
+				if node.Node.IsLatest {
+					releases = append(releases, node.Node)
+					break
+				}
+				// Check if the next release is of type "latest"
+				continue
+			}
+
+			if node.Node.IsDraft {
+				if releaseType.Draft {
+					releases = append(releases, node.Node)
+				}
+			} else if node.Node.IsPrerelease {
+				if releaseType.PreRelease {
+					releases = append(releases, node.Node)
+				}
+			} else {
+				if releaseType.Release {
+					releases = append(releases, node.Node)
+				}
+			}
+		}
+
+		if !query.Repository.Releases.PageInfo.HasPreviousPage {
+			break
+		}
+
+		variables[keyBefore] = githubv4.NewString(githubv4.String(query.Repository.Releases.PageInfo.StartCursor))
+	}
+
+	log.Debugf("%d releases found", len(releases))
+	return releases, nil
+}
+
+// SearchReleasesByTagName return every releases tag name from the github api
+// ordered by reverse order of created time.
+// Draft and pre-releases are filtered out.
+func (g *Github) SearchReleasesByTagName(ctx context.Context, releaseType ReleaseType) (releases []string, err error) {
+	releaseNodes, err := g.SearchReleases(ctx, releaseType, 0)
+	if err != nil {
+		log.Errorf("\t%s", err)
+		return releases, err
+	}
+
+	for _, release := range releaseNodes {
+		releases = append(releases, release.TagName)
+	}
+	return releases, nil
+}
+
+// SearchReleasesByTagHash return every releases tag hash from the github api
+// ordered by reverse order of created time.
+// Draft and pre-releases are filtered out.
+func (g *Github) SearchReleasesByTagHash(ctx context.Context, releaseType ReleaseType) (releases []string, err error) {
+	releaseNodes, err := g.SearchReleases(ctx, releaseType, 0)
+	if err != nil {
+		log.Errorf("\t%s", err)
+		return releases, err
+	}
+
+	for _, release := range releaseNodes {
+		releases = append(releases, release.TagCommit.Oid)
+	}
+	return releases, nil
+}
+
+// SearchReleasesByTitle return every releases title from the github api
+// ordered by reverse order of created time.
+// Draft and pre-releases are filtered out.
+func (g *Github) SearchReleasesByTitle(ctx context.Context, releaseType ReleaseType) (releases []string, err error) {
+	releaseNodes, err := g.SearchReleases(ctx, releaseType, 0)
+	if err != nil {
+		log.Errorf("\t%s", err)
+		return releases, err
+	}
+
+	for _, release := range releaseNodes {
+		releases = append(releases, release.Name)
+	}
+	return releases, nil
+}

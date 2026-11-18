@@ -1,0 +1,155 @@
+package flux
+
+import (
+	"fmt"
+	"path/filepath"
+
+	"github.com/Masterminds/semver/v3"
+	"github.com/updatecli/updatecli/pkg/core/log"
+)
+
+// MatchingRule defines a rule to select artifacts.
+// A rule matches when every field it sets matches.
+// Each rule must set at least one field.
+type MatchingRule struct {
+	// "path" defines a Flux manifest path pattern.
+	//
+	// remark:
+	//   * the pattern must match the whole path, not just a substring.
+	//   * the pattern follows the Go filepath.Match syntax, such as "*" or "?".
+	//
+	Path string
+	// "repositories" defines the Helm repository URLs to match.
+	//
+	// remark:
+	//   * a repository URL must be identical to one of the entries.
+	//   * an OCIRepository artifact has no Helm repository, so a rule setting "repositories" never matches it.
+	//
+	Repositories []string
+	// "artifacts" defines the artifacts to match, keyed by artifact name.
+	//
+	// remark:
+	//   * an artifact is the Helm chart of a HelmRelease, or the artifact of an OCIRepository.
+	//   * an OCIRepository artifact name is its URL without the "oci://" prefix.
+	//   * an empty value matches any version.
+	//   * otherwise the value is a semantic version constraint, such as ">=1.0.0".
+	//   * when the version or the constraint cannot be parsed, the value must equal the version.
+	//
+	Artifacts map[string]string
+}
+
+// MatchingRules defines a list of rules.
+// The list matches when at least one of its rules matches.
+type MatchingRules []MatchingRule
+
+// Validate checks that each matching rule has at least one non-empty field.
+// Returns an error if any rule has no valid fields specified.
+func (m MatchingRules) Validate() error {
+	for i, rule := range m {
+		if rule.Path == "" && len(rule.Repositories) == 0 && len(rule.Artifacts) == 0 {
+			return fmt.Errorf("rule %d has no valid fields (path, repositories, or artifacts must be specified)", i+1)
+		}
+	}
+	return nil
+}
+
+// isMatchingRules checks if a specific file content matches the "only" rule
+func (m MatchingRules) isMatchingRules(rootDir, filePath, repositoryURL, chartName, chartVersion string) bool {
+	var ruleResults []bool
+
+	if len(m) > 0 {
+		for _, rule := range m {
+			/*
+				Check if rule.Path is matching. Path accepts wildcard path
+			*/
+
+			if rule.Path != "" {
+				if filepath.IsAbs(rule.Path) {
+					filePath = filepath.Join(rootDir, filePath)
+				}
+
+				match, err := filepath.Match(rule.Path, filePath)
+				if err != nil {
+					log.Errorf("%s - %q", err, rule.Path)
+					continue
+				}
+				ruleResults = append(ruleResults, match)
+				if match {
+					log.Debugf("file path %q matching rule %q", filePath, rule.Path)
+				}
+			}
+
+			/*
+				Checks if Chart Repository is matching the policy constraint.
+			*/
+
+			if len(rule.Repositories) > 0 {
+				match := false
+
+			outRepository:
+				for i := range rule.Repositories {
+
+					if repositoryURL == rule.Repositories[i] {
+						match = true
+						break outRepository
+					}
+				}
+				ruleResults = append(ruleResults, match)
+			}
+
+			/*
+				Checks if Chart Name is matching the policy constraint.
+			*/
+
+			if len(rule.Artifacts) > 0 {
+				match := false
+
+			outChartName:
+				for ruleReleaseName, ruleReleaseVersion := range rule.Artifacts {
+
+					if chartName == ruleReleaseName {
+						if ruleReleaseVersion == "" {
+							match = true
+							break outChartName
+						}
+
+						v, err := semver.NewVersion(chartVersion)
+						if err != nil {
+							match = chartVersion == ruleReleaseVersion
+							log.Debugf("%q - %s", chartVersion, err)
+							break outChartName
+						}
+
+						c, err := semver.NewConstraint(ruleReleaseVersion)
+						if err != nil {
+							match = chartVersion == ruleReleaseVersion
+							log.Debugf("%q %s", err, ruleReleaseVersion)
+							break outChartName
+						}
+
+						match = c.Check(v)
+						break outChartName
+					}
+				}
+				ruleResults = append(ruleResults, match)
+			}
+
+			/*
+				If at least one rule is failing then we return false
+			*/
+			isAllMatching := true
+			for i := range ruleResults {
+				if !ruleResults[i] {
+					isAllMatching = false
+				}
+			}
+			if isAllMatching {
+				return true
+			}
+			ruleResults = []bool{}
+		}
+		return false
+	}
+
+	return false
+}

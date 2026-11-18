@@ -1,0 +1,84 @@
+package config
+
+import (
+	"fmt"
+
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"github.com/updatecli/updatecli/pkg/core/pipeline/scm"
+)
+
+// GetChangelogTitle try to guess a specific target based on various information available for
+// a specific job
+func (config *Config) GetChangelogTitle(ID string, fallback string) (title string) {
+	if len(config.Spec.Name) > 0 {
+		// If a pipeline title has been defined, then use it for action title
+		title = config.Spec.Name
+
+	} else if len(config.Spec.Targets) == 1 && len(config.Spec.Targets[ID].Name) > 0 {
+		// If we only have one target then we can use it as fallback.
+		// Reminder, map in golang are not sorted so the order can't be kept between updatecli run
+		title = config.Spec.Targets[ID].Name
+	} else {
+		// At the moment, we don't have an easy way to describe what changed
+		// I am still thinking to a better solution.
+		log.Warning("**Fallback** Please add a name to your configuration using the field 'name: <your pipeline>'")
+		title = fmt.Sprintf("deps: [%s] Bump version to %s",
+			config.Spec.Sources[config.Spec.Targets[ID].SourceID].Kind,
+			fallback)
+	}
+	return title
+}
+
+// EnsureLocalScm ensures the config receiver has a
+// "local" SCM configuration if needed
+func (config *Config) EnsureLocalScm() error {
+	if !config.needScm(LOCALSCMIDENTIFIER) {
+		return nil
+	}
+	// Is there already a "local" SCM specified by the user
+	localScmConfig, ok := config.Spec.SCMs[LOCALSCMIDENTIFIER]
+	if ok && localScmConfig.Disabled {
+		// No need to "auto-guess" if user disabled the local SCM explicitly
+		return nil
+	}
+
+	// Autoguess (localScmConfig is a copy of the config tree)
+	// The base directory is where the manifest expects its relative paths to resolve from,
+	// so it is also where the "local" scm must look for a repository.
+	// The checkout directory stays empty so the scm keeps working from its own clone
+	// instead of the user's working copy.
+	if err := localScmConfig.AutoGuess(LOCALSCMIDENTIFIER, config.BaseDir(), "", config.gitHandler); err != nil {
+		return err
+	}
+
+	if config.Spec.SCMs == nil {
+		log.Infof("\nINFO: A configuration for the 'local' SCM is automatically guessed. To opt-out, please set `scms.local.disabled` to the value `true`\n")
+		config.Spec.SCMs = make(map[string]scm.Config)
+	}
+	config.Spec.SCMs[LOCALSCMIDENTIFIER] = localScmConfig
+	return nil
+}
+
+func (config Config) needScm(requiredScmId string) bool {
+	for _, source := range config.Spec.Sources {
+		if source.SCMID == requiredScmId {
+			return true
+		}
+	}
+	for _, condition := range config.Spec.Conditions {
+		if condition.SCMID == requiredScmId {
+			return true
+		}
+	}
+	for _, target := range config.Spec.Targets {
+		if target.SCMID == requiredScmId {
+			return true
+		}
+	}
+	for _, action := range config.Spec.Actions {
+		if action.ScmID == requiredScmId {
+			return true
+		}
+	}
+	return false
+}

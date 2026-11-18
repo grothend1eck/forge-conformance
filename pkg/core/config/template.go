@@ -1,0 +1,246 @@
+package config
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
+	"text/template"
+
+	"github.com/updatecli/updatecli/pkg/core/log"
+
+	"dario.cat/mergo"
+	"github.com/Masterminds/sprig/v3"
+	"github.com/getsops/sops/v3/decrypt"
+	"go.yaml.in/yaml/v4"
+
+	"cuelang.org/go/cue"
+	cueast "cuelang.org/go/cue/ast"
+	"cuelang.org/go/cue/cuecontext"
+)
+
+// Template contains template information used to generate updatecli configuration struct
+type Template struct {
+	// CfgFile is the updatecli configuration file
+	CfgFile string
+	// ValuesFiles contains one or multiple yaml files containing key/values
+	ValuesFiles []string
+	// ValuesInline contains the list of inline values for templating, accepted valid json/yaml string
+	ValuesInline []string
+	// SecretsFiles contains one or multiple sops files containing secrets
+	SecretsFiles []string
+	// Values contains key/value extracted from a values file
+	Values map[string]interface{} `yaml:"-,inline"`
+	// Secrets contains key/value extracted from a sops file
+	Secrets map[string]interface{} `yaml:"-,inline"`
+	// Fragments describes which file each line of the content handed to
+	// NewStringTemplate comes from, so that templating errors can be reported
+	// against the file the user wrote rather than against the concatenation of
+	// every partial and the manifest.
+	Fragments []manifestFragment
+	// fs is a file system abstraction used to read files
+	fs fs.FS
+}
+
+// templateName returns the name given to the golang template, which text/template
+// uses to prefix the location of parse and execution errors.
+func (t *Template) templateName() string {
+	if t.CfgFile == "" {
+		return "cfg"
+	}
+
+	return t.CfgFile
+}
+
+// NewStringTemplate parses a golang template then return an updatecli configuration as a struct
+func (t *Template) NewStringTemplate(content []byte) ([]byte, error) {
+	templateValues, err := t.readAllValues()
+	if err != nil {
+		return []byte{}, err
+	}
+
+	tmpl, err := template.New(t.templateName()).
+		Funcs(sprig.FuncMap()).
+		Funcs(helmFuncMap()).      // add helm funcMap
+		Funcs(updatecliFuncMap()). // add custom funcMap last so that it takes precedence
+		Parse(string(content))
+	if err != nil {
+		return []byte{}, t.locateError(err, content)
+	}
+
+	b := bytes.Buffer{}
+
+	if err := tmpl.Execute(&b, templateValues); err != nil {
+		return []byte{}, t.locateError(err, content)
+	}
+
+	return b.Bytes(), nil
+}
+
+// locateError points a templating error at the file and line it came from, and
+// appends an excerpt of the offending lines. It returns the error unchanged when
+// the location cannot be resolved.
+func (t *Template) locateError(err error, content []byte) error {
+	location, located := locateTemplateError(err, t.templateName(), t.Fragments)
+
+	excerpt := renderExcerpt(content, location, excerptContextLines)
+	if excerpt == "" {
+		return located
+	}
+
+	return fmt.Errorf("%w\n\n%s", located, strings.TrimRight(excerpt, "\n"))
+}
+
+// NewCueTemplate parses a Cue template then return an updatecli configuration as a struct
+func (t *Template) NewCueTemplate(content []byte) (cue.Value, error) {
+	ctx := cuecontext.New()
+
+	templateValues, err := t.readAllValues()
+	if err != nil {
+		return cue.Value{}, err
+	}
+
+	scope := ctx.BuildExpr(cueast.NewStruct())
+	valuesPath := cue.MakePath(cue.Def("#values"))
+	scope = scope.FillPath(valuesPath, ctx.Encode(templateValues))
+
+	result := ctx.CompileBytes(content, cue.Scope(scope))
+	return result, nil
+}
+
+// readAllValues reads and merges all the values and secrets files into one map
+func (t *Template) readAllValues() (map[string]any, error) {
+	err := t.readValuesFiles(t.ValuesFiles, false)
+	if err != nil {
+		return nil, err
+	}
+
+	err = t.readValuesFiles(t.SecretsFiles, true)
+	if err != nil {
+		return nil, err
+	}
+
+	inlineValues, err := readValuesInline(t.ValuesInline)
+	if err != nil {
+		return nil, err
+	}
+
+	// Merge yaml configuration, sops secrets, and inline values into one configuration
+	return mergeValueFile(t.Values, t.Secrets, inlineValues), nil
+}
+
+// readValuesFiles reads one or multiple updatecli values files and merge them into one
+func (t *Template) readValuesFiles(valueFiles []string, encrypted bool) error {
+	// Read every files containing yaml key/values
+	for _, valueFile := range valueFiles {
+		var v map[string]interface{}
+		err := t.readFile(valueFile, &v, encrypted)
+		// Stop early, no need to lead more values files
+		// if something went wrong with at least one
+		if err != nil {
+			return err
+		}
+
+		// Merge yaml configuration and sops secrets into different variable
+		switch encrypted {
+		case true:
+			t.Secrets = mergeValueFile(t.Secrets, v)
+		case false:
+			t.Values = mergeValueFile(t.Values, v)
+		}
+	}
+	return nil
+}
+
+// ReadFile reads an updatecli values file, it can also read encrypted sops files
+func (t *Template) readFile(filename string, values *map[string]interface{}, encrypted bool) (err error) {
+	baseFilename := filepath.Base(filename)
+	extension := filepath.Ext(baseFilename)
+
+	// Check if the file extension is either yaml or yml
+	if strings.Compare(extension, EXTENSIONYML) != 0 &&
+		strings.Compare(extension, EXTENSIONYAML) != 0 &&
+		strings.Compare(extension, EXTENSIONJSON) != 0 {
+		err = fmt.Errorf("wrong file extension %q for file %q", extension, baseFilename)
+		log.Errorln(err)
+		return err
+	}
+
+	if filename == "" {
+		log.Infof("No filename defined, nothing else to do")
+		return nil
+	}
+
+	// I am struggling to find a way to mock the file system for the unit test
+	// when file is not in the current directory
+	// So I am using a condition to make sure that the unit test work
+	if filename != baseFilename {
+		t.fs = os.DirFS(filepath.Dir(filename))
+	}
+
+	v, err := t.fs.Open((baseFilename))
+	if err != nil {
+		return err
+	}
+
+	defer v.Close()
+
+	content, err := io.ReadAll(v)
+	if err != nil {
+		return err
+	}
+
+	if encrypted {
+		switch extension {
+		case EXTENSIONYAML, EXTENSIONYML:
+			content, err = decrypt.Data(content, "yaml")
+			if err != nil {
+				return err
+			}
+		case EXTENSIONJSON:
+			content, err = decrypt.Data(content, "json")
+			if err != nil {
+				return err
+			}
+		default:
+			err = fmt.Errorf("wrong file extension %q for file %q", extension, baseFilename)
+		}
+	}
+
+	err = yaml.Unmarshal(content, &values)
+
+	return err
+}
+
+// readValuesInline reads and merges all the inline values into one map
+func readValuesInline(valuesInline []string) (map[string]interface{}, error) {
+	values := make(map[string]interface{})
+
+	for _, value := range valuesInline {
+		var v map[string]interface{}
+		err := yaml.Unmarshal([]byte(value), &v)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse inline value: %w", err)
+		}
+		values = mergeValueFile(values, v)
+	}
+
+	return values, nil
+}
+
+// mergeValueFile merges one or multiple updatecli value files content into one
+func mergeValueFile(valuesFiles ...map[string]interface{}) (results map[string]interface{}) {
+	results = make(map[string]interface{})
+
+	for _, values := range valuesFiles {
+		if err := mergo.Merge(&results, values, mergo.WithOverride); err != nil {
+			err = fmt.Errorf("merging values files: %w", err)
+			log.Errorln(err)
+		}
+	}
+
+	return results
+}

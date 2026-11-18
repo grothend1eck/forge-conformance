@@ -1,0 +1,61 @@
+name: CSV manipulation examples
+pipelineid: "e2e/csv"
+
+sources:
+  default:
+    name: Basic get query
+    kind: csv
+    spec:
+      files:
+        - pkg/plugins/resources/csv/testdata/data.csv
+      key: "$this[0].firstname"
+      engine: dasel/v3
+
+  versionfilter:
+    name: Test Version filter`
+    kind: csv
+    spec:
+      files:
+        - pkg/plugins/resources/csv/testdata/data.csv
+      key: "map(firstname)..."
+      versionfilter:
+        kind: regex
+        pattern: "^Jo"
+      engine: dasel/v3
+
+conditions:
+  single:
+    name: Basic condition query
+    kind: csv
+    disablesourceinput: true
+    spec:
+      files:
+        - pkg/plugins/resources/csv/testdata/data.csv
+        - pkg/plugins/resources/csv/testdata/data.csv
+      key: $this[0].firstname
+      value: John
+      engine: dasel/v3
+
+targets:
+  single:
+    name: Basic target update
+    kind: csv
+    sourceid: default
+    spec:
+      files:
+        - pkg/plugins/resources/csv/testdata/data.csv
+        - pkg/plugins/resources/csv/testdata/data.csv
+      key: $this[1].firstname
+      value: John
+      engine: dasel/v3
+
+  multiple:
+    name: Multiple target update
+    kind: csv
+    sourceid: default
+    spec:
+      files:
+        - pkg/plugins/resources/csv/testdata/data.csv
+        - pkg/plugins/resources/csv/testdata/data.csv
+      key: "map(firstname)..."
+      engine: dasel/v3

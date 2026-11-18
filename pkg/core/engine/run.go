@@ -1,0 +1,151 @@
+package engine
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/updatecli/updatecli/pkg/core/cache"
+	"github.com/updatecli/updatecli/pkg/core/httpclient"
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"github.com/updatecli/updatecli/pkg/core/result"
+	"github.com/updatecli/updatecli/pkg/core/telemetry"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+)
+
+// Run runs the full process under the provided context, emitting
+// OpenTelemetry spans for each major operation so failures are observable.
+func (e *Engine) Run(ctx context.Context) (err error) {
+	log.Title("Pipeline")
+
+	tracer := e.tracer
+	ctx, span := tracer.Start(ctx, "updatecli.run",
+		trace.WithAttributes(
+			attribute.Int("updatecli.pipeline_count", len(e.Pipelines)),
+			attribute.Bool("updatecli.dry_run", e.Options.Pipeline.Target.DryRun),
+		),
+	)
+	defer span.End()
+
+	errs := []error{}
+
+	e.sourceCache = cache.NewSourceCache()
+
+	httpclient.EnableHTTPCache()
+	defer httpclient.DisableHTTPCache()
+
+	for i := range e.Pipelines {
+		pipeline := e.Pipelines[i]
+		pipeline.SourceCache = e.sourceCache
+
+		stopCapture := pipeline.CaptureConsoleOutput()
+		log.PipelineTitle(log.Pipeline{
+			Name:     pipeline.Name,
+			ID:       pipeline.ID,
+			DryRun:   pipeline.Options.Target.DryRun,
+			Position: i + 1,
+			Total:    len(e.Pipelines),
+		})
+		start := time.Now()
+		err := e.failedSCMError(pipeline)
+		if err != nil {
+			pipeline.Report.Result = result.FAILURE
+			pipeline.Report.Err = err.Error()
+		} else {
+			err = pipeline.Run(ctx)
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("pipeline %q failed: %w", pipeline.Name, err))
+			span.AddEvent("pipeline.failed", trace.WithAttributes(
+				attribute.String("pipeline.name", pipeline.Name),
+				attribute.String("error", telemetry.SanitizeError(err)),
+			))
+			log.Printf("Pipeline %q failed\n", pipeline.Name)
+			log.Printf("Skipping due to:\n\t%s\n", err)
+		}
+
+		status := pipeline.Status()
+		if err != nil {
+			status = log.StatusFailed
+		}
+		log.PipelineResult(status, time.Since(start))
+		stopCapture()
+	}
+
+	if !e.Options.Pipeline.Target.DryRun && e.Options.Pipeline.Target.Push {
+		_, pushSpan := tracer.Start(ctx, "updatecli.push_commits")
+		if err = e.pushSCMCommits(); err != nil {
+			errs = append(errs, fmt.Errorf("pushing commits failed: %w", err))
+			telemetry.RecordSpanError(pushSpan, err)
+		}
+		pushSpan.End()
+	}
+
+	actionsCtx, actionsSpan := tracer.Start(ctx, "updatecli.run_actions")
+	if err = e.runActions(actionsCtx); err != nil {
+		errs = append(errs, fmt.Errorf("running actions failed: %w", err))
+		telemetry.RecordSpanError(actionsSpan, err)
+	}
+	actionsSpan.End()
+
+	if !e.Options.Pipeline.Target.DryRun && e.Options.Pipeline.Target.Push && e.Options.Pipeline.Target.CleanGitBranches {
+		_, pruneSpan := tracer.Start(ctx, "updatecli.prune_scm_branches")
+		if err = e.pruneSCMBranches(); err != nil {
+			errs = append(errs, fmt.Errorf("cleaning git branches failed: %w", err))
+			telemetry.RecordSpanError(pruneSpan, err)
+		}
+		pruneSpan.End()
+	}
+
+	for i := range e.Pipelines {
+		pipeline := e.Pipelines[i]
+		pipeline.SaveConsoleOutput()
+		err = pipeline.Report.UpdateCIJob()
+		if err != nil {
+			log.Debugf("updating CI job information: %s", err)
+		}
+		err = pipeline.Report.UpdateID()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("updating report ID failed: %w", err))
+		}
+	}
+
+	e.publishErr = nil
+	if !e.Options.DisableUdashReport {
+		_, publishSpan := tracer.Start(ctx, "updatecli.publish_udash")
+		// A publish failure is logged and kept apart from the pipeline errors.
+		if e.publishErr = e.publishToUdash(); e.publishErr != nil {
+			log.Error(e.publishErr)
+			telemetry.RecordSpanError(publishSpan, e.publishErr)
+		}
+		publishSpan.End()
+	}
+
+	// e.Reports holds copies, so collect them once publishing has set the
+	// report URL shown in the summary.
+	for i := range e.Pipelines {
+		e.Reports = append(e.Reports, e.Pipelines[i].Report)
+	}
+
+	if e.Options.ExportToYAML {
+		if err = e.exportReportToYAML(); err != nil {
+			errs = append(errs, fmt.Errorf("exporting report to YAML failed: %w", err))
+		}
+	}
+
+	if err = e.showReports(); err != nil {
+		errs = append(errs, fmt.Errorf("showing reports failed: %w", err))
+	}
+
+	if len(errs) > 0 {
+		for _, e := range errs {
+			log.Error(e)
+		}
+		span.SetStatus(codes.Error, fmt.Sprintf("%d pipeline(s) failed", len(errs)))
+		return fmt.Errorf("%d pipeline(s) failed during execution", len(errs))
+	}
+
+	return nil
+}

@@ -1,0 +1,376 @@
+package pipeline
+
+import (
+	"context"
+	"crypto/sha256"
+	"fmt"
+	"slices"
+	"strings"
+
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"github.com/updatecli/updatecli/pkg/core/pipeline/action"
+	"github.com/updatecli/updatecli/pkg/core/reports"
+	"github.com/updatecli/updatecli/pkg/core/result"
+)
+
+var (
+	// CheckedPipelines is used to avoid checking the same action multiple times across different pipelines
+	CheckedPipelines []string
+)
+
+// RunActions runs all actions defined in the configuration.
+func (p *Pipeline) RunActions(ctx context.Context) error {
+
+	if len(p.Actions) == 0 {
+		log.Debugf("No action found for pipeline %q", p.Name)
+		return nil
+	}
+
+	// Early return
+	if len(p.Targets) == 0 {
+		log.Debugf("No target found for pipeline %q, skipping depends on action", p.Name)
+		return nil
+	}
+
+	// firstPipelineAction is used to display the pipeline name only once
+	firstPipelineAction := true
+
+	for id := range p.Actions {
+
+		// Update pipeline before each action run
+		if err := p.Update(); err != nil {
+			log.Errorf("Pipeline %q failed to update: %s", p.Name, err.Error())
+			continue
+		}
+
+		action := p.Actions[id]
+
+		// action.Report.ID and action.Report.Title must be set
+		// after actionTarget is set
+		updateActionTitle := func() {
+			action.Title = p.Config.Spec.Actions[id].Title
+			// If an action spec doesn't have a title, then we use the one specified by the pipeline spec title
+			if action.Title == "" {
+				p.detectActionTitle(&action)
+			}
+		}
+
+		showActionTitle := func() {
+			updateActionTitle()
+			if firstPipelineAction {
+				log.Infof("\n---")
+				log.Infof("Pipeline Name\t: %s", p.Name)
+				log.Infof("Pipeline ID\t: %s", p.ID)
+				log.Infof("Dry run\t\t: %t", p.Options.Target.DryRun)
+			}
+
+			if action.Scm != nil {
+				log.Infof("Repository\t: %s", action.Scm.Handler.Summary())
+			}
+
+			log.Infof("Action\t\t: %s\n", action.Title)
+			log.Infof("---\n\n")
+			firstPipelineAction = false
+		}
+
+		showActionTitle()
+
+		relatedTargets, err := p.searchAssociatedTargetsID(id)
+		if err != nil {
+			log.Errorf("searching associated targets ID: %s", err.Error())
+			continue
+		}
+
+		if len(relatedTargets) == 0 {
+			log.Infof("No target found for action %q", id)
+			continue
+		}
+
+		// alreadyCheckedAction is used to avoid checking the same action multiple times
+		alreadyCheckedAction := p.Report.Targets[relatedTargets[0]].Scm.ID + p.ID
+
+		if _, ok := p.SCMs[action.Config.ScmID]; !ok {
+			return fmt.Errorf("scm id %q couldn't be found", action.Config.ScmID)
+		}
+
+		inheritedSCM := p.SCMs[action.Config.ScmID]
+		action.Scm = &inheritedSCM
+
+		action.Config = p.Config.Spec.Actions[id]
+
+		if p.Report.Actions == nil {
+			p.Report.Actions = make(map[string]*reports.Action)
+		}
+		p.Report.Actions[id] = &action.Report
+
+		if err := action.Update(); err != nil {
+			return err
+		}
+
+		failedTargetIDs, attentionTargetIDs, _, skippedTargetIDs := p.GetTargetsIDByResult(relatedTargets)
+
+		// Ignoring failed targets
+		if len(failedTargetIDs) > 0 {
+			log.Warningf("%d/%d target(s) (%s) failed for action %q", len(failedTargetIDs), len(relatedTargets), strings.Join(failedTargetIDs, ","), id)
+			for _, tID := range failedTargetIDs {
+				log.Infof("  - %s: %s — %s", p.Targets[tID].Config.Name, p.Report.Targets[tID].Result, p.Report.Targets[tID].Description)
+			}
+			log.Infof("\n")
+		}
+
+		// Ignoring skipped targets
+		if len(skippedTargetIDs) > 0 {
+			log.Debugf("%d/%d target(s) (%s) skipped for action %q", len(skippedTargetIDs), len(relatedTargets), strings.Join(skippedTargetIDs, ","), id)
+		}
+
+		// If no target require attention while processing action in a attention state,
+		// then we skip the action
+		if len(attentionTargetIDs) == 0 {
+			// If nothing changed within associated target, then we want to be sure that
+			// we don't have an open pull request or an open issue before skipping the action
+			// The goal is to identify pull request opened in previous Updatecli execution.
+			if len(relatedTargets) > 0 {
+				if !slices.Contains(CheckedPipelines, alreadyCheckedAction) {
+
+					err = action.Handler.CheckActionExist(ctx, &action.Report)
+					if err != nil {
+						log.Warningf("Action %q failed: %s", id, err.Error())
+					}
+
+					CheckedPipelines = append(CheckedPipelines, alreadyCheckedAction)
+					if action.Report.Link == "" {
+						log.Infof("No follow up action needed")
+					}
+
+					p.Report.Actions[id] = &action.Report
+				}
+			}
+			continue
+		}
+
+		// We try to identify if any of the related targets have a branch reset.
+		// It it's the case then we set the action to have a branch reset
+		// and remove the previous action description as it may be outdated.
+		isBranchReset := false
+		for _, t := range relatedTargets {
+			if p.Targets[t].Result.Scm.BranchReset {
+				isBranchReset = true
+				break
+			}
+		}
+		for _, t := range attentionTargetIDs {
+
+			actionTarget := reports.ActionTarget{
+				// Better for ID to use hash string
+				ID:          fmt.Sprintf("%x", sha256.Sum256([]byte(t))),
+				Title:       p.Targets[t].Config.Name,
+				Description: p.Targets[t].Result.Description,
+			}
+
+			if len(p.Targets[t].Result.Changelogs) > 0 {
+
+				for _, changelog := range p.Targets[t].Result.Changelogs {
+					actionTarget.Changelogs = append(actionTarget.Changelogs, reports.ActionTargetChangelog{
+						Title:       changelog.Title,
+						Description: changelog.Body,
+					})
+				}
+
+			}
+
+			action.Report.Targets = append(action.Report.Targets, actionTarget)
+		}
+
+		pipelineName := p.Config.Spec.Name
+		if pipelineName == "" && p.Config.Spec.Title != "" {
+			pipelineName = p.Config.Spec.Name
+		} else if pipelineName == "" && p.Name != "" {
+			pipelineName = p.Name
+		}
+
+		action.Report.ID = p.actionReportID()
+		action.Report.Title = action.Title
+		action.Report.PipelineTitle = pipelineName
+
+		if !action.Config.DisablePipelineURL {
+			action.Report.UpdatePipelineURL()
+		}
+		if isBranchReset {
+			log.Warningf("Git branch reset detected, the action must reset previous action description")
+		}
+
+		if p.Options.Target.DryRun || !p.Options.Target.Push {
+			if len(attentionTargetIDs) > 0 {
+				log.Infof("An action of kind %q is expected.", action.Config.Kind)
+			}
+
+			actionOutput := fmt.Sprintf("The expected action would have the following information:\n\n## Title:\n%s\n\n\n## Report:\n\n%s\n\n=====\n",
+				action.Title,
+				action.Report.String())
+			log.Debugf("%s", strings.ReplaceAll(actionOutput, "\n", "\n\t|\t"))
+
+			action.Report.Description = actionOutput
+			action.Report.DryRun = true
+
+			p.Report.Actions[id] = &action.Report
+
+			return nil
+		}
+
+		err = action.Handler.CreateAction(ctx, &action.Report, isBranchReset)
+		if err != nil {
+			return err
+		}
+
+		isBranchReset = false
+
+		/*
+			The action has just been published so the remote information used by the clean
+			stage may not reflect it yet.
+			The clean stage is only meant to detect actions published by previous
+			Updatecli executions.
+		*/
+		action.Published = true
+
+		p.Actions[id] = action
+	}
+	return nil
+}
+
+// RunCleanActions executes clean up operation which depends on the action plugin.
+// handled holds the cleanup keys already cleaned or published during this execution.
+func (p *Pipeline) RunCleanActions(ctx context.Context, handled map[string]bool) error {
+	var errs []string
+
+	// Early return
+	if len(p.Targets) == 0 || len(p.Actions) == 0 {
+		return nil
+	}
+
+	for id := range p.Actions {
+		action := p.Actions[id]
+
+		if p.Options.Target.DryRun {
+			continue
+		}
+
+		if action.Handler == nil {
+			continue
+		}
+
+		// An action published by the current execution must not be cleaned up by that
+		// same execution.
+		if action.Published {
+			log.Debugf("Action %q published during this execution, skipping its cleanup", id)
+			continue
+		}
+
+		if key := action.CleanupKey(); key != "" {
+			if handled[key] {
+				continue
+			}
+			handled[key] = true
+		}
+
+		// At least we try to clean existing pullrequest
+		err := action.Handler.CleanAction(ctx, &action.Report)
+		if err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
+
+	if len(errs) > 0 {
+		log.Errorf("Failed to clean up action(s): %s", strings.Join(errs, ", "))
+		for i := range errs {
+			log.Errorf("  - %s", errs[i])
+		}
+		return fmt.Errorf("failed to clean up action(s):\n\t%s", strings.Join(errs, "\n\t* "))
+	}
+
+	return nil
+}
+
+// GetTargetsIDByResult return a list of target ID per result type
+func (p *Pipeline) GetTargetsIDByResult(targetIDs []string) (
+	failedTargetsID, attentionTargetsID, successTargetsID, skippedTargetsID []string) {
+
+	for _, targetID := range targetIDs {
+
+		switch p.Report.Targets[targetID].Result {
+		case result.FAILURE:
+			failedTargetsID = append(failedTargetsID, targetID)
+
+		case result.ATTENTION:
+			attentionTargetsID = append(attentionTargetsID, targetID)
+
+		case result.SKIPPED:
+			skippedTargetsID = append(skippedTargetsID, targetID)
+
+		case result.SUCCESS:
+			successTargetsID = append(successTargetsID, targetID)
+		}
+	}
+	return failedTargetsID, attentionTargetsID, successTargetsID, skippedTargetsID
+}
+
+// searchAssociatedTargetsID search for targets related to an action based on a scm configuration
+func (p *Pipeline) searchAssociatedTargetsID(actionID string) ([]string, error) {
+
+	scmid := p.Actions[actionID].Config.ScmID
+
+	if len(scmid) == 0 {
+		return []string{}, fmt.Errorf("scmid %q not found for the action id %q", scmid, actionID)
+	}
+	results := []string{}
+
+	for id, target := range p.Targets {
+		if target.Config.SCMID == scmid {
+			results = append(results, id)
+		}
+	}
+	return results, nil
+}
+
+// detectActionTitle set the action title based on the pipeline title or the target title
+func (p *Pipeline) detectActionTitle(action *action.Action) {
+	if action.Title != "" {
+		return
+	}
+
+	if p.Config.Spec.Name != "" {
+		action.Title = p.Config.Spec.Name
+		return
+	}
+
+	// Title is deprecated and should be removed in the future
+	if p.Config.Spec.Title != "" {
+		action.Title = p.Config.Spec.Title
+		return
+	}
+
+	if len(action.Report.Targets) == 0 {
+		log.Debugf("We don't know how to name the action")
+		return
+	}
+
+	// Search first validate action title based on target title
+	// if none could be found then actionTitle keeps its default value
+	for i := range action.Report.Targets {
+		if action.Report.Targets[i].Title != "" {
+			action.Title = action.Report.Targets[i].Title
+			return
+		}
+	}
+}
+
+// actionReportID returns the ID identifying the pipeline in action reports, such as pullrequest descriptions.
+// It relies on the unrendered pipeline name, so the ID doesn't change when the name references runtime values
+// such as {{ source "id" }}, and the report of an existing pullrequest keeps being merged instead of duplicated.
+func (p *Pipeline) actionReportID() string {
+	name := p.unrenderedName
+	// Pipelines not created by Init have no unrendered name
+	if name == "" {
+		name = p.Name
+	}
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(name)))
+}

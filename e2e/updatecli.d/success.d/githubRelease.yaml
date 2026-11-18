@@ -1,0 +1,58 @@
+name: Test GitHub Release
+
+sources:
+  default:
+    name: Default Get Latest github action Release
+    kind: githubrelease
+    spec:
+      owner: updatecli
+      repository: updatecli-action
+  prerelease:
+    name: Get Latest GitHub Action Prerelease
+    kind: githubrelease
+    spec:
+      owner: updatecli
+      repository: updatecli-action
+      typefilter:
+        prerelease: true
+  release:
+    name: Get Latest GitHub Action Release
+    kind: githubrelease
+    spec:
+      owner: updatecli
+      repository: updatecli-action
+      typefilter:
+        release: true
+  hash:
+    name: Default Get Latest github action Release Hash
+    kind: githubrelease
+    spec:
+      owner: updatecli
+      repository: updatecli-action
+      key: taghash
+conditions:
+  default:
+    name: Default Get Latest GitHub action Release
+    kind: githubrelease
+    sourceid: default
+    spec:
+      owner: updatecli
+      repository: updatecli-action
+  prerelease:
+    name: Check Latest GitHub Action Prerelease
+    kind: githubrelease
+    sourceid: prerelease
+    spec:
+      owner: updatecli
+      repository: updatecli-action
+      typefilter:
+        prerelease: true
+  release:
+    name: Check latest GitHub Action release
+    kind: githubrelease
+    sourceid: release
+    spec:
+      owner: updatecli
+      repository: updatecli-action
+      typefilter:
+        release: true

@@ -1,0 +1,53 @@
+package helm
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"helm.sh/helm/v3/pkg/repo"
+
+	"github.com/updatecli/updatecli/pkg/core/pipeline/scm"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/pathresolver"
+)
+
+// Condition checks if a specific chart version exist
+func (c *Chart) Condition(ctx context.Context, source string, scm scm.ScmHandler, pathResolver pathresolver.Resolver) (pass bool, message string, err error) {
+
+	if strings.HasPrefix(c.spec.URL, "oci://") {
+		return c.OCICondition(source, scm)
+	}
+
+	if c.spec.Version != "" {
+		log.Infof("Version %v, already defined from configuration file", c.spec.Version)
+	} else {
+		c.spec.Version = source
+	}
+
+	var index repo.IndexFile
+
+	if strings.HasPrefix(c.spec.URL, "https://") || strings.HasPrefix(c.spec.URL, "http://") {
+		index, err = c.GetRepoIndexFromURL(ctx)
+		if err != nil {
+			return false, "", err
+		}
+	} else {
+		index, err = c.GetRepoIndexFromFile(pathResolver)
+		if err != nil {
+			return false, "", err
+		}
+	}
+
+	baseMessage := ""
+	if c.spec.Version != "" {
+		baseMessage = fmt.Sprintf(" for version '%s'", c.spec.Version)
+	}
+
+	if index.Has(c.spec.Name, c.spec.Version) {
+		return true, fmt.Sprintf("Helm Chart %q is available on %s%s", c.spec.Name, c.spec.URL, baseMessage), nil
+	}
+
+	return false, fmt.Sprintf("the Helm chart %q isn't available on %s%s", c.spec.Name, c.spec.URL, baseMessage), nil
+
+}

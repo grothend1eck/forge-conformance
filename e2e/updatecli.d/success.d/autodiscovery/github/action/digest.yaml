@@ -1,0 +1,24 @@
+name: "deps: bump GitHub Action digest"
+scms:
+  default:
+    kind: github
+    spec:
+      owner: updatecli
+      repository: updatecli
+      branch: main
+
+actions:
+  default:
+    kind: github/pullrequest
+    scmid: default
+    spec:
+      labels:
+        - "dependencies"
+
+autodiscovery:
+  scmid: default
+  actionid: default
+  crawlers:
+    github/action:
+      digest: true
+      rootdir: pkg/plugins/autodiscovery/githubaction/testdata/digest/.github/

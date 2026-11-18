@@ -1,0 +1,294 @@
+package dockerfile
+
+import (
+	"bytes"
+	"path/filepath"
+	"sort"
+	"strings"
+	"text/template"
+
+	"path"
+
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"github.com/updatecli/updatecli/pkg/plugins/resources/dockerfile/simpletextparser/keywords"
+	"github.com/updatecli/updatecli/pkg/plugins/resources/dockerimage"
+)
+
+var (
+	// DefaultFileMatch specifies accepted Helm chart metadata file name
+	DefaultFileMatch []string = []string{
+		"Dockerfile",
+		"Dockerfile.*",
+	}
+	// scratchIgnore specifies a list of globally ignored docker image, like the `scratch` image which
+	// never needs to be updated as it's not a "real" image
+	scratchIgnore MatchingRule = MatchingRule{
+		Images: []string{"scratch"},
+	}
+)
+
+func (d Dockerfile) generateManifest(
+	globalIgnore MatchingRules,
+	relativeFoundDockerfile, basename, dirname string,
+	instruction keywords.FromToken,
+	args map[string]keywords.SimpleTokens,
+) ([]byte, error) {
+	var err error
+	targetMatcher, targetInstruction := instruction.Image, instruction.Keyword
+	image, tag, digest, platform := instruction.Image, instruction.Tag, instruction.Digest, instruction.Platform
+
+	argTypes := make([]string, 0, len(instruction.Args))
+	for argType := range instruction.Args {
+		argTypes = append(argTypes, argType)
+	}
+	sort.Strings(argTypes)
+
+	for _, arg_type := range argTypes {
+		fromArg := instruction.Args[arg_type]
+		if arg, ok := args[fromArg.Name]; ok {
+			if arg.Value == "" {
+				continue
+			}
+			switch arg_type {
+			case "image":
+				image = strings.ReplaceAll(image, "${"+fromArg.Name+"}", arg.Value)
+			case "tag":
+				tag = strings.ReplaceAll(tag, "${"+fromArg.Name+"}", arg.Value)
+			case "digest":
+				digest = strings.ReplaceAll(digest, "${"+fromArg.Name+"}", arg.Value)
+			case "platform":
+				platform = strings.ReplaceAll(platform, "${"+fromArg.Name+"}", arg.Value)
+			}
+			targetMatcher = fromArg.Name
+			targetInstruction = arg.Keyword
+		}
+	}
+	/*
+		We need to ensure that we don't have unresolved arg in the image source, a case
+		Where this could happen is e.g:
+		ARG updatecli_version
+		FROM updatecli/updatecli:${updatecli_version}
+		In this case, we cannot infer the version from the arg, and should ignore it
+	*/
+	if strings.Contains(image, "${") ||
+		strings.Contains(tag, "${") ||
+		strings.Contains(platform, "${") ||
+		strings.Contains(digest, "${") {
+		return nil, nil
+	}
+
+	/*
+		// For the time being, it's not possible to retrieve a list of tag for a specific digest
+		// without a significant amount f api call. More information on following issue
+		// https://github.com/google/go-containerregistry/issues/1297
+		// until a better solution, we don't handle docker image digest
+	*/
+	if digest != "" && tag == "" {
+		log.Debugf("docker digest without specified tag is not supported at the moment for %q", image)
+		return nil, nil
+	}
+
+	// Remove globally ignore images
+	if len(globalIgnore) > 0 {
+		if globalIgnore.isMatchingRule(d.rootDir, relativeFoundDockerfile, image, platform) {
+			log.Debugf("Ignoring Dockerfile %q from %q, as global matching ignore rule(s)\n",
+				basename,
+				dirname)
+			return nil, nil
+		}
+	}
+
+	// Test if the ignore rule based on path is respected
+	if len(d.spec.Ignore) > 0 {
+		if d.spec.Ignore.isMatchingRule(
+			d.rootDir,
+			relativeFoundDockerfile,
+			image,
+			platform,
+		) {
+
+			log.Debugf("Ignoring Dockerfile %q from %q, as matching ignore rule(s)\n",
+				basename,
+				dirname)
+			return nil, nil
+		}
+	}
+
+	// Test if the only rule based on path is respected
+	if len(d.spec.Only) > 0 {
+		if !d.spec.Only.isMatchingRule(
+			d.rootDir,
+			relativeFoundDockerfile,
+			image,
+			platform) {
+
+			log.Debugf("Ignoring Dockerfile %q from %q, as not matching only rule(s)\n",
+				basename,
+				dirname)
+			return nil, nil
+		}
+	}
+
+	sourceSpec := dockerimage.NewDockerImageSpecFromImage(image, tag, d.spec.Auths)
+
+	if sourceSpec == nil && !d.digest {
+		log.Debugln("no source spec detected")
+		return nil, nil
+	}
+
+	versionFilterKind := d.versionFilter.Kind
+	versionFilterPattern := d.versionFilter.Pattern
+	versionFilterRegex := d.versionFilter.Regex
+	tagFilter := "*"
+
+	registryUsername := ""
+	registryPassword := ""
+	registryToken := ""
+
+	if sourceSpec != nil {
+		versionFilterKind = sourceSpec.VersionFilter.Kind
+		versionFilterPattern = sourceSpec.VersionFilter.Pattern
+		versionFilterRegex = sourceSpec.VersionFilter.Regex
+		tagFilter = sourceSpec.TagFilter
+
+		registryPassword = sourceSpec.Password
+		registryUsername = sourceSpec.Username
+		registryToken = sourceSpec.Token
+	}
+
+	// If a versionfilter is specified in the manifest then we want to be sure that it takes precedence
+	if !d.spec.VersionFilter.IsZero() {
+		versionFilterKind = d.versionFilter.Kind
+		versionFilterPattern, err = d.versionFilter.GreaterThanPattern(tag)
+		versionFilterRegex = d.versionFilter.Regex
+		tagFilter = ""
+		if err != nil {
+			log.Debugf("building version filter pattern: %s", err)
+			versionFilterPattern = "*"
+		}
+	}
+
+	var tmpl *template.Template
+	if d.digest && sourceSpec != nil {
+		tmpl, err = template.New("manifest").Parse(manifestTemplateDigestAndLatest)
+		if err != nil {
+			return nil, err
+		}
+	} else if d.digest && sourceSpec == nil {
+		tmpl, err = template.New("manifest").Parse(manifestTemplateDigest)
+		if err != nil {
+			return nil, err
+		}
+	} else if !d.digest && sourceSpec != nil {
+		tmpl, err = template.New("manifest").Parse(manifestTemplateLatest)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		log.Infoln("No source spec detected")
+		return nil, nil
+	}
+
+	params := struct {
+		ActionID             string
+		ImageName            string
+		ImageTag             string
+		ScmID                string
+		SourceID             string
+		RegistryUsername     string
+		RegistryPassword     string
+		RegistryToken        string
+		TargetID             string
+		TargetFile           string
+		TargetKeyword        string
+		TargetMatcher        string
+		TagFilter            string
+		VersionFilterKind    string
+		VersionFilterPattern string
+		VersionFilterRegex   string
+	}{
+		ActionID:             d.actionID,
+		ImageName:            image,
+		ImageTag:             tag,
+		ScmID:                d.scmID,
+		SourceID:             image,
+		RegistryUsername:     registryUsername,
+		RegistryPassword:     registryPassword,
+		RegistryToken:        registryToken,
+		TargetID:             image,
+		TargetFile:           relativeFoundDockerfile,
+		TargetKeyword:        targetInstruction,
+		TargetMatcher:        targetMatcher,
+		TagFilter:            tagFilter,
+		VersionFilterKind:    versionFilterKind,
+		VersionFilterPattern: versionFilterPattern,
+		VersionFilterRegex:   versionFilterRegex,
+	}
+
+	manifest := bytes.Buffer{}
+	if err := tmpl.Execute(&manifest, params); err != nil {
+		log.Debugln(err)
+		return nil, nil
+	}
+	return manifest.Bytes(), nil
+}
+
+func (d Dockerfile) discoverDockerfileManifests() ([][]byte, error) {
+
+	var manifests [][]byte
+
+	searchFromDir := d.rootDir
+	// If the spec.RootDir is an absolute path, then it as already been set
+	// correctly in the New function.
+	if d.spec.RootDir != "" && !path.IsAbs(d.spec.RootDir) {
+		searchFromDir = filepath.Join(d.rootDir, d.spec.RootDir)
+	}
+
+	foundDockerfiles, err := searchDockerfiles(
+		searchFromDir,
+		d.filematch)
+
+	if err != nil {
+		return nil, err
+	}
+
+	for _, foundDockerfile := range foundDockerfiles {
+
+		log.Debugf("parsing file %q", foundDockerfile)
+		relativeFoundDockerfile, err := filepath.Rel(d.rootDir, foundDockerfile)
+		if err != nil {
+			// Let try the next one if it fails
+			log.Debugln(err)
+			continue
+		}
+
+		dirname := filepath.Dir(relativeFoundDockerfile)
+		basename := filepath.Base(relativeFoundDockerfile)
+
+		instructions, args, err := parseDockerfile(foundDockerfile)
+		if err != nil {
+			log.Debugln(err)
+			continue
+		}
+
+		if len(instructions) == 0 {
+			continue
+		}
+
+		globalIgnore := MatchingRules{scratchIgnore}
+
+		for _, instruction := range instructions {
+			manifest, err := d.generateManifest(globalIgnore, relativeFoundDockerfile, basename, dirname, instruction, args)
+			if err != nil {
+				log.Debugln(err)
+				continue
+			}
+			if manifest != nil {
+				manifests = append(manifests, manifest)
+			}
+
+		}
+	}
+
+	return manifests, nil
+}

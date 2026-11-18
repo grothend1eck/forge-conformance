@@ -1,0 +1,37 @@
+name: Skip targets with only one (failing) condition
+pipelineid: skip/target
+
+sources:
+  default:
+    name: Default Source (dummy)
+    kind: shell
+    spec:
+      command: echo DUMMY
+
+conditions:
+  condition1:
+    name: This conditions always succeed
+    sourceid: default
+    kind: shell
+    spec:
+      command: "true"
+  condition2:
+    name: This conditions always fail
+    sourceid: default
+    kind: shell
+    spec:
+      command: "false"
+  condition3:
+    name: This conditions always succeed
+    sourceid: default
+    kind: shell
+    spec:
+      command: "true"
+
+targets:
+  shouldNeverRun:
+    name: This target should never run
+    sourceid: default
+    kind: shell
+    spec:
+      command: echo SHOULD NOT RUN

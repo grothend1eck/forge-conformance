@@ -1,0 +1,24 @@
+name: "Maven autodiscovery using git scm"
+scms:
+  default:
+    kind: git 
+    spec:
+      url: "https://github.com/updatecli-test/sortpom.git"
+      branch: "master"
+    
+autodiscovery:
+  scmid: default
+  crawlers:
+    maven:
+      versionfilter:
+        kind: semver
+        pattern: majoronly
+      # To ignore specific path
+      #ignore:
+      #  - path: <filepath relative to scm repository>
+      only:
+        - artifactids:
+            "junit-bom": ""
+          groupid:
+            "org.junit": ""
+

@@ -1,0 +1,144 @@
+package github
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/shurcooL/githubv4"
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"github.com/updatecli/updatecli/pkg/plugins/scms/github/client"
+)
+
+// labelsQuery defines a github v4 API query to retrieve a list of labels defined for the repository with their name and descriptions
+/*
+https://developer.github.com/v4/explorer/
+
+query getLatestRelease{
+	rateLimit {
+		cost
+		remaining
+		resetAt
+	}
+	repository(owner: "updatecli", name: "updatecli"){
+		labels (last: 5) {
+			totalCount
+			pageInfo {
+				hasNextPage
+				endCursor
+			}
+			edges {
+				node {
+					id
+					name
+					description
+				}
+				cursor
+			}
+		}
+	}
+}
+*/
+type labelsQuery struct {
+	RateLimit  RateLimit
+	Repository struct {
+		Labels repositoryLabels `graphql:"labels(last: 5, before: $before)"`
+	} `graphql:"repository(owner: $owner, name: $repository)"`
+}
+type repositoryLabels struct {
+	TotalCount int
+	PageInfo   PageInfo
+	Edges      []labelEdge
+}
+type labelEdge struct {
+	Cursor string
+	Node   labelNode
+}
+type labelNode struct {
+	ID          string
+	Name        string
+	Description string
+}
+
+// repositoryLabelApi holds specific label information returned from GitHub API
+type repositoryLabelApi struct {
+	ID          string
+	Name        string
+	Description string
+}
+
+// getRepositoryLabels queries GitHub Api to retrieve every labels configured for a repository
+func (g *Github) getRepositoryLabels(ctx context.Context, retry int) ([]repositoryLabelApi, error) {
+	var repositoryLabels []repositoryLabelApi
+
+	variables := map[string]interface{}{
+		keyOwner:      githubv4.String(g.Spec.Owner),
+		keyRepository: githubv4.String(g.Spec.Repository),
+		keyBefore:     (*githubv4.String)(nil),
+	}
+
+	var query labelsQuery
+
+	for {
+		err := g.client.Query(ctx, &query, variables)
+
+		if err != nil {
+			if client.IsRateLimitError(err) {
+				rateLimit, err := queryRateLimit(g.client, ctx)
+				if err != nil {
+					log.Errorf("Error querying GitHub API rate limit: %s", err)
+				}
+
+				log.Debugln(rateLimit)
+				if retry < client.MaxRetry {
+					log.Warningf("GitHub API rate limit exceeded. Retrying... (%d/%d)", retry+1, client.MaxRetry)
+					rateLimit.Pause(ctx)
+					return g.getRepositoryLabels(ctx, retry+1)
+				}
+				return nil, errors.New(ErrAPIRateLimitExceededFinalAttempt)
+			}
+			return nil, fmt.Errorf("querying GitHub API: %w", err)
+		}
+
+		log.Debugln(query.RateLimit)
+
+		// Retrieve remote label information such as label ID, label name, labe description
+		for _, node := range query.Repository.Labels.Edges {
+			repositoryLabels = append(
+				repositoryLabels,
+				repositoryLabelApi{
+					ID:          node.Node.ID,
+					Name:        node.Node.Name,
+					Description: node.Node.Description,
+				})
+		}
+
+		if !query.Repository.Labels.PageInfo.HasPreviousPage {
+			break
+		}
+
+		variables[keyBefore] = githubv4.NewString(githubv4.String(query.Repository.Labels.PageInfo.StartCursor))
+	}
+
+	return repositoryLabels, nil
+}
+
+func mergeLabels(a, b []repositoryLabelApi) []repositoryLabelApi {
+
+	result := b
+
+	for i := 0; i < len(a); i++ {
+		found := false
+		for j := 0; j < len(b); j++ {
+			if a[i].Name == b[j].Name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			result = append(result, a[i])
+		}
+	}
+
+	return result
+}

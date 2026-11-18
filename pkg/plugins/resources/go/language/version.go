@@ -1,0 +1,80 @@
+package language
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httputil"
+	"regexp"
+	"sort"
+	"strings"
+
+	"github.com/updatecli/updatecli/pkg/core/log"
+)
+
+var (
+	newMinorVersion = regexp.MustCompile(`^(\d)*.(\d)*$`)
+)
+
+type Info struct {
+	Stable  bool
+	Version string
+}
+
+// versions fetch all stable Golang version
+func (l *Language) versions(ctx context.Context) (versions []string, err error) {
+
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://go.dev/dl/?mode=json&include=all", nil)
+	if err != nil {
+		log.Errorf("something went wrong while getting go version data %q\n", err)
+		return []string{}, err
+	}
+
+	res, err := l.webClient.Do(req)
+	if err != nil {
+		log.Errorf("something went wrong while getting go version data %q\n", err)
+		return []string{}, err
+	}
+
+	defer res.Body.Close()
+	if res.StatusCode >= 400 {
+		body, err := httputil.DumpResponse(res, false)
+		log.Errorf("something went wrong while getting golang version data %q\n", err)
+		log.Debugf("\n%v\n", string(body))
+	}
+
+	data, err := io.ReadAll(res.Body)
+	if err != nil {
+		log.Errorf("something went wrong while getting npm api data%q\n", err)
+		return []string{}, err
+	}
+
+	versionsInfo := []Info{}
+
+	err = json.Unmarshal(data, &versionsInfo)
+	if err != nil {
+		log.Errorf("error unmarshalling json: %q", err)
+		return []string{}, err
+	}
+
+	for _, v := range versionsInfo {
+		if v.Stable {
+			version := strings.TrimPrefix(v.Version, "go")
+			if newMinorVersion.MatchString(version) {
+				version = version + ".0"
+			}
+
+			versions = append(versions, version)
+		}
+	}
+
+	sort.Strings(versions)
+	l.Version, err = l.versionFilter.Search(versions)
+	if err != nil {
+		return nil, err
+	}
+
+	return versions, nil
+
+}

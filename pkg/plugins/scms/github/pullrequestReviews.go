@@ -1,0 +1,97 @@
+package github
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/shurcooL/githubv4"
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"github.com/updatecli/updatecli/pkg/plugins/scms/github/client"
+)
+
+// addPullrequestReviewers adds reviewers to a pull request
+func (p *PullRequest) addPullrequestReviewers(ctx context.Context, prID string, retry int) error {
+
+	rateLimit, err := queryRateLimit(p.gh.client, ctx)
+	if err != nil {
+		if client.IsRateLimitError(err) {
+			log.Debugln(rateLimit)
+			if retry < client.MaxRetry {
+				log.Warningf("GitHub API rate limit exceeded. Retrying... (%d/%d)", retry+1, client.MaxRetry)
+				rateLimit.Pause(ctx)
+				return p.addPullrequestReviewers(ctx, prID, retry+1)
+			}
+			return errors.New(ErrAPIRateLimitExceededFinalAttempt)
+		}
+		return fmt.Errorf("unable to query GitHub API rate limit: %w", err)
+	}
+	log.Debugln(rateLimit)
+
+	if len(p.spec.Reviewers) == 0 {
+		return nil
+	}
+
+	var mutation struct {
+		RequestReviews struct {
+			PullRequest struct {
+				ID string
+			}
+		} `graphql:"requestReviews(input: $input)"`
+	}
+
+	input := githubv4.RequestReviewsInput{
+		PullRequestID: githubv4.ID(prID),
+		Union:         githubv4.NewBoolean(true), // Keep existing reviewers
+	}
+
+	var userIDs []githubv4.ID
+	var teamIDs []githubv4.ID
+
+	for _, reviewer := range p.spec.Reviewers {
+		a := strings.Split(reviewer, "/")
+
+		switch len(a) {
+		case 2:
+			teamID, err := getTeamID(ctx, p.gh.client, a[0], a[1], 0)
+			log.Debugf("Team ID: %q found for %q", teamID, reviewer)
+			if err != nil {
+				log.Warningf("Failed to get team id for %s/%s: %v", a[0], a[1], err)
+			} else {
+				teamIDs = append(teamIDs, githubv4.NewID(teamID))
+			}
+		case 1:
+			user, err := getUserInfo(ctx, p.gh.client, a[0], 0)
+			log.Debugf("User ID: %q found for %q", user.ID, reviewer)
+			if err != nil {
+				log.Warningf("Failed to get user id for %s/%s: %v", a[0], a[1], err)
+			} else {
+				userIDs = append(userIDs, githubv4.NewID(user.ID))
+			}
+		case 0:
+			// Ignore empty reviewer
+		default:
+			log.Warningf("Invalid reviewer format: %s", reviewer)
+		}
+	}
+
+	if len(userIDs) > 0 {
+		input.UserIDs = &userIDs
+	}
+
+	if len(teamIDs) > 0 {
+		input.TeamIDs = &teamIDs
+	}
+
+	if len(userIDs) == 0 && len(teamIDs) == 0 {
+		return fmt.Errorf("no valid reviewers found among %v", p.spec.Reviewers)
+	}
+
+	err = p.gh.client.Mutate(ctx, &mutation, input, nil)
+	if err != nil {
+		return fmt.Errorf("adding pullrequest reviewers: %w", err)
+	}
+
+	return nil
+}

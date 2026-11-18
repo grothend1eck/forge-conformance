@@ -1,0 +1,82 @@
+package pipeline
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"github.com/updatecli/updatecli/pkg/core/pipeline/resource"
+	"github.com/updatecli/updatecli/pkg/core/result"
+)
+
+var (
+	// ErrRunTargets is return when at least one error happened during targets execution
+	ErrRunTargets error = errors.New("something went wrong during pipeline execution")
+)
+
+func (p *Pipeline) updateTarget(id, result string) {
+	target := p.Targets[id]
+	target.Result.Result = result
+	p.Targets[id] = target
+}
+
+// RunTarget run a target by id
+func (p *Pipeline) RunTarget(ctx context.Context, id string, sourceIds []string) (r string, changed bool, err error) {
+	target := p.Targets[id]
+	target.Config = p.Config.Spec.Targets[id]
+	// Ensure the result named contains the up to date target name after templating
+	target.Result.Name = target.Config.Name
+	target.Result.DryRun = target.DryRun
+
+	err = target.Run(ctx, p.Sources[target.Config.SourceID].Output, &p.Options.Target)
+	if err != nil {
+		p.Report.Result = result.FAILURE
+		target.Result.Result = result.FAILURE
+		err = fmt.Errorf("%s", err)
+	}
+
+	if !p.Options.DisableChangelog {
+		changelogSourceID := target.Config.SourceID
+		if changelogSourceID == "" {
+			switch len(sourceIds) {
+			case 1:
+				changelogSourceID = sourceIds[0]
+			case 0:
+			// If we have more than one sourceID then we can't define in a reliable way which one to use
+			// as the order of the sourceIDs is not guaranteed.
+			default:
+				log.Debugf("Target depends on a too many sources that we can't determine which one to use for the changelog")
+			}
+		}
+
+		if changelogSourceID != "" {
+			// Once the source is executed, then it can retrieve its changelog
+			// Any error means an empty changelog
+			if source, found := p.Sources[changelogSourceID]; found {
+				c, err := resource.New(source.Config.ResourceConfig)
+
+				if err == nil {
+
+					changelogs := c.Changelog(target.Result.Information, source.OriginalOutput)
+
+					if changelogs != nil {
+						target.Result.Changelogs = *changelogs
+
+						if log.IsDebug() {
+							log.Subheading("Changelog")
+							log.Debugf("%s", changelogs.String())
+						}
+
+					} else {
+						log.Debugln("no changelog detected")
+					}
+				}
+			}
+		}
+	}
+
+	p.Targets[id] = target
+
+	return target.Result.Result, target.Result.Changed, err
+}

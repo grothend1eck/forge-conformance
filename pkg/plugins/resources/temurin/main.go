@@ -1,0 +1,153 @@
+package temurin
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"slices"
+	"strings"
+
+	"github.com/go-viper/mapstructure/v2"
+	"github.com/updatecli/updatecli/pkg/core/httpclient"
+	"github.com/updatecli/updatecli/pkg/core/result"
+)
+
+const temurinApiUrl string = "https://api.adoptium.net/v3"
+
+// Http defines a resource of type "temurin"
+type Temurin struct {
+	spec                    Spec
+	apiWebClient            httpclient.HTTPClient
+	apiWebRedirectionClient httpclient.HTTPClient
+	foundVersion            string
+	// apiURL overrides the default temurinApiUrl. Used in tests to point at a mock server.
+	apiURL string
+}
+
+/*
+*
+New returns a reference to a newly initialized Temurin resource
+or an error if the provided Spec triggers a validation error.
+*
+*/
+func New(spec interface{}) (*Temurin, error) {
+	newSpec := Spec{}
+	err := mapstructure.Decode(spec, &newSpec)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(newSpec.Platforms) > 0 {
+		if newSpec.Architecture != "" {
+			return nil, fmt.Errorf("[temurin] `spec.platform` and `spec.architecture` are mutually exclusive")
+		}
+		if newSpec.OperatingSystem != "" {
+			return nil, fmt.Errorf("[temurin] `spec.platform` and `spec.operatingsystem` are mutually exclusive")
+		}
+	}
+
+	// Set defaults
+	if newSpec.Result == "" {
+		newSpec.Result = "version"
+	}
+	if newSpec.Architecture == "" {
+		newSpec.Architecture = "x64"
+	}
+	if newSpec.Project == "" {
+		newSpec.Project = "jdk"
+	}
+	if newSpec.OperatingSystem == "" {
+		newSpec.OperatingSystem = "linux"
+	}
+	if newSpec.ImageType == "" {
+		newSpec.ImageType = "jdk"
+	}
+	if newSpec.ReleaseType == "" {
+		newSpec.ReleaseType = "ga"
+	}
+	if newSpec.SpecificVersion != "" && newSpec.FeatureVersion != 0 {
+		return nil, fmt.Errorf("[temurin] resource with both 'specificversion' and 'featureversion' specified which are mutually exclusive")
+	}
+
+	noRedirectClient := httpclient.NewRetryClient()
+	noRedirectClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+
+	newResource := &Temurin{
+		spec:                    newSpec,
+		apiWebClient:            httpclient.NewRetryClient(),
+		apiWebRedirectionClient: noRedirectClient,
+	}
+
+	/** Validations **/
+	// context.Background() is appropriate here: New() is a constructor with no caller context.
+	architectures, err := newResource.apiGetArchitectures(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	if !slices.Contains(architectures, newResource.spec.Architecture) {
+		return nil, fmt.Errorf("[temurin] Specified architecture %q is not a valid Temurin architecture (check https://api.adoptium.net/q/swagger-ui/#/Types for valid list)", newResource.spec.Architecture)
+	}
+
+	operatingSystems, err := newResource.apiGetOperatingSystems(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	if !slices.Contains(operatingSystems, newResource.spec.OperatingSystem) {
+		return nil, fmt.Errorf("[temurin] Specified operating system %q is not a valid Temurin architecture (check https://api.adoptium.net/q/swagger-ui/#/Types for valid list)", newResource.spec.OperatingSystem)
+	}
+
+	if newSpec.ReleaseType != "ea" && newSpec.ReleaseType != "ga" {
+		return nil, fmt.Errorf("[temurin] Specified release type %q is invalid: Temurin only accepts 'ga' (stable builds) or 'ea' (nightly builds)", newResource.spec.ReleaseType)
+	}
+
+	for _, platform := range newSpec.Platforms {
+		splitPlatform := strings.Split(platform, "/")
+		if len(splitPlatform) > 2 {
+			return nil, fmt.Errorf("[temurin] Specified platform %q is not a valid Temurin platform: too much items specified", platform)
+		}
+		if len(splitPlatform) < 2 {
+			return nil, fmt.Errorf("[temurin] Specified platform %q is not a valid Temurin platform: it misses a CPU architecture", platform)
+		}
+		if !slices.Contains(operatingSystems, splitPlatform[0]) {
+			return nil, fmt.Errorf("[temurin] Specified platform %q is not a valid Temurin platform: %q is not a valid Operating System (check https://api.adoptium.net/q/swagger-ui/#/Types for valid list)", platform, splitPlatform[0])
+		}
+		if !slices.Contains(architectures, splitPlatform[1]) {
+			return nil, fmt.Errorf("[temurin] Specified platform %q is not a valid Temurin platform: %q is not a valid Architecture (check https://api.adoptium.net/q/swagger-ui/#/Types for valid list)", platform, splitPlatform[1])
+		}
+
+	}
+
+	/** End of validations **/
+
+	return newResource, nil
+}
+
+// Changelog returns the changelog for this resource, or an empty string if not supported
+func (t *Temurin) Changelog(from, to string) *result.Changelogs {
+	return &result.Changelogs{
+		{
+			Title: t.foundVersion,
+			Body:  fmt.Sprintf("https://adoptium.net/temurin/release-notes/?version=%s\n", t.foundVersion),
+			URL:   fmt.Sprintf("https://adoptium.net/temurin/release-notes/?version=%s", t.foundVersion),
+		},
+	}
+}
+
+// ReportConfig returns a new configuration object with only the necessary fields
+// to identify the resource without any sensitive information or context specific data.
+func (t *Temurin) ReportConfig() interface{} {
+	return Spec{
+		Project:         t.spec.Project,
+		ReleaseType:     t.spec.ReleaseType,
+		ImageType:       t.spec.ImageType,
+		FeatureVersion:  t.spec.FeatureVersion,
+		SpecificVersion: t.spec.SpecificVersion,
+		ReleaseLine:     t.spec.ReleaseLine,
+		Architecture:    t.spec.Architecture,
+		OperatingSystem: t.spec.OperatingSystem,
+		Platforms:       t.spec.Platforms,
+		Result:          t.spec.Result,
+	}
+}

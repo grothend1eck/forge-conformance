@@ -1,0 +1,275 @@
+package tag
+
+import (
+	"context"
+	"fmt"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/go-viper/mapstructure/v2"
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"github.com/updatecli/updatecli/pkg/plugins/resources/gitlab/client"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/age"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/version"
+	gitlab "gitlab.com/gitlab-org/api/client-go"
+)
+
+/*
+"gitlab/tag" defines the specification for retrieving tags from a GitLab repository.
+It can be used as a "source" or a "condition".
+*/
+type Spec struct {
+	client.Spec `yaml:",inline,omitempty"`
+	// "owner" defines the owner of the GitLab repository.
+	//
+	// compatible:
+	//   * source
+	//   * condition
+	//
+	// example:
+	//   * owner: updatecli
+	//
+	Owner string `yaml:",omitempty" jsonschema:"required"`
+	// "repository" defines the name of the GitLab repository, for a specific owner.
+	//
+	// compatible:
+	//   * source
+	//   * condition
+	//
+	// example:
+	//   * repository: updatecli
+	//
+	Repository string `yaml:",omitempty" jsonschema:"required"`
+	// "versionfilter" defines the version pattern and kind used to select the tag, such as regex, semver or latest.
+	//
+	// compatible:
+	//   * source
+	//
+	// default:
+	//   kind: latest
+	//
+	VersionFilter version.Filter `yaml:",omitempty"`
+	// "age" defines the minimum or maximum age of a tag to be considered valid.
+	//
+	// compatible:
+	//   * source
+	//
+	// remark:
+	//   * it accepts a duration string such as "24h", "7d", "3w" or "1y".
+	//   * the age of a tag is its creation date, which GitLab reports as the tagger date
+	//     of an annotated tag and as the commit date of a lightweight one.
+	//   * when no tag matches the age filter yet, the source is skipped instead of failing.
+	//
+	Age age.Spec `yaml:",omitempty"`
+	// "tag" defines the name of the tag to look for.
+	//
+	// compatible:
+	//   * condition
+	//
+	// default:
+	//   the output of the associated source.
+	//
+	// example:
+	//   * tag: v1.0.0
+	//
+	Tag string `yaml:",omitempty"`
+}
+
+// Gitlab contains information to interact with GitLab api
+type Gitlab struct {
+	// spec contains inputs coming from updatecli configuration
+	spec Spec
+	// client handle the api authentication
+	client        client.Client
+	foundVersion  version.Version
+	versionFilter version.Filter
+}
+
+// New returns a new valid GitLab object.
+func New(spec interface{}) (*Gitlab, error) {
+	var s Spec
+	var clientSpec client.Spec
+
+	// mapstructure.Decode cannot handle embedded fields
+	// hence we decode it in two steps
+	err := mapstructure.Decode(spec, &clientSpec)
+	if err != nil {
+		return &Gitlab{}, err
+	}
+
+	err = mapstructure.Decode(spec, &s)
+	if err != nil {
+		return &Gitlab{}, nil
+	}
+
+	s.Spec = clientSpec
+	err = s.Validate()
+
+	if err != nil {
+		return &Gitlab{}, err
+	}
+
+	c, err := client.New(clientSpec)
+
+	if err != nil {
+		return &Gitlab{}, err
+	}
+
+	newFilter, err := s.VersionFilter.Init()
+	if err != nil {
+		return &Gitlab{}, err
+	}
+	s.VersionFilter = newFilter
+
+	g := Gitlab{
+		spec:          s,
+		client:        c,
+		versionFilter: newFilter,
+	}
+
+	return &g, nil
+
+}
+
+// SearchTags retrieves the tags of a remote GitLab repository, keeping only the ones
+// created inside the provided age window. The returned tags are ordered from the
+// oldest to the most recent one, as expected by the version filters.
+func (g *Gitlab) SearchTags(tagAge age.Spec) (tags []string, err error) {
+
+	// Timeout api query after 30sec
+	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	// GitLab paginates from page 1, so starting anywhere else fetches the first page twice.
+	page := int64(1)
+	// Tracks whether the repository holds tags at all, so that a running cooldown
+	// isn't reported as a repository without any tag.
+	foundTag := false
+
+	// Query gitlab api until we visit all pages
+	for {
+
+		opt := &gitlab.ListTagsOptions{ListOptions: gitlab.ListOptions{Page: page, PerPage: 100}}
+
+		references, resp, err := g.client.Tags.ListTags(
+			g.getPID(),
+			opt,
+			gitlab.WithContext(ctx),
+		)
+
+		if err != nil {
+			return nil, err
+		}
+
+		if resp.StatusCode > 400 {
+			log.Debugf("RC: %q\nBody:\n%s", resp.Status, resp.Body)
+		}
+
+		for _, ref := range references {
+			foundTag = true
+
+			if !tagAge.IsZero() {
+				date, ok := tagDate(ref)
+				if !ok {
+					log.Debugf("ignoring tag %q, which carries no date, as the age filter cannot be applied to it", ref.Name)
+					continue
+				}
+				if !tagAge.Matches(date) {
+					log.Debugf("ignoring tag %q, dated %s, as outside of the age window", ref.Name, date)
+					continue
+				}
+			}
+
+			tags = append(tags, ref.Name)
+		}
+
+		// GitLab reports no next page once the last one has been visited.
+		if resp.NextPage == 0 {
+			break
+		}
+		page = resp.NextPage
+	}
+
+	/*
+		The repository does hold tags but the age filter discarded every one of them,
+		which means the tag we would have returned is still cooling down. That's not a
+		lookup failure, so the sentinel lets the caller skip rather than fail.
+	*/
+	if !tagAge.IsZero() && foundTag && len(tags) == 0 {
+		return nil, fmt.Errorf("%w for the GitLab tags of %s", age.ErrNoVersionMatchingAge, g.getPID())
+	}
+
+	// GitLab returns the most recently updated tag first, while the version filters
+	// expect the oldest one first, such as when they pick the last element for the
+	// "latest" kind.
+	slices.Reverse(tags)
+
+	return tags, nil
+}
+
+// tagDate returns the date at which a tag was created, and whether GitLab reported one.
+// The creation date is absent from older GitLab versions, so the committer date of the
+// commit the tag points at is used as a fallback.
+func tagDate(t *gitlab.Tag) (time.Time, bool) {
+	if t.CreatedAt != nil && !t.CreatedAt.IsZero() {
+		return *t.CreatedAt, true
+	}
+	if t.Commit != nil && t.Commit.CommittedDate != nil && !t.Commit.CommittedDate.IsZero() {
+		return *t.Commit.CommittedDate, true
+	}
+	return time.Time{}, false
+}
+
+func (s Spec) Validate() error {
+	gotError := false
+	missingParameters := []string{}
+
+	if len(s.Owner) == 0 {
+		gotError = true
+		missingParameters = append(missingParameters, "owner")
+	}
+
+	if len(s.Repository) == 0 {
+		gotError = true
+		missingParameters = append(missingParameters, "repository")
+	}
+
+	if err := s.Age.Validate(); err != nil {
+		gotError = true
+		log.Errorln(err)
+	}
+
+	if len(missingParameters) > 0 {
+		log.Errorf("missing parameter(s) [%s]", strings.Join(missingParameters, ","))
+	}
+
+	if gotError {
+		return fmt.Errorf("wrong GitLab configuration")
+	}
+
+	return nil
+}
+
+// ReportConfig returns a new configuration with only the necessary fields
+// to identify the resource without any sensitive information
+// and context specific data.
+func (g *Gitlab) ReportConfig() interface{} {
+	return Spec{
+		Owner:      g.spec.Owner,
+		Repository: g.spec.Repository,
+		Spec: client.Spec{
+			URL: g.spec.URL,
+		},
+		VersionFilter: g.spec.VersionFilter,
+		Age:           g.spec.Age,
+		Tag:           g.spec.Tag,
+	}
+}
+
+func (g *Gitlab) getPID() string {
+	return strings.Join([]string{
+		g.spec.Owner,
+		g.spec.Repository}, "/")
+}

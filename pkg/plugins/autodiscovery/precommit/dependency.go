@@ -1,0 +1,161 @@
+package precommit
+
+import (
+	"bytes"
+	"fmt"
+	"path"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"text/template"
+
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"github.com/updatecli/updatecli/pkg/plugins/resources/yaml"
+)
+
+var commentVersionRegex = regexp.MustCompile(`^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$`)
+
+func extractVersionFromComment(comment string) string {
+	for _, token := range strings.Fields(comment) {
+		candidate := strings.Trim(token, ",;:()[]{}")
+		if commentVersionRegex.MatchString(candidate) {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func (p Precommit) discoverDependencyManifests() ([][]byte, error) {
+
+	var manifests [][]byte
+
+	searchFromDir := p.rootDir
+	// If the spec.RootDir is an absolute path, then it as already been set
+	// correctly in the New function.
+	if p.spec.RootDir != "" && !path.IsAbs(p.spec.RootDir) {
+		searchFromDir = filepath.Join(p.rootDir, p.spec.RootDir)
+	}
+
+	foundFiles, err := searchPrecommitConfigFiles(searchFromDir)
+
+	if err != nil {
+		return nil, err
+	}
+
+	for _, foundFile := range foundFiles {
+
+		log.Debugf("parsing file %q", foundFile)
+
+		relativeFoundFile, err := filepath.Rel(p.rootDir, foundFile)
+		if err != nil {
+			// Let's try the next pom.xml if one fail
+			log.Debugln(err)
+			continue
+		}
+
+		data, err := loadPrecommitData(foundFile)
+
+		if err != nil {
+			log.Debugln(err)
+			continue
+		}
+		if len(data.Repos) == 0 {
+			log.Errorf("no precommit hook repo found in %q\n", foundFile)
+			continue
+		}
+
+		for _, repo := range data.Repos {
+
+			if len(p.spec.Ignore) > 0 {
+				if p.spec.Ignore.isMatchingRules(p.rootDir, relativeFoundFile, repo.Repo, repo.Rev) {
+					log.Debugf("Ignoring Hook Repo %q from %q, as matching ignore rule(s)\n", repo.Repo, relativeFoundFile)
+					continue
+				}
+			}
+
+			if len(p.spec.Only) > 0 {
+				if !p.spec.Only.isMatchingRules(p.rootDir, relativeFoundFile, repo.Repo, repo.Rev) {
+					log.Debugf("Ignoring NPM package %q from %q, as not matching only rule(s)\n", repo.Repo, relativeFoundFile)
+					continue
+				}
+			}
+
+			versionPattern, err := p.versionFilter.GreaterThanPattern(repo.Rev)
+			versionRegex := p.versionFilter.Regex
+			if err != nil {
+				commentVersion := extractVersionFromComment(repo.RevComment)
+				if commentVersion == "" {
+					log.Debugf("skipping file %q due to: %s", relativeFoundFile, err)
+					continue
+				}
+
+				log.Debugf("using version %q detected from rev comment in %q", commentVersion, relativeFoundFile)
+				versionPattern, err = p.versionFilter.GreaterThanPattern(commentVersion)
+				if err != nil {
+					log.Debugf("skipping file %q due to: %s", relativeFoundFile, err)
+					continue
+				}
+			}
+
+			tmpl, err := template.New("manifest").Parse(manifestTemplate)
+			if err != nil {
+				log.Debugln(err)
+				continue
+			}
+
+			targetSource := gittagIdentifier
+			if p.digest {
+				targetSource = fmt.Sprintf("%s_digest", targetSource)
+			}
+			params := struct {
+				ActionID                   string
+				ManifestName               string
+				SourceScmId                string
+				SourceScmUrl               string
+				SourceID                   string
+				SourceName                 string
+				SourceKind                 string
+				SourceVersionFilterKind    string
+				SourceVersionFilterPattern string
+				SourceVersionFilterRegex   string
+				TargetID                   string
+				TargetName                 string
+				TargetEngine               string
+				TargetKey                  string
+				File                       string
+				ScmID                      string
+				Digest                     bool
+			}{
+				ActionID:                   p.actionID,
+				ManifestName:               fmt.Sprintf("Bump %q repo version", repo.Repo),
+				SourceScmId:                repo.Repo,
+				SourceScmUrl:               repo.Repo,
+				SourceName:                 fmt.Sprintf("Get %q repo version", repo.Repo),
+				SourceID:                   gittagIdentifier,
+				SourceKind:                 gittagIdentifier,
+				SourceVersionFilterKind:    p.versionFilter.Kind,
+				SourceVersionFilterPattern: versionPattern,
+				SourceVersionFilterRegex:   versionRegex,
+				TargetID:                   ".pre-commit-config.yaml",
+				TargetName:                 fmt.Sprintf("deps(precommit): bump %q repo version to {{ source %q }}", repo.Repo, targetSource),
+				TargetKey:                  fmt.Sprintf("$.repos[?(@.repo == '%s')].rev", repo.Repo),
+				TargetEngine:               yaml.EngineYamlPath,
+				File:                       relativeFoundFile,
+				ScmID:                      p.scmID,
+				Digest:                     p.digest,
+			}
+
+			manifest := bytes.Buffer{}
+			if err := tmpl.Execute(&manifest, params); err != nil {
+				log.Errorln(err)
+				continue
+			}
+
+			manifests = append(manifests, manifest.Bytes())
+		}
+	}
+
+	log.Printf("%v manifests identified", len(manifests))
+
+	return manifests, nil
+}

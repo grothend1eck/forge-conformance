@@ -1,0 +1,55 @@
+package udash
+
+import (
+	"fmt"
+	"os"
+)
+
+// APIURLSelector selects which stored credential to use when several Udash
+// instances are configured. It holds the API URL of the wanted instance and is
+// set from the --udash-api-url flag.
+var APIURLSelector string
+
+// getConfigFromFile return the Udash configuration from the configuration file
+func getConfigFromFile(apiURL string) (URL string, ApiURL string, Token string, err error) {
+	if APIURLSelector != "" {
+		apiURL = APIURLSelector
+	}
+
+	data, err := readConfigFile()
+	if err != nil {
+		return "", "", "", err
+	}
+
+	switch apiURL {
+	case "":
+		authdata, ok := data.Auths[data.Default]
+		if ok {
+			return authdata.URL, authdata.API, authdata.Token, nil
+		}
+		return "", "", "", fmt.Errorf("no default token found")
+	default:
+		authdata, ok := data.Auths[sanitizeTokenID(apiURL)]
+		if ok {
+			return authdata.URL, authdata.API, authdata.Token, nil
+		}
+	}
+
+	return "", "", "", fmt.Errorf("token for domain %q not found", apiURL)
+}
+
+// getConfigFromEnv return the Udash configuration from environment variables
+func getConfigFromEnv() (URL string, ApiURL string, Token string) {
+	return os.Getenv(DefaultEnvVariableURL), os.Getenv(DefaultEnvVariableAPIURL), os.Getenv(DefaultEnvVariableAccessToken)
+}
+
+// IsConfigured reports whether a Udash endpoint is configured, either through
+// environment variables or through `updatecli udash login`.
+func IsConfigured() bool {
+	if _, apiURL, _ := getConfigFromEnv(); apiURL != "" {
+		return true
+	}
+
+	_, apiURL, _, err := getConfigFromFile("")
+	return err == nil && apiURL != ""
+}

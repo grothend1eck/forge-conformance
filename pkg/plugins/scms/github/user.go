@@ -1,0 +1,58 @@
+package github
+
+import (
+	"context"
+	"errors"
+
+	"github.com/shurcooL/githubv4"
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"github.com/updatecli/updatecli/pkg/plugins/scms/github/client"
+)
+
+// userQuery defines a github v4 API query to retrieve a user information
+type userQuery struct {
+	RateLimit RateLimit
+	User      userInfo `graphql:"user(login: $login)"`
+}
+
+// userInfo defines a user information returned from GitHub API
+type userInfo struct {
+	ID   string
+	Name string
+}
+
+// getUserInfo return a user information from GitHub API
+func getUserInfo(ctx context.Context, c client.Client, login string, retry int) (*userInfo, error) {
+
+	variables := map[string]interface{}{
+		"login": githubv4.String(login),
+	}
+
+	var query userQuery
+
+	err := c.Query(ctx, &query, variables)
+
+	if err != nil {
+		if client.IsRateLimitError(err) {
+			// If the query failed because we reached the rate limit,
+			// then we need to re-requery the rate limit to get the latest information
+			rateLimit, err := queryRateLimit(c, ctx)
+			if err != nil {
+				log.Errorf("Error querying GitHub API rate limit: %s", err)
+			}
+
+			log.Debugln(rateLimit)
+			if retry < client.MaxRetry {
+				log.Warningf("GitHub API rate limit exceeded. Retrying... (%d/%d)", retry+1, client.MaxRetry)
+				rateLimit.Pause(ctx)
+				return getUserInfo(ctx, c, login, retry+1)
+			}
+			return nil, errors.New(ErrAPIRateLimitExceededFinalAttempt)
+		}
+		return nil, err
+	}
+
+	log.Debugln(query.RateLimit)
+
+	return &query.User, nil
+}

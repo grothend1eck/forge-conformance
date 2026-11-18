@@ -1,0 +1,1460 @@
+package gitgeneric
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"github.com/updatecli/updatecli/pkg/plugins/scms/git/sign"
+
+	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/config"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/object"
+	transportHttp "github.com/go-git/go-git/v5/plumbing/transport/http"
+)
+
+const (
+	// DefaultGitCommitEmailAddress is the default git commit email address
+	DefaultGitCommitEmailAddress = "updatecli-bot@updatecli.io"
+	// DefaultGitCommitUserName is the default git commit user name
+	DefaultGitCommitUserName   = "updatecli-bot"
+	DefaultRemoteReferenceName = "origin"
+	// ErrNoBranchFound is the error message when no branch is found
+	ErrNoBranchFound = "no branch found"
+	// ErrNoGitTagFound is the error message when no tag is found
+	ErrNoGitTagFound = "no tag found"
+)
+
+var (
+	// pulledBranches holds the "<repository path>\x00<branch>" keys Checkout already pulled.
+	pulledBranches sync.Map
+	// fetchedBaseBranches holds the "<repository path>\x00<branch>" keys of the base branches
+	// Checkout already fetched, or tried to, during this execution.
+	fetchedBaseBranches sync.Map
+)
+
+type GitHandler interface {
+	Add(files []string, workingDir string) error
+	Checkout(username, password, branch, remoteBranch, workingDir string, forceReset bool, depth *int) error
+	Clone(username, password, URL, workingDir string, withSubmodules *bool, depth *int, branch string, singleBranch bool) error
+	Commit(user, email, message, workingDir string, signingKey string, passphrase string) error
+	DeleteBranch(branch, gitRepositoryPath, username, password string) error
+	GetChangedFiles(workingDir string) ([]string, error)
+	GetLatestCommitHash(workingDir string) (string, error)
+	IsSimilarBranch(a, b, workingDir string) (bool, error)
+	IsLocalBranchSyncedWithRemote(baseBranch, workingBranch, username, password, workingDir string) (bool, error)
+	IsRemoteBranchExist(branch, username, password, workingDir string) (bool, error)
+	NewTag(tag, message, workingDir string) (bool, error)
+	NewBranch(branch, workingDir string) (bool, error)
+	Pull(username, password, gitRepositoryPath, branch string, singleBranch, forceReset bool, depth *int) error
+	Push(username string, password string, workingDir string, force bool) (bool, error)
+	PushTag(tag string, username string, password string, workingDir string, force bool) error
+	PushBranch(branch string, username string, password string, workingDir string, force bool) error
+	RemoteURLs(workingDir string) (map[string]string, error)
+	SanitizeBranchName(branch string) string
+	SquashCommit(repoDir, baseBranch, featureBranch string, options SquashCommitOptions) error
+	Tags(workingDir string) (tags []string, err error)
+	TagHashes(workingDir string) (hashes []string, err error)
+	TagRefs(workingDir string) (refs []DatedTag, err error)
+	Branches(workingDir string) (branches []string, err error)
+	BranchRefs(workingDir string) (branches []DatedBranch, err error)
+	IsForceReset() bool
+}
+
+type GoGit struct {
+	// ForceReset is set to true if the branch has been reset to the latest commit of the based branch.
+	ForceReset bool
+}
+
+/*
+IsLocalBranchPublished checks if the local working branch, contains any changes which should be published.
+
+  - `git diff` is not yet supported by the go-git library.
+    https://github.com/go-git/go-git/issues/36
+
+We retrieve:
+  - the latest commit from the local working branch
+  - the latest commit from the base branch
+  - the latest commit from the remote working branch if it exists.
+
+Based on those three information we decide if local changes should be published.
+
+If local working branch == local base branch and no remote working branch
+=> This means that base branch and working are similar so nothing need to be pushed
+
+If local working branch == local base branch != remote working branch
+=> This means that at some point the remote branch diverge from base branch
+
+If local working branch == local base branch == remote working branch
+=> This means that everything is up to date
+
+If the remote working branch doesn't exist then it means that local changes are not published.
+
+returns true if both the remote and local reference are similar.
+*/
+func (g GoGit) IsLocalBranchSyncedWithRemote(baseBranch, workingBranch, username, password, workingDir string) (bool, error) {
+	log.Debugln("Checking if local changes have been done that should be published")
+
+	auth := transportHttp.BasicAuth{
+		Username: username, // anything excepted an empty string
+		Password: password,
+	}
+
+	// No need to check with the remote branch if the local one
+	// doesn't exist
+	baseBranchFound, err := isLocalBranchExist(baseBranch, workingDir)
+	if err != nil {
+		return false, fmt.Errorf("is base branch exist? %w", err)
+	}
+
+	if !baseBranchFound {
+		return true, nil
+	}
+
+	workingBranchFound, err := isLocalBranchExist(workingBranch, workingDir)
+	if err != nil {
+		log.Errorln(err)
+		return false, fmt.Errorf("is working branch exist? %w", err)
+	}
+
+	if !workingBranchFound {
+		return true, nil
+	}
+
+	gitRepository, err := git.PlainOpen(workingDir)
+	if err != nil {
+		return false, fmt.Errorf("opening %q git directory: %s", workingDir, err)
+	}
+
+	matching, err := g.IsSimilarBranch(baseBranch, workingBranch, workingDir)
+	if err != nil {
+		return false, fmt.Errorf("checking if branch %q and %q are similar - %s", baseBranch, workingBranch, err)
+	}
+
+	workingBranchReferenceName := workingBranch
+
+	rem, err := gitRepository.Remote(DefaultRemoteReferenceName)
+	if err != nil {
+
+		// If the remote doesn't exist, then nothing has been published yet
+		if err == git.ErrRemoteNotFound {
+			return false, nil
+		}
+
+		return false, fmt.Errorf("remote %q - %s", DefaultRemoteReferenceName, err)
+	}
+
+	listOptions := git.ListOptions{}
+
+	if !isAuthEmpty(&auth) {
+		listOptions.Auth = &auth
+	}
+
+	remoteRefs, err := rem.List(&listOptions)
+	if err != nil {
+		return false, fmt.Errorf("listing remote %q - %s", DefaultRemoteReferenceName, err)
+	}
+
+	var workingBranchRef *plumbing.Reference
+	var remoteRef *plumbing.Reference
+
+	workingBranchRef, err = gitRepository.Reference(plumbing.NewBranchReferenceName(workingBranchReferenceName), true)
+	if err != nil {
+		// if the workingBranchRef doesn't exist remotely, then nothing has been published yet
+		if err == plumbing.ErrReferenceNotFound {
+			return false, nil
+		}
+		return false, fmt.Errorf("reference %q - %s", workingBranchReferenceName, err)
+	}
+
+	// Looking for remote branch hash
+	for id := range remoteRefs {
+		if remoteRefs[id].Name().IsBranch() {
+			// We are looking for the remote branch matching the local one
+			if remoteRefs[id].Name().Short() != workingBranchReferenceName {
+				continue
+			}
+
+			remoteRef = remoteRefs[id]
+
+			// Local branch matches the remote one which means that local one is already
+			// up to date. Nothing else to do
+			if remoteRef.Hash().String() == workingBranchRef.Hash().String() {
+				return true, nil
+			}
+			break
+		}
+	}
+
+	if remoteRef == nil && matching {
+		/*
+			if there is no remote branch, and the local working
+			branch equal the base branch then it means that nothing changed
+		*/
+		return true, nil
+	}
+
+	/*
+		There is no way to git log between two branches at the moment using go-git
+		https://github.com/go-git/go-git/issues/69
+	*/
+
+	return false, nil
+}
+
+// IsRemoteBranchExist checks if a remote branch exists.
+func (g GoGit) IsRemoteBranchExist(branch, username, password, workingDir string) (bool, error) {
+	log.Debugf("Checking if remote branch %q exists", branch)
+
+	auth := transportHttp.BasicAuth{
+		Username: username, // anything except an empty string
+		Password: password,
+	}
+
+	gitRepository, err := git.PlainOpen(workingDir)
+	if err != nil {
+		return false, fmt.Errorf("opening %q git directory: %s", workingDir, err)
+	}
+
+	rem, err := gitRepository.Remote(DefaultRemoteReferenceName)
+	if err != nil {
+		// If the remote doesn't exist, then nothing has been published yet
+		if err == git.ErrRemoteNotFound {
+			return false, nil
+		}
+
+		return false, fmt.Errorf("remote %q - %s", DefaultRemoteReferenceName, err)
+	}
+
+	listOptions := git.ListOptions{}
+
+	if !isAuthEmpty(&auth) {
+		listOptions.Auth = &auth
+	}
+
+	remoteRefs, err := rem.List(&listOptions)
+	if err != nil {
+		return false, fmt.Errorf("listing remote %q - %s", DefaultRemoteReferenceName, err)
+	}
+
+	// Looking for remote branch hash
+	for id := range remoteRefs {
+		if remoteRefs[id].Name().IsBranch() {
+			// We are looking for the remote branch matching the local one
+			if remoteRefs[id].Name().Short() == branch {
+				return true, nil
+			}
+		}
+	}
+
+	return false, nil
+}
+
+// isLocalBranchExist checks if a branch exists locally.
+// It returns true, false or an error if something went wrong.
+func isLocalBranchExist(branch, workingDir string) (bool, error) {
+
+	gitRepository, err := git.PlainOpen(workingDir)
+	if err != nil {
+		return false, fmt.Errorf("opening %q git directory: %w", workingDir, err)
+	}
+
+	_, err = gitRepository.Reference(plumbing.NewBranchReferenceName(branch), true)
+
+	if err != nil {
+		if err == plumbing.ErrReferenceNotFound {
+			return false, nil
+		}
+		return false, fmt.Errorf("reference %q - %w", branch, err)
+	}
+
+	return true, nil
+
+}
+
+// IsSimilarBranch checks that the last commits of the two branches are similar then return
+// true if it's the case
+func (g GoGit) IsSimilarBranch(a, b, workingDir string) (bool, error) {
+	if a == b {
+		return true, nil
+	}
+
+	gitRepository, err := git.PlainOpen(workingDir)
+	if err != nil {
+		return false, fmt.Errorf("opening %q git directory: %w", workingDir, err)
+	}
+
+	refA, err := gitRepository.Reference(plumbing.NewBranchReferenceName(a), true)
+	if err != nil {
+		if err == git.ErrBranchNotFound {
+			return false, nil
+		}
+		return false, fmt.Errorf("reference %q - %w", a, err)
+	}
+
+	refB, err := gitRepository.Reference(plumbing.NewBranchReferenceName(b), true)
+	if err != nil {
+		if err == git.ErrBranchNotFound {
+			return false, nil
+		}
+		return false, fmt.Errorf("reference %q - %w", b, err)
+	}
+
+	if refA.Hash().String() == refB.Hash().String() {
+		log.Debugf("no changes detected between branches %q and %q",
+			a, b)
+		return true, nil
+	}
+
+	return false, nil
+}
+
+func (g GoGit) GetChangedFiles(workingDir string) ([]string, error) {
+	gitRepository, err := git.PlainOpen(workingDir)
+	if err != nil {
+		return []string{}, fmt.Errorf("opening %q git directory: %s", workingDir, err)
+	}
+
+	gitWorktree, err := gitRepository.Worktree()
+	if err != nil {
+		return []string{}, fmt.Errorf("opening %q git worktree: %s", workingDir, err)
+	}
+
+	gitStatus, err := gitWorktree.Status()
+	if err != nil {
+		return []string{}, fmt.Errorf("getting git status: %s", err)
+	}
+
+	// gitStatus is a list of changed (as per git definition) files in the provided workingDir
+	// We only retrieve the list of changed files without checking the file status (https://pkg.go.dev/github.com/go-git/go-git/v5@v5.4.2?utm_source=gopls#StatusCode)
+	// as we assume all changes have been done by the target and shall be added, even if already added
+	filesChanged := []string{}
+	for changedFile := range gitStatus {
+		filesChanged = append(filesChanged, changedFile)
+	}
+
+	return filesChanged, nil
+}
+
+// GetCommitHash returns the commit hash referenced by a local or remote branch.
+func (g GoGit) GetCommitHash(workingDir, branch string) (string, error) {
+	gitRepository, err := git.PlainOpen(workingDir)
+	if err != nil {
+		return "", fmt.Errorf("opening %q git directory: %s", workingDir, err)
+	}
+
+	hash, err := resolveBranchHash(gitRepository, branch)
+	if err != nil {
+		return "", err
+	}
+
+	return hash.String(), nil
+}
+
+// GetLatestCommitHash returns the latest commit hash from the working directory
+func (g GoGit) GetLatestCommitHash(workingDir string) (string, error) {
+	return g.GetCommitHash(workingDir, "")
+}
+
+// IsCommitExist checks whether a commit exists in the repository.
+// The commit is resolved with the Git revision syntax so abbreviated hashes are supported.
+func (g GoGit) IsCommitExist(workingDir, commit string) (bool, error) {
+	gitRepository, err := git.PlainOpen(workingDir)
+	if err != nil {
+		return false, fmt.Errorf("opening %q git directory: %s", workingDir, err)
+	}
+
+	hash, err := gitRepository.ResolveRevision(plumbing.Revision(commit))
+	if err != nil {
+		if errors.Is(err, plumbing.ErrReferenceNotFound) || errors.Is(err, plumbing.ErrObjectNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("resolving revision %q: %s", commit, err)
+	}
+
+	// ResolveRevision does not guarantee that the returned hash points to an
+	// existing commit object, for example when a full hash is provided.
+	if _, err := gitRepository.CommitObject(*hash); err != nil {
+		if errors.Is(err, plumbing.ErrObjectNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("getting commit %q: %s", commit, err)
+	}
+
+	return true, nil
+}
+
+// Add run `git add`.
+func (g GoGit) Add(files []string, workingDir string) error {
+	log.Debugf("stage: git-add\n\n")
+
+	for _, file := range files {
+		log.Debugf("adding file: %q\n", file)
+
+		// Strip working directory from file path if it's provided as an absolute path
+		if filepath.IsAbs(file) {
+			relativeFilePath, err := filepath.Rel(workingDir, file)
+			if err != nil {
+				return fmt.Errorf("failed to convert absolute file path %q to relative path: %w", file, err)
+			}
+			log.Debugf("absolute file path detected: %q converted to relative path %q\n", file, relativeFilePath)
+			file = relativeFilePath
+		}
+
+		r, err := git.PlainOpen(workingDir)
+		if err != nil {
+			return fmt.Errorf("opening %q git directory: %w", workingDir, err)
+		}
+
+		w, err := r.Worktree()
+		if err != nil {
+			return fmt.Errorf("opening %q git worktree: %w", workingDir, err)
+		}
+
+		_, err = w.Add(file)
+		if err != nil {
+			return fmt.Errorf("adding file %q: %w", file, err)
+		}
+	}
+	return nil
+}
+
+// Checkout create and then uses a temporary git branch.
+func (g *GoGit) Checkout(username, password, basedBranch, newBranch, gitRepositoryPath string, forceReset bool, depth *int) error {
+	return g.checkout(username, password, basedBranch, newBranch, gitRepositoryPath, forceReset, depth, true)
+}
+
+// checkout implements Checkout. When the new branch doesn't exist locally and fetchMissingBranch
+// is true, it first tries to fetch it from the remote.
+func (g *GoGit) checkout(username, password, basedBranch, newBranch, gitRepositoryPath string, forceReset bool, depth *int, fetchMissingBranch bool) error {
+	log.Debugf("checkout git branch %q, based on %q",
+		newBranch,
+		basedBranch)
+
+	repository, err := git.PlainOpen(gitRepositoryPath)
+	if err != nil {
+		return fmt.Errorf("opening %q git directory: %w", gitRepositoryPath, err)
+	}
+
+	worktree, err := repository.Worktree()
+	if err != nil {
+		return fmt.Errorf("opening %q git worktree: %w", gitRepositoryPath, err)
+	}
+
+	auth := transportHttp.BasicAuth{
+		Username: username, // anything except an empty string
+		Password: password,
+	}
+
+	// Checkout runs before every resource of the repository, but the branch only changes
+	// during an execution through Updatecli's own pushes and API commits, which update
+	// the local branch themselves, so it's pulled once.
+	pulledKey := gitRepositoryPath + "\x00" + newBranch
+
+	// Checkout source branch without creating it yet
+	// If newBranch already exist, use it
+	// otherwise use the one define in the spec
+	err = worktree.Checkout(&git.CheckoutOptions{
+		Branch: plumbing.NewBranchReferenceName(newBranch),
+		Create: false,
+		Keep:   false,
+		Force:  true,
+	})
+
+	switch err {
+	case plumbing.ErrReferenceNotFound:
+		// Means that the new branch doesn't exist locally.
+		// With a regular clone, every remote branch exists locally so the new branch
+		// doesn't exist remotely either. With a single branch clone, it may exist remotely
+		// without being fetched, so we must fetch it to continue from where it was left.
+		if fetchMissingBranch {
+			fetched, fetchErr := fetchBranch(
+				repository,
+				&auth,
+				newBranch,
+				plumbing.NewBranchReferenceName(newBranch).String(),
+				depth,
+			)
+
+			switch {
+			case fetchErr != nil:
+				// Don't fail, a regular clone doesn't need the remote here either.
+				log.Warningf("failed fetching new branch %q from the remote, continuing without it: %s", newBranch, fetchErr)
+			case fetched:
+				log.Debugf("new branch %q already exists on the remote, using it", newBranch)
+				// It was just fetched, there is nothing to pull.
+				pulledBranches.Store(pulledKey, true)
+				return g.checkout(username, password, basedBranch, newBranch, gitRepositoryPath, forceReset, depth, false)
+			}
+		}
+
+		log.Debugf("new branch %q doesn't exist, creating it from branch %q", newBranch, basedBranch)
+
+		if err := fetchBaseBranch(repository, &auth, basedBranch, gitRepositoryPath, depth); err != nil {
+			return err
+		}
+
+		// First we need to checkout the based branch
+		err = worktree.Checkout(&git.CheckoutOptions{
+			Branch: plumbing.NewBranchReferenceName(basedBranch),
+			Create: false,
+			Keep:   false,
+			Force:  true,
+		})
+		if err != nil {
+			return fmt.Errorf("checking out branch %q - %s", basedBranch, err)
+		}
+
+		// Then we create the new branch
+		err = worktree.Checkout(&git.CheckoutOptions{
+			Branch: plumbing.NewBranchReferenceName(newBranch),
+			Create: true,
+			Keep:   false,
+			Force:  true,
+		})
+		if err != nil {
+			return fmt.Errorf("checking out branch %q - %s", newBranch, err)
+		}
+
+		log.Debugf("branch %q successfully created", newBranch)
+		// It doesn't exist on the remote, there is nothing to pull.
+		pulledBranches.Store(pulledKey, true)
+
+	case nil:
+		// Means that a local branch named remoteBranch already exist
+		// so we want to be sure that the local branch is
+		// aligned with the remote one.
+		b := bytes.Buffer{}
+
+		pullOptions := git.PullOptions{
+			Force:    true,
+			Progress: &b,
+		}
+
+		if depth != nil {
+			if *depth < 0 {
+				return fmt.Errorf("invalid depth value: %d, depth should be a positive integer", *depth)
+			}
+			pullOptions.Depth = *depth
+		}
+
+		if !isAuthEmpty(&auth) {
+			pullOptions.Auth = &auth
+		}
+
+		if _, pulled := pulledBranches.Load(pulledKey); pulled {
+			err = git.NoErrAlreadyUpToDate
+		} else {
+			err = pullCheckedOutBranch(repository, worktree, &pullOptions, newBranch)
+		}
+		if b.String() != "" {
+			log.Debugln(b.String())
+		}
+		b.Reset()
+		if err != nil &&
+			err != git.ErrNonFastForwardUpdate &&
+			err != git.NoErrAlreadyUpToDate {
+			log.Debugln(err)
+			return err
+		}
+		pulledBranches.Store(pulledKey, true)
+
+		if forceReset {
+			// The base branch was pulled above if it's the checked out branch.
+			if newBranch != basedBranch {
+				if err := fetchBaseBranch(repository, &auth, basedBranch, gitRepositoryPath, depth); err != nil {
+					return err
+				}
+			}
+
+			log.Debugf("Checking if branch %q diverged from %q:", newBranch, basedBranch)
+			// If the newBranch diverged from the basedBranch, we need to reset it
+			resetBranch, err := resetNewBranchToBaseBranch(
+				plumbing.NewBranchReferenceName(newBranch),
+				plumbing.NewBranchReferenceName(basedBranch),
+				gitRepositoryPath,
+			)
+			g.ForceReset = resetBranch
+			if err != nil {
+				return err
+			}
+			if resetBranch {
+				log.Debugf("\tbranch %q reset to %q", newBranch, basedBranch)
+			} else {
+				log.Debugf("\tall good,branch %q is ahead of %q", newBranch, basedBranch)
+			}
+		}
+
+	default:
+		return fmt.Errorf("checking out branch %q - %s", newBranch, err)
+	}
+
+	return nil
+}
+
+// pullCheckedOutBranch pulls the checked out branch from the remote.
+//
+// Without a reference name, a pull resolves the remote HEAD, which is the default branch of the
+// remote. A single branch clone doesn't fetch the default branch if it isn't the configured one,
+// so the pull would fail to find its latest commit. Single branch clones therefore pull the
+// branch itself, temporarily added to the fetched references, like Pull does.
+// Regular clones keep pulling the remote HEAD.
+func pullCheckedOutBranch(repository *git.Repository, worktree *git.Worktree, pullOptions *git.PullOptions, branch string) error {
+	singleBranch, err := isSingleBranchClone(repository)
+	if err != nil {
+		return err
+	}
+
+	if !singleBranch {
+		return worktree.Pull(pullOptions)
+	}
+
+	restore, err := trackBranch(repository, branch)
+	if err != nil {
+		return err
+	}
+	defer restore()
+
+	// go-git fetches the references configured on the remote, which now include the branch,
+	// then resolves this reference name among them.
+	pullOptions.ReferenceName = plumbing.NewBranchReferenceName(branch)
+
+	err = worktree.Pull(pullOptions)
+	if errors.Is(err, git.NoMatchingRefSpecError{}) {
+		// A fetched reference doesn't exist on the remote and go-git aborts the whole fetch.
+		// This is usually the branch, which was never pushed, so there is nothing to pull.
+		// It can also be the configured branch of the clone if it was deleted from the remote.
+		log.Warningf("a reference to fetch for branch %q doesn't exist on the remote, nothing to pull: %s", branch, err)
+		return git.NoErrAlreadyUpToDate
+	}
+	return err
+}
+
+// isSingleBranchClone reports whether the origin remote only fetches specific branches,
+// as configured by a clone done with "singleBranch", instead of every branch.
+//
+// It's detected from the repository configuration rather than from the scm configuration, so it
+// also matches a repository cloned by a previous execution.
+func isSingleBranchClone(repository *git.Repository) (bool, error) {
+	cfg, err := repository.Config()
+	if err != nil {
+		return false, fmt.Errorf("getting repository configuration: %w", err)
+	}
+
+	remote, ok := cfg.Remotes[DefaultRemoteReferenceName]
+	if !ok {
+		return false, nil
+	}
+
+	for _, refSpec := range remote.Fetch {
+		if refSpec.IsWildcard() {
+			return false, nil
+		}
+	}
+
+	return len(remote.Fetch) > 0, nil
+}
+
+func (g *GoGit) IsForceReset() bool {
+	// If ForceReset is set to true, it means that the branch has been reset
+	// to the latest commit of the based branch.
+	return g.ForceReset
+}
+
+// Commit run `git commit`.
+func (g GoGit) Commit(user, email, message, workingDir string, signingKey string, passphrase string) error {
+	log.Debugf("stage: git-commit\n\n")
+
+	r, err := git.PlainOpen(workingDir)
+	if err != nil {
+		return fmt.Errorf("opening %q git directory: %w", workingDir, err)
+	}
+
+	w, err := r.Worktree()
+	if err != nil {
+		return fmt.Errorf("opening %q git worktree: %w", workingDir, err)
+	}
+
+	status, err := w.Status()
+	if err != nil {
+		return fmt.Errorf("getting git status: %w", err)
+	}
+
+	commitOptions := git.CommitOptions{
+		// Several plugin
+		// We assume that updatecli is working from a clean worktree and can add all files that need to be tracked by git
+		// Hence why we run git commit -A
+		All: true,
+		Author: &object.Signature{
+			Name:  user,
+			Email: email,
+			When:  time.Now(),
+		},
+	}
+
+	log.Debugf("status: %q\n", status)
+
+	if len(signingKey) > 0 {
+		key, err := sign.GetCommitSignKey(signingKey, passphrase)
+		if err != nil {
+			return fmt.Errorf("getting commit sign key: %w", err)
+		}
+		commitOptions.SignKey = key
+	}
+
+	commit, err := w.Commit(message, &commitOptions)
+	if err != nil {
+		return fmt.Errorf("committing: %w", err)
+	}
+	obj, err := r.CommitObject(commit)
+	if err != nil {
+		return fmt.Errorf("getting commit object: %w", err)
+	}
+	log.Debugf("git commit object:\n%s\n", obj)
+
+	return nil
+}
+
+// updateSingleBranchClone updates the configured branch of an existing single branch clone,
+// which may have been made for another branch of the repository, by a previous pipeline or execution.
+//
+// The branch is fetched into the local one, as the refs/heads/* fetch done for regular clones does.
+// If it's checked out, the worktree is reset to it. Otherwise, such as when a previous execution left
+// a working branch checked out, Checkout later creates or resets the working branch from it.
+func updateSingleBranchClone(repository *git.Repository, worktree *git.Worktree, auth *transportHttp.BasicAuth, branch string, depth *int) error {
+	branchRef := plumbing.NewBranchReferenceName(branch)
+
+	fetched, err := fetchBranch(repository, auth, branch, branchRef.String(), depth)
+	if err != nil {
+		return err
+	}
+	if !fetched {
+		return fmt.Errorf("branch %q not found on the remote", branch)
+	}
+
+	head, err := repository.Head()
+	if err != nil {
+		return fmt.Errorf("getting HEAD: %w", err)
+	}
+	if head.Name() != branchRef {
+		return nil
+	}
+
+	ref, err := repository.Reference(branchRef, true)
+	if err != nil {
+		return fmt.Errorf("getting branch %q: %w", branch, err)
+	}
+
+	return worktree.Reset(&git.ResetOptions{
+		Commit: ref.Hash(),
+		Mode:   git.HardReset,
+	})
+}
+
+// fetchBaseBranch updates the local base branch of a single branch clone from the remote, once per
+// execution, as the refs/heads/* fetch done by Clone does for regular clones.
+//
+// A clone is shared by every pipeline using the repository, whatever their base branch, but Clone
+// only runs once per execution, for one of them. A single branch clone doesn't have the base branch
+// of the others, or has the one left by a previous execution.
+func fetchBaseBranch(repository *git.Repository, auth *transportHttp.BasicAuth, branch, gitRepositoryPath string, depth *int) error {
+	// Only try once per execution, whatever the outcome, as Checkout runs before every resource.
+	if _, tried := fetchedBaseBranches.LoadOrStore(gitRepositoryPath+"\x00"+branch, true); tried {
+		return nil
+	}
+
+	singleBranch, err := isSingleBranchClone(repository)
+	if err != nil {
+		return err
+	}
+	if !singleBranch {
+		return nil
+	}
+
+	// Don't fail, a regular clone doesn't need the remote here either: the local base branch is used
+	// if there is one, and Checkout fails if there isn't.
+	fetched, err := fetchBranch(repository, auth, branch, plumbing.NewBranchReferenceName(branch).String(), depth)
+	switch {
+	case err != nil:
+		log.Warningf("failed fetching base branch %q from the remote, using the local one: %s", branch, err)
+	case !fetched:
+		log.Warningf("base branch %q not found on the remote, using the local one", branch)
+	}
+
+	return nil
+}
+
+// Clone run `git clone`.
+func (g GoGit) Clone(username, password, URL, workingDir string, withSubmodules *bool, depth *int, branch string, singleBranch bool) error {
+	var repo *git.Repository
+
+	auth := transportHttp.BasicAuth{
+		Username: username, // anything except an empty string
+		Password: password,
+	}
+
+	submodule := git.DefaultSubmoduleRecursionDepth
+	if withSubmodules != nil && !*withSubmodules {
+		submodule = git.NoRecurseSubmodules
+	}
+
+	var b bytes.Buffer
+	cloneOptions := git.CloneOptions{
+		URL:               URL,
+		Progress:          &b,
+		RecurseSubmodules: submodule,
+	}
+
+	if singleBranch && branch != "" {
+		cloneOptions.SingleBranch = true
+		cloneOptions.ReferenceName = plumbing.NewBranchReferenceName(branch)
+	}
+
+	if depth != nil {
+		if *depth < 0 {
+			return fmt.Errorf("invalid depth value: %d, depth should be a positive integer", *depth)
+		}
+		cloneOptions.Depth = *depth
+	}
+
+	if !isAuthEmpty(&auth) {
+		cloneOptions.Auth = &auth
+	}
+
+	fmt.Fprintf(&b, "cloning git repository: %s in %s\n", URL, workingDir)
+	repo, err := git.PlainClone(workingDir, false, &cloneOptions)
+
+	if b.String() != "" {
+		log.Debugln(b.String())
+	}
+	b.Reset()
+
+	if err == git.ErrRepositoryAlreadyExists {
+
+		log.Debugf("repository already exists, trying to pull changes")
+		b.Reset()
+
+		repo, err = git.PlainOpen(workingDir)
+		if err != nil {
+			return fmt.Errorf("opening %q git directory: %w", workingDir, err)
+		}
+
+		w, err := repo.Worktree()
+		if err != nil {
+			return fmt.Errorf("opening %q git worktree: %w", workingDir, err)
+		}
+
+		status, err := w.Status()
+		if err != nil {
+			return fmt.Errorf("getting git status: %w", err)
+		}
+		b.WriteString(status.String())
+
+		if singleBranch && branch != "" {
+			err = updateSingleBranchClone(repo, w, &auth, branch, depth)
+		} else {
+			pullOptions := git.PullOptions{
+				Force:    true,
+				Progress: &b,
+			}
+
+			if depth != nil {
+				if *depth < 0 {
+					return fmt.Errorf("invalid depth value: %d, depth should be a positive integer", *depth)
+				}
+				pullOptions.Depth = *depth
+			}
+
+			if !isAuthEmpty(&auth) {
+				pullOptions.Auth = &auth
+			}
+
+			err = w.Pull(&pullOptions)
+		}
+
+		if b.String() != "" {
+			log.Debugln(b.String())
+		}
+		b.Reset()
+
+		if err != nil &&
+			err != git.ErrNonFastForwardUpdate &&
+			err != git.NoErrAlreadyUpToDate {
+			return fmt.Errorf("pulling: %w", err)
+		}
+
+	} else if err != nil &&
+		err != git.NoErrAlreadyUpToDate {
+		// It's a common error to specify a password without a username
+		// Considering that I don't see a use case for an empty username
+		// I will return an error if a password is specified without a username
+		// Feel free to open an issue if you think it's a bad idea.
+		if username == "" && password != "" {
+			return fmt.Errorf("cloning: %w\n\tIt appears that a password has been specified without a username, could it be related?", err)
+		}
+		return fmt.Errorf("cloning: %w", err)
+	}
+
+	// Skip the full ref reconciliation fetch below when singleBranch is enabled: it
+	// mirrors every branch and tag from the remote, which defeats the purpose of only
+	// cloning/fetching the configured branch and can be very expensive on repositories with a
+	// large number of refs.
+	if singleBranch {
+		if branch != "" {
+			// The configured branch was just cloned or updated, Checkout doesn't need to fetch it again.
+			fetchedBaseBranches.Store(workingDir+"\x00"+branch, true)
+		}
+		return nil
+	}
+
+	remotes, err := repo.Remotes()
+	if err != nil {
+		return fmt.Errorf("listing remotes: %w", err)
+	}
+
+	log.Debugf("Fetching remote branches for resetting local ones")
+
+	for _, r := range remotes {
+
+		fetchOptions := git.FetchOptions{
+			Progress: &b,
+			// Only branches and tags: other refs, such as the refs/pull/* GitHub keeps for every
+			// pull request, aren't used and can hold most of the refs and objects of a repository.
+			RefSpecs: []config.RefSpec{"refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*"},
+			Force:    true,
+		}
+
+		if depth != nil {
+			if *depth < 0 {
+				return fmt.Errorf("invalid depth value: %d, depth should be a positive integer", *depth)
+			}
+			fetchOptions.Depth = *depth
+		}
+
+		if !isAuthEmpty(&auth) {
+			fetchOptions.Auth = &auth
+		}
+
+		err := r.Fetch(&fetchOptions)
+
+		if b.String() != "" {
+			log.Debugln(b.String())
+		}
+		b.Reset()
+
+		if err != nil &&
+			err != git.NoErrAlreadyUpToDate &&
+			err != git.ErrBranchExists {
+			return fmt.Errorf("fetching remote %q: %w", r.Config().Name, err)
+		}
+	}
+
+	return nil
+}
+
+// Push run `git push`.
+// The function returns a boolean to indicate if the push needed a force push or not.
+// and an error if something went wrong.
+func (g GoGit) Push(username string, password string, workingDir string, force bool) (bool, error) {
+	log.Debugf("stage: git-push\n\n")
+
+	auth := transportHttp.BasicAuth{
+		Username: username, // anything excepted an empty string
+		Password: password,
+	}
+
+	r, err := git.PlainOpen(workingDir)
+	if err != nil {
+		return false, fmt.Errorf("opening %q git directory: %s", workingDir, err)
+	}
+
+	// Retrieve local branch
+	head, err := r.Head()
+	if err != nil {
+		return false, fmt.Errorf("getting HEAD: %s", err)
+	}
+
+	if !head.Name().IsBranch() {
+		return false, fmt.Errorf("not pushing from a branch")
+	}
+
+	localBranch := strings.TrimPrefix(head.Name().String(), "refs/heads/")
+	localRefSpec := head.Name().String()
+
+	// By default don't force push
+	refspec := config.RefSpec(fmt.Sprintf("%s:refs/heads/%s",
+		localRefSpec,
+		localBranch))
+
+	if err := refspec.Validate(); err != nil {
+		return false, fmt.Errorf("validating refspec: %s", err)
+	}
+
+	b := bytes.Buffer{}
+
+	pushOptions := git.PushOptions{
+		Auth:     &auth,
+		Progress: &b,
+		RefSpecs: []config.RefSpec{refspec},
+	}
+
+	if !isAuthEmpty(&auth) {
+		pushOptions.Auth = &auth
+	}
+
+	// Only push one branch at a time
+	err = r.Push(&pushOptions)
+	if b.String() != "" {
+		log.Debugln(b.String())
+	}
+	b.Reset()
+
+	if err == nil || err == git.NoErrAlreadyUpToDate {
+		return false, nil
+	}
+
+	// Even if push --force is allowed by the configuration,
+	// we first want to see if the push is a fast forward or not.
+	if strings.Contains(err.Error(), git.ErrNonFastForwardUpdate.Error()) {
+		if !force {
+			return false, fmt.Errorf("force push needed, use scm parameter \"force\" to true")
+		}
+
+		refspec = config.RefSpec(fmt.Sprintf("+%s:refs/heads/%s",
+			localRefSpec,
+			localBranch))
+
+		pushOptions = git.PushOptions{
+			Auth:     &auth,
+			Progress: &b,
+			RefSpecs: []config.RefSpec{refspec},
+		}
+
+		// Only push one branch at a time
+		err = r.Push(&pushOptions)
+
+		if b.String() != "" {
+			log.Debugln(b.String())
+		}
+		b.Reset()
+
+		if err != nil {
+			return false, fmt.Errorf("push to remote origin: %s", err)
+		}
+		return true, nil
+	}
+
+	log.Errorf("%s", git.ErrNonFastForwardUpdate.Error())
+	log.Errorf("push: %s", err)
+
+	return false, err
+}
+
+// SanitizeBranchName replace wrong character in the branch name
+func (g GoGit) SanitizeBranchName(branch string) string {
+	removedCharacter := []string{
+		":", "=", "+", "$", "&", "#", "!", "@", "*", " ",
+	}
+
+	replacedByUnderscore := []string{
+		"\\", "{", "}", "[", "]",
+	}
+
+	for _, character := range removedCharacter {
+		branch = strings.ReplaceAll(branch, character, "")
+	}
+	for _, character := range replacedByUnderscore {
+		branch = strings.ReplaceAll(branch, character, "_")
+	}
+
+	branch = strings.TrimPrefix(branch, "/")
+
+	if len(branch) > 255 {
+		return branch[0:255]
+	}
+
+	return branch
+}
+
+// TagHashes returns a list of the commit hashes for git tags ordered by creation time
+func (g GoGit) TagHashes(workingDir string) (hashes []string, err error) {
+	refs, err := g.TagRefs(workingDir)
+	if err != nil {
+		return hashes, fmt.Errorf("listing git tags in directory %q: %w", workingDir, err)
+	}
+
+	// Extract the list of tag hashes (ordered by time)
+	for _, ref := range refs {
+		hashes = append(hashes, ref.Hash)
+	}
+
+	log.Debugf("got tags: %v", hashes)
+
+	if len(hashes) == 0 {
+		return hashes, fmt.Errorf("%s", ErrNoGitTagFound)
+	}
+
+	return hashes, nil
+}
+
+// Tags returns a list of the names for git tags ordered by creation time
+func (g GoGit) Tags(workingDir string) (names []string, err error) {
+	refs, err := g.TagRefs(workingDir)
+	if err != nil {
+		return names, fmt.Errorf("listing git tags in directory %q: %w", workingDir, err)
+	}
+
+	// Extract the list of tag names (ordered by time)
+	for _, ref := range refs {
+		names = append(names, ref.Name)
+	}
+
+	log.Debugf("got tags: %v", names)
+
+	if len(names) == 0 {
+		return names, fmt.Errorf("%s", ErrNoGitTagFound)
+	}
+
+	return names, nil
+}
+
+type DatedTag struct {
+	When time.Time
+	Name string
+	Hash string
+}
+
+// TagRefs returns a list of git tags ordered by creation time
+func (g GoGit) TagRefs(workingDir string) (tags []DatedTag, err error) {
+	r, err := git.PlainOpen(workingDir)
+	if err != nil {
+		return tags, fmt.Errorf("opening %q git directory: %w", workingDir, err)
+	}
+	tagrefs, err := r.Tags()
+	if err != nil {
+		return tags, fmt.Errorf("listing tags: %w", err)
+	}
+
+	listOfDatedTags := []DatedTag{}
+
+	err = tagrefs.ForEach(func(tagRef *plumbing.Reference) error {
+		// cfr https://github.com/updatecli/updatecli/issues/1392
+		// using reference hash instead of reference name
+
+		revision := plumbing.Revision(tagRef.Hash().String())
+
+		hash := ""
+
+		obj, err := r.TagObject(tagRef.Hash())
+		switch err {
+		case nil:
+			// Annotated Tag detected
+			revision = plumbing.Revision(obj.Target.String())
+
+			hash = obj.Target.String()
+
+		case plumbing.ErrObjectNotFound:
+			// Not an annotated tag object
+			hash = tagRef.Hash().String()
+
+		default:
+			return fmt.Errorf("getting tag object for %q: %w", tagRef.Name().Short(), err)
+		}
+
+		tagCommitHash, err := r.ResolveRevision(revision)
+		if err != nil {
+			return fmt.Errorf("resolving revision %q: %w", revision, err)
+		}
+
+		commit, err := r.CommitObject(*tagCommitHash)
+		if err != nil {
+			return fmt.Errorf("getting commit object for %q: %w", tagRef.Name().Short(), err)
+		}
+
+		listOfDatedTags = append(
+			listOfDatedTags,
+			DatedTag{
+				Name: tagRef.Name().Short(),
+				Hash: hash,
+				When: commit.Committer.When,
+			},
+		)
+
+		return nil
+	})
+	if err != nil {
+		return tags, fmt.Errorf("listing tags: %w", err)
+	}
+
+	if len(listOfDatedTags) == 0 {
+		return []DatedTag{}, fmt.Errorf("%s", ErrNoGitTagFound)
+	}
+
+	// Sort tags by time
+	sort.Slice(listOfDatedTags, func(i, j int) bool {
+		return listOfDatedTags[i].When.Before(listOfDatedTags[j].When)
+	})
+
+	return listOfDatedTags, nil
+}
+
+// NewTag create a tag then return a boolean to indicate if
+// the tag was created or not.
+func (g GoGit) NewTag(tag, message, workingDir string) (bool, error) {
+	r, err := git.PlainOpen(workingDir)
+	if err != nil {
+		return false, fmt.Errorf("opening %q git directory: %w", workingDir, err)
+	}
+
+	h, err := r.Head()
+	if err != nil {
+		return false, fmt.Errorf("get HEAD: %w", err)
+	}
+
+	_, err = r.CreateTag(tag, h.Hash(), &git.CreateTagOptions{
+		Message: message,
+	})
+	if err != nil {
+		return false, fmt.Errorf("creating tag %q: %w", tag, err)
+	}
+	return true, nil
+}
+
+// PushTag publish a single tag created locally
+func (g GoGit) PushTag(tag string, username string, password string, workingDir string, force bool) error {
+	auth := transportHttp.BasicAuth{
+		Username: username, // anything except an empty string
+		Password: password,
+	}
+
+	r, err := git.PlainOpen(workingDir)
+	if err != nil {
+		return fmt.Errorf("opening %q git directory: %w", workingDir, err)
+	}
+
+	log.Debugf("Pushing git Tag: %q", tag)
+
+	// By default don't force push
+	refspec := config.RefSpec("refs/tags/" + tag + ":refs/tags/" + tag)
+
+	if force {
+		refspec = config.RefSpec("+refs/tags/" + tag + ":refs/tags/" + tag)
+	}
+
+	b := bytes.Buffer{}
+	po := &git.PushOptions{
+		RemoteName: DefaultRemoteReferenceName,
+		Progress:   &b,
+		RefSpecs:   []config.RefSpec{refspec},
+	}
+
+	if !isAuthEmpty(&auth) {
+		po.Auth = &auth
+	}
+
+	err = r.Push(po)
+
+	log.Debugln(b.String())
+	b.Reset()
+
+	if err != nil {
+		if err == git.NoErrAlreadyUpToDate {
+			log.Infof("%q remote was up to date, no push done", DefaultRemoteReferenceName)
+			return nil
+		}
+		return fmt.Errorf("push to remote %q: %s", DefaultRemoteReferenceName, err)
+	}
+
+	return nil
+}
+
+// RemoteURLs returns the list of remote URLs
+func (g GoGit) RemoteURLs(workingDir string) (map[string]string, error) {
+	remoteList := make(map[string]string)
+
+	gitRepository, err := git.PlainOpenWithOptions(workingDir, &git.PlainOpenOptions{DetectDotGit: true})
+	if err != nil {
+		return remoteList, fmt.Errorf("opening %q git directory: %w", workingDir, err)
+	}
+
+	list, err := gitRepository.Remotes()
+	if err != nil {
+		return remoteList, fmt.Errorf("listing remotes: %w", err)
+	}
+
+	for _, r := range list {
+		remoteList[r.Config().Name] = r.Config().URLs[0]
+	}
+
+	return remoteList, nil
+}
+
+// isAuthEmpty return true if no username/password are defined
+func isAuthEmpty(auth *transportHttp.BasicAuth) bool {
+	return auth.Username == "" && auth.Password == ""
+}
+
+// fetchBranch fetches a single branch from the origin remote into the given reference.
+// It returns false, without error, if the branch doesn't exist on the remote.
+//
+// A clone done with "singleBranch" only fetches the configured branch, so any other
+// branch, such as the working branch, must be fetched explicitly.
+func fetchBranch(repository *git.Repository, auth *transportHttp.BasicAuth, branch, localRef string, depth *int) (bool, error) {
+	fetchOptions := git.FetchOptions{
+		RemoteName: DefaultRemoteReferenceName,
+		RefSpecs: []config.RefSpec{
+			config.RefSpec(fmt.Sprintf("+%s:%s", plumbing.NewBranchReferenceName(branch), localRef)),
+		},
+		Force: true,
+	}
+
+	if depth != nil {
+		if *depth < 0 {
+			return false, fmt.Errorf("invalid depth value: %d, depth should be a positive integer", *depth)
+		}
+		fetchOptions.Depth = *depth
+	}
+
+	if auth != nil && !isAuthEmpty(auth) {
+		fetchOptions.Auth = auth
+	}
+
+	err := repository.Fetch(&fetchOptions)
+	switch {
+	case err == nil, errors.Is(err, git.NoErrAlreadyUpToDate):
+		return true, nil
+	case errors.Is(err, git.NoMatchingRefSpecError{}):
+		return false, nil
+	}
+
+	return false, fmt.Errorf("fetching branch %q: %w", branch, err)
+}
+
+// trackBranch temporarily adds a branch to the references fetched from the origin remote, so that
+// operations relying on the remote configuration, such as a pull, also fetch it.
+// The returned function restores the original configuration, so a later fetch doesn't fail
+// if the branch is removed from the remote.
+func trackBranch(repository *git.Repository, branch string) (restore func(), err error) {
+	noop := func() {}
+
+	cfg, err := repository.Config()
+	if err != nil {
+		return noop, fmt.Errorf("getting repository configuration: %w", err)
+	}
+
+	remote, ok := cfg.Remotes[DefaultRemoteReferenceName]
+	if !ok {
+		return noop, fmt.Errorf("remote %q not found in the repository configuration", DefaultRemoteReferenceName)
+	}
+
+	refSpec := config.RefSpec(fmt.Sprintf("+%s:%s",
+		plumbing.NewBranchReferenceName(branch),
+		plumbing.NewRemoteReferenceName(DefaultRemoteReferenceName, branch)))
+
+	for _, existing := range remote.Fetch {
+		if existing == refSpec {
+			return noop, nil
+		}
+	}
+
+	original := append([]config.RefSpec(nil), remote.Fetch...)
+	remote.Fetch = append(remote.Fetch, refSpec)
+
+	if err := repository.SetConfig(cfg); err != nil {
+		return noop, fmt.Errorf("adding branch %q to the fetched references: %w", branch, err)
+	}
+
+	return func() {
+		remote.Fetch = original
+		if err := repository.SetConfig(cfg); err != nil {
+			log.Debugf("failed restoring the fetched references of remote %q: %s", DefaultRemoteReferenceName, err)
+		}
+	}, nil
+}
+
+// Pull run `git pull` on the local HEAD.
+func (g GoGit) Pull(username, password, gitRepositoryPath, branch string, singleBranch, forceReset bool, depth *int) error {
+	repository, err := git.PlainOpen(gitRepositoryPath)
+	if err != nil {
+		return fmt.Errorf("opening %q git directory: %w", gitRepositoryPath, err)
+	}
+
+	ref, err := repository.Head()
+	if err != nil {
+		return fmt.Errorf("get branch head: %s", err)
+	}
+
+	log.Debugf("Pulling git branch %q", ref.Name())
+
+	worktree, err := repository.Worktree()
+	if err != nil {
+		return fmt.Errorf("opening %q git worktree: %w", gitRepositoryPath, err)
+	}
+
+	auth := transportHttp.BasicAuth{
+		Username: username, // anything except an empty string
+		Password: password,
+	}
+
+	b := bytes.Buffer{}
+
+	// Pull only fetches the references configured on the remote, which in a single branch
+	// clone is the configured branch. The branch to pull, usually the working branch,
+	// must be part of that same fetch, otherwise its latest commit is resolved without
+	// having been downloaded, for instance if the branch is updated between two requests.
+	if singleBranch && branch != "" {
+		restore, err := trackBranch(repository, branch)
+		if err != nil {
+			return err
+		}
+		defer restore()
+	}
+
+	pullOptions := git.PullOptions{
+		Force:        forceReset,
+		Progress:     &b,
+		SingleBranch: singleBranch,
+	}
+
+	if depth != nil {
+		if *depth < 0 {
+			return fmt.Errorf("invalid depth value: %d, depth should be a positive integer", *depth)
+		}
+		pullOptions.Depth = *depth
+	}
+
+	if branch != "" {
+		pullOptions.ReferenceName = plumbing.NewBranchReferenceName(branch)
+	}
+
+	if !isAuthEmpty(&auth) {
+		pullOptions.Auth = &auth
+	}
+
+	err = worktree.Pull(&pullOptions)
+	if b.String() != "" {
+		log.Debugln(b.String())
+	}
+
+	if err != nil &&
+		err != git.ErrNonFastForwardUpdate &&
+		err != git.NoErrAlreadyUpToDate {
+		return fmt.Errorf("pulling remote branch %s", err)
+	}
+
+	ref, err = repository.Head()
+	if err != nil {
+		return fmt.Errorf("get branch head: %s", err)
+	}
+
+	log.Debugf("branch %q is now at %s", ref.Name(), ref.Hash())
+
+	return nil
+}

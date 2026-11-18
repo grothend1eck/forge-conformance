@@ -1,0 +1,154 @@
+package yaml
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"strings"
+
+	goyaml "github.com/goccy/go-yaml"
+	"github.com/goccy/go-yaml/parser"
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"github.com/updatecli/updatecli/pkg/core/result"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/pathresolver"
+	"github.com/vmware-labs/yaml-jsonpath/pkg/yamlpath"
+
+	"go.yaml.in/yaml/v3"
+)
+
+// Source return the latest version
+func (y *Yaml) Source(_ context.Context, pathResolver pathresolver.Resolver, resultSource *result.Source) error {
+	// By default workingDir is set to local directory
+	var filePath string
+
+	if y.spec.SearchPattern {
+		return fmt.Errorf("validation error in sources of type 'yaml': the attribute `spec.searchpattern` is not supported for source")
+	}
+
+	if len(y.files) > 1 {
+		validationError := fmt.Errorf("validation error in sources of type 'yaml': the attributes `spec.files` can't contain more than one element for sources")
+		log.Errorln(validationError.Error())
+		return validationError
+	}
+
+	if y.spec.Value != "" {
+		log.Warnf("Key 'Value' is not used by source YAML")
+	}
+
+	if err := y.initFiles(pathResolver); err != nil {
+		return fmt.Errorf("init files: %w", err)
+	}
+
+	switch len(y.files) {
+	case 1:
+		//
+	case 0:
+		return fmt.Errorf("no yaml file found")
+	default:
+		return fmt.Errorf("multiple yaml files found, please specify only one file")
+	}
+
+	// loop over the only file
+	for f := range y.files {
+		filePath = f
+	}
+
+	if err := y.Read(); err != nil {
+		return fmt.Errorf("reading yaml file: %w", err)
+	}
+
+	fileContent := y.files[filePath].content
+	originalFilePath := y.files[filePath].originalFilePath
+
+	var results []string
+	switch y.spec.Engine {
+	case EngineGoYaml, EngineDefault, EngineUndefined:
+		urlPath, err := goyaml.PathString(y.spec.Key)
+		if err != nil {
+			return fmt.Errorf("crafting yamlpath query: %w", err)
+		}
+
+		file, err := parser.ParseBytes([]byte(fileContent), 0)
+		if err != nil {
+			return fmt.Errorf("parsing yaml file: %w", err)
+		}
+
+		for index, doc := range file.Docs {
+
+			if y.spec.DocumentIndex != nil {
+				if index != *y.spec.DocumentIndex {
+					continue
+				}
+			}
+
+			node, err := urlPath.FilterNode(doc.Body)
+			if err != nil {
+				return fmt.Errorf("searching in yaml document index %d: %w", *y.spec.DocumentIndex, err)
+			}
+
+			if node != nil {
+				results = append(results, nodeValue(node))
+				break
+			}
+		}
+
+	case EngineYamlPath:
+		urlPath, err := yamlpath.NewPath(y.spec.Key)
+		if err != nil {
+			return fmt.Errorf("crafting yamlpath query: %w", err)
+		}
+
+		// Decode the file into one or more YAML document nodes
+		var docs []*yaml.Node                                                //nolint:forbidigo // yamlpath only accepts go.yaml.in/yaml/v3 nodes
+		dec := yaml.NewDecoder(strings.NewReader(y.files[filePath].content)) //nolint:forbidigo // yamlpath only accepts go.yaml.in/yaml/v3 nodes
+		for {
+			var doc yaml.Node                          //nolint:forbidigo // yamlpath only accepts go.yaml.in/yaml/v3 nodes
+			if derr := dec.Decode(&doc); derr != nil { //nolint:forbidigo // yamlpath only accepts go.yaml.in/yaml/v3 nodes
+				if derr == io.EOF {
+					break
+				}
+				return fmt.Errorf("parsing yaml file %q: %w", originalFilePath, derr)
+			}
+			docs = append(docs, &doc)
+		}
+
+		for index, doc := range docs {
+			if y.spec.DocumentIndex != nil {
+				if index != *y.spec.DocumentIndex {
+					continue
+				}
+			}
+
+			founds, err := urlPath.Find(doc)
+			if err != nil {
+				return fmt.Errorf("searching in yaml file: %w", err)
+			}
+
+			for i := range founds {
+				results = append(results, founds[i].Value) //nolint:forbidigo // yamlpath only accepts go.yaml.in/yaml/v3 nodes
+			}
+		}
+
+	default:
+		return fmt.Errorf("unsupported engine %q", y.spec.Engine)
+	}
+	if len(results) == 0 {
+		return fmt.Errorf("impossible to find any key for the specified path: %s", y.spec.Key)
+	}
+
+	if len(results) > 0 {
+		value := results[0]
+		resultSource.Result = result.SUCCESS
+		resultSource.Information = value
+		resultSource.Description = fmt.Sprintf("value %q found for key %q in the yaml file %q",
+			value,
+			y.spec.Key,
+			originalFilePath,
+		)
+		return nil
+	}
+
+	return fmt.Errorf("cannot find key %q from file %q",
+		y.spec.Key,
+		originalFilePath)
+}

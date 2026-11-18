@@ -1,0 +1,19 @@
+---
+name: 'Updatecli Version TestSuite'
+vars:
+  message:
+    warning: 'WARNING:'
+    error: 'ERROR:'
+testcases:
+  - name: 'Test updatecli version return code is 0'
+    steps:
+      - script: '{{ .binpath }}/updatecli version'
+        type: 'exec'
+        assertions:
+          - 'result.code ShouldEqual 0'
+          - 'result.systemout ShouldNotContainSubstring "{{ .message.warning }}"'
+          - 'result.systemout ShouldNotContainSubstring "{{ .message.error }}"'
+          - 'result.systemout ShouldContainSubstring "VERSION"'
+          - 'result.systemout ShouldContainSubstring "Application:"'
+          - 'result.systemout ShouldContainSubstring "Golang     :"'
+          - 'result.systemout ShouldContainSubstring "Build Time :"'

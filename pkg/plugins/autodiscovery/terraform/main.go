@@ -1,0 +1,105 @@
+package terraform
+
+import (
+	"path"
+
+	"github.com/go-viper/mapstructure/v2"
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/version"
+)
+
+// Terraform struct holds all information needed to generate terraform manifest.
+type Terraform struct {
+	// actionID holds the actionID used by the newly generated manifest
+	actionID string
+	// spec defines the settings provided via an updatecli manifest
+	spec Spec
+	// rootdir defines the root directory from where looking for .terraform.lock.hcl
+	rootDir string
+	// scmID holds the scmID used by the newly generated manifest
+	scmID string
+	//  `versionfilter` provides parameters to specify the version pattern used when generating manifest.
+	//
+	//  kind - semver
+	//    versionfilter of kind `semver` uses semantic versioning as version filtering
+	//    pattern accepts one of:
+	//      `prerelease` - Updatecli tries to identify the latest prerelease whatever it means
+	//      `patch` - Updatecli only handles patch version update
+	//      `minor` - Updatecli handles patch AND minor version update
+	//      `minoronly` - Updatecli handles minor version only
+	//      `major` - Updatecli handles patch, minor, AND major version update
+	//      `majoronly` - Updatecli only handles major version update
+	//      `a version constraint` such as `>= 1.0.0`
+	//
+	//  kind - regex
+	//    versionfilter of kind `regex` uses regular expression as version filtering
+	//    pattern accepts a valid regular expression
+	//
+	//  example:
+	//  ```
+	//    versionfilter:
+	//      kind: semver
+	//      pattern: minor
+	//  ```
+	//
+	//  and its type like regex, semver, or just latest.
+	//
+	//  More examples can be found at https://www.updatecli.io/docs/core/versionfilter/
+	versionFilter version.Filter
+}
+
+// New return a new valid Terraform object.
+func New(spec interface{}, rootDir, scmID, actionID string) (Terraform, error) {
+	var s Spec
+
+	err := mapstructure.Decode(spec, &s)
+	if err != nil {
+		return Terraform{}, err
+	}
+
+	if len(s.Platforms) == 0 {
+		log.Warningf("No platforms specified, we fallback to linux_amd64, linux_arm64, darwin_amd64, darwin_arm64")
+		s.Platforms = []string{"linux_amd64", "linux_arm64", "darwin_amd64", "darwin_arm64"}
+	}
+
+	newFilter := s.VersionFilter
+	if s.VersionFilter.IsZero() {
+		log.Debugln("no versioning filtering specified, fallback to semantic versioning")
+		// By default, golang versioning uses semantic versioning
+		newFilter.Kind = "semver"
+		newFilter.Pattern = "*"
+	}
+
+	dir := rootDir
+	if path.IsAbs(s.RootDir) {
+		if scmID != "" {
+			log.Warningf("rootdir %q is an absolute path, scmID %q will be ignored", s.RootDir, scmID)
+		}
+		dir = s.RootDir
+	}
+
+	// Fallback to the current process path if not rootdir specified.
+	if len(dir) == 0 {
+		log.Errorln("no working directory defined")
+		return Terraform{}, err
+	}
+
+	return Terraform{
+		actionID:      actionID,
+		spec:          s,
+		rootDir:       dir,
+		scmID:         scmID,
+		versionFilter: newFilter,
+	}, nil
+}
+
+func (t Terraform) DiscoverManifests() ([][]byte, error) {
+	log.Heading("Terraform")
+
+	manifests, err := t.discoverTerraformProvidersManifests()
+	if err != nil {
+		return nil, err
+	}
+
+	return manifests, nil
+}

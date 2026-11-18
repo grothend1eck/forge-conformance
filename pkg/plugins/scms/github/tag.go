@@ -1,0 +1,123 @@
+package github
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/shurcooL/githubv4"
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"github.com/updatecli/updatecli/pkg/plugins/scms/github/client"
+)
+
+// tagsQuery defines a github v4 API query to retrieve a list of tags sorted in reverse order of commit tags.
+/*
+https://developer.github.com/v4/explorer/
+# Query
+query getLatestTag($cursor: String){
+	rateLimit {
+		cost
+		remaining
+		resetAt
+	}
+	repository(owner: "kubernetes", name: "kubectl") {
+		refs(refPrefix: "refs/tags/", first: 100, after: $cursor, orderBy: {field: TAG_COMMIT_DATE, direction: DESC}) {
+			totalCount
+			pageInfo {
+				hasNextPage
+				endCursor
+			}
+			edges {
+				node {
+						name
+				}
+				cursor
+			}
+		}
+	}
+}
+*/
+type tagsQuery struct {
+	RateLimit  RateLimit
+	Repository struct {
+		Refs repositoryRef `graphql:"refs(refPrefix: $refPrefix, last: 100, before: $before,orderBy: $orderBy)"`
+	} `graphql:"repository(owner: $owner, name: $repository)"`
+}
+type repositoryRef struct {
+	TotalCount int
+	PageInfo   PageInfo
+	Edges      []refEdge
+}
+type refNode struct {
+	Name string
+}
+type refEdge struct {
+	Cursor string
+	Node   refNode
+}
+
+// SearchTags return every tags from the github api return in reverse order of commit tags.
+func (g *Github) SearchTags(ctx context.Context, retry int) (tags []string, err error) {
+
+	var query tagsQuery
+
+	variables := map[string]interface{}{
+		keyOwner:      githubv4.String(g.Spec.Owner),
+		keyRepository: githubv4.String(g.Spec.Repository),
+		"refPrefix":   githubv4.String("refs/tags/"),
+		keyBefore:     (*githubv4.String)(nil),
+		"orderBy": githubv4.RefOrder{
+			Field:     "TAG_COMMIT_DATE",
+			Direction: "DESC",
+		},
+	}
+
+	expectedFound := 0
+	tagCounter := 0
+	for {
+		err = g.client.Query(ctx, &query, variables)
+		if err != nil {
+			if client.IsRateLimitError(err) {
+				// If the query failed because we reached the rate limit,
+				// then we need to re-requery the rate limit to get the latest information
+				rateLimit, err := queryRateLimit(g.client, ctx)
+				if err != nil {
+					log.Errorf("Error querying GitHub API rate limit: %s", err)
+				}
+
+				log.Debugln(rateLimit)
+
+				if retry < client.MaxRetry {
+					log.Warningf("GitHub API rate limit exceeded. Retrying... (%d/%d)", retry+1, client.MaxRetry)
+					rateLimit.Pause(ctx)
+					return g.SearchTags(ctx, retry+1)
+				}
+				return nil, errors.New(ErrAPIRateLimitExceededFinalAttempt)
+			}
+			return nil, fmt.Errorf("querying GitHub API: %w", err)
+		}
+
+		log.Debugln(query.RateLimit)
+
+		expectedFound = query.Repository.Refs.TotalCount
+
+		for i := len(query.Repository.Refs.Edges) - 1; i >= 0; i-- {
+			tagCounter++
+			node := query.Repository.Refs.Edges[i]
+			tags = append(tags, node.Node.Name)
+		}
+
+		if !query.Repository.Refs.PageInfo.HasPreviousPage {
+			break
+		}
+		variables[keyBefore] = githubv4.NewString(githubv4.String(query.Repository.Refs.PageInfo.StartCursor))
+	}
+
+	if expectedFound != tagCounter {
+		return tags, fmt.Errorf("something went wrong, found %d, expected %d", tagCounter, expectedFound)
+	}
+
+	log.Debugf("%d tags found", len(tags))
+
+	return tags, err
+}

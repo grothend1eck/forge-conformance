@@ -1,0 +1,155 @@
+package toml
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/pathresolver"
+)
+
+func TestCondition(t *testing.T) {
+
+	testData := []struct {
+		name             string
+		spec             Spec
+		expectedResult   bool
+		expectedErrorMsg error
+		wantErr          bool
+	}{
+		{
+			name: "Deprecated - Default successful multiple update workflow",
+			spec: Spec{
+				File:     "testdata/data.toml",
+				Key:      ".employees.[*].role",
+				Multiple: true,
+			},
+			expectedResult: false,
+		},
+		{
+			name: "Default successful multiple update workflow",
+			spec: Spec{
+				File:  "testdata/data.toml",
+				Query: ".employees.[*].role",
+			},
+			expectedResult: false,
+		},
+		{
+			name: "Successful conditional multiple update workflow",
+			spec: Spec{
+				File:  "testdata/data.toml",
+				Query: ".employees.(address=AU).role",
+			},
+			expectedResult: false,
+		},
+		{
+			name: "Successful multiple map update workflow",
+			spec: Spec{
+				File:  "testdata/data.toml",
+				Query: ".benefits.[0].country.(country=UK).name",
+			},
+			expectedResult: false,
+		},
+		{
+			name: "Default scenario",
+			spec: Spec{
+				File:  "testdata/data.toml",
+				Key:   ".owner.firstName",
+				Value: "Jack",
+			},
+			expectedResult: true,
+		},
+		{
+			name: "Default successful workflow with empty result",
+			spec: Spec{
+				File:  "testdata/data.toml",
+				Key:   ".owner.surname",
+				Value: "",
+			},
+			expectedResult: true,
+		},
+		{
+			name: "Default scenario with Dasel v2",
+			spec: Spec{
+				File:   "testdata/data.toml",
+				Key:    ".owner.firstName",
+				Value:  "Jack",
+				Engine: strPtr(ENGINEDASEL_V2),
+			},
+			expectedResult: true,
+		},
+		{
+			name: "Default scenario with Dasel v3",
+			spec: Spec{
+				File:   "testdata/data.toml",
+				Key:    "owner.firstName",
+				Value:  "Jack",
+				Engine: strPtr(ENGINEDASEL_V3),
+			},
+			expectedResult: true,
+		},
+		{
+			name: "Nested array item with Dasel v3",
+			spec: Spec{
+				File:   "testdata/data.toml",
+				Key:    "servers.beta.role",
+				Value:  "backend",
+				Engine: strPtr(ENGINEDASEL_V3),
+			},
+			expectedResult: true,
+		},
+		{
+			name: "Mismatching value with Dasel v3",
+			spec: Spec{
+				File:   "testdata/data.toml",
+				Key:    "owner.firstName",
+				Value:  "NotJack",
+				Engine: strPtr(ENGINEDASEL_V3),
+			},
+			expectedResult: false,
+		},
+		{
+			name: "Test key do not exist",
+			spec: Spec{
+				File:  "testdata/data.toml",
+				Key:   ".doNotExist",
+				Value: "",
+			},
+			expectedResult:   false,
+			wantErr:          true,
+			expectedErrorMsg: errors.New("could not find value for query \".doNotExist\" from file \"testdata/data.toml\""),
+		},
+		{
+			name: "Test key do not exist",
+			spec: Spec{
+				File:  "testdata/data.toml",
+				Query: ".doNotExist.[*]",
+				Value: "",
+			},
+			expectedResult:   false,
+			wantErr:          true,
+			expectedErrorMsg: errors.New("could not find multiple value for query \".doNotExist.[*]\" from file \"testdata/data.toml\""),
+		},
+	}
+
+	for _, tt := range testData {
+
+		t.Run(tt.name, func(t *testing.T) {
+			toml, err := New(tt.spec)
+
+			require.NoError(t, err)
+
+			gotResult, _, gotErr := toml.Condition(context.Background(), "", nil, pathresolver.Resolver{})
+
+			if tt.wantErr {
+				assert.Equal(t, tt.expectedErrorMsg.Error(), gotErr.Error())
+			} else {
+				require.NoError(t, gotErr)
+			}
+
+			assert.Equal(t, tt.expectedResult, gotResult)
+		})
+	}
+}

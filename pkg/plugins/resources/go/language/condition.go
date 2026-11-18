@@ -1,0 +1,53 @@
+package language
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"github.com/updatecli/updatecli/pkg/core/pipeline/scm"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/age"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/pathresolver"
+)
+
+// Condition checks if a specific stable Golang version is published
+func (l *Language) Condition(ctx context.Context, source string, scm scm.ScmHandler, pathResolver pathresolver.Resolver) (pass bool, message string, err error) {
+	var versions []string
+
+	if scm != nil {
+		log.Debugln("scm is not supported")
+	}
+	versionToCheck := l.Spec.Version
+	if versionToCheck == "" {
+		versionToCheck = source
+	}
+	if len(versionToCheck) == 0 {
+		return false, "", fmt.Errorf("no version defined")
+	}
+
+	switch l.Spec.Age.IsZero() {
+	case true:
+		versions, err = l.versions(ctx)
+		if err != nil {
+			return false, "", fmt.Errorf("searching golang version: %w", err)
+		}
+	case false:
+		versions, err = l.getTagsFromRepository()
+		/*
+			A cooldown still running means the version may not be usable yet, which the loop
+			below already reports as an unmet condition, so it isn't surfaced as an error.
+		*/
+		if err != nil && !errors.Is(err, age.ErrNoVersionMatchingAge) {
+			return false, "", fmt.Errorf("searching golang version: %w", err)
+		}
+	}
+
+	for _, v := range versions {
+		if v == versionToCheck {
+			return true, fmt.Sprintf("Golang version %q available", versionToCheck), nil
+		}
+	}
+
+	return false, fmt.Sprintf("golang version %q doesn't exist", versionToCheck), nil
+}

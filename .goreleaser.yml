@@ -1,0 +1,324 @@
+---
+version: 2
+archives:
+  - name_template: >-
+      {{ .ProjectName }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+    format_overrides:
+      - goos: windows
+        format: zip
+    files:
+      - README.md
+      - LICENSE
+      - completions/*
+      - manpages/*
+
+aurs:
+  - homepage: https://www.updatecli.io
+    # "auto" skips the upload when the tag carries a prerelease identifier, so a
+    # release candidate never reaches the AUR.
+    skip_upload: "auto"
+    description: "A declarative update policy engine."
+    maintainers:
+      - "Olivier Vernin <olivier at vernin dot me>"
+      - "Jonathan Neidel <aur at jneidel dot com>"
+    license: "Apache"
+    private_key: "{{ .Env.AUR_KEY }}"
+    git_url: "ssh://aur@aur.archlinux.org/updatecli-bin.git"
+    package: |-
+      # bin
+      install -Dm755 "./updatecli" "${pkgdir}/usr/bin/updatecli"
+      # license
+      install -Dm644 "./LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+      # completions
+      install -Dm644 "./completions/updatecli.bash" "${pkgdir}/usr/share/bash-completion/completions/updatecli"
+      install -Dm644 "./completions/updatecli.zsh" "${pkgdir}/usr/share/zsh/site-functions/_updatecli"
+      install -Dm644 "./completions/updatecli.fish" "${pkgdir}/usr/share/fish/vendor_completions.d/updatecli.fish"
+      # man pages
+      install -Dm644 "./manpages/updatecli.1.gz" "${pkgdir}/usr/share/man/man1/updatecli.1.gz"
+
+before:
+  hooks:
+    - go mod tidy
+    - go mod download
+    - ./scripts/completions.sh
+    - ./scripts/manpages.sh
+
+brews:
+  - name: updatecli
+    # "auto" skips the upload when the tag carries a prerelease identifier, so a
+    # release candidate never reaches the Homebrew tap.
+    skip_upload: "auto"
+    directory: Formula
+    repository:
+      owner: updatecli
+      name: homebrew-updatecli
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    commit_msg_template: "Brew formula update for {{ .ProjectName }} version {{ .Tag }}"
+    homepage: "https://updatecli.io/"
+    description: "A declarative update policy engine."
+    license: "Apache-2.0"
+    test: |
+      system "#{bin}/updatecli version"
+    install: |-
+      bin.install "updatecli"
+      bash_completion.install "completions/updatecli.bash" => "updatecli"
+      zsh_completion.install "completions/updatecli.zsh" => "_updatecli"
+      fish_completion.install "completions/updatecli.fish"
+      man1.install "manpages/updatecli.1.gz"
+
+builds:
+  - id: updatecli
+    env:
+      - CGO_ENABLED=0
+    main: ./main.go
+    binary: updatecli
+    ldflags:
+      - -w -s
+      - -X "github.com/updatecli/updatecli/pkg/core/version.BuildTime={{.Date}}"
+      - -X "github.com/updatecli/updatecli/pkg/core/version.GoVersion={{.Env.GOVERSION}}"
+      - -X "github.com/updatecli/updatecli/pkg/core/version.Version={{ .Version }}"
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+      - arm
+    ignore:
+      - goos: windows
+        goarch: arm
+
+changelog:
+  ## Delegate Changelog to release-drafter
+  disable: true
+
+checksum:
+  name_template: "checksums.txt"
+
+dockers:
+  #
+  # Build the main images
+  #
+  - image_templates:
+      - "updatecli/updatecli:{{ .Tag }}-amd64"
+      - "ghcr.io/updatecli/updatecli:{{ .Tag }}-amd64"
+    dockerfile: docker/Dockerfile
+    use: buildx
+    build_flag_templates:
+      - "--pull"
+      - "--no-cache"
+      - "--label=org.opencontainers.image.created={{.Date}}"
+      - "--label=org.opencontainers.image.name={{.ProjectName}}"
+      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
+      - "--label=org.opencontainers.image.version={{.Version}}"
+      - "--label=org.opencontainers.image.source={{.GitURL}}"
+      - "--platform=linux/amd64"
+    goos: linux
+    goarch: amd64
+    extra_files:
+      - Makefile
+  - image_templates:
+      - "updatecli/updatecli:{{ .Tag }}-arm64"
+      - "ghcr.io/updatecli/updatecli:{{ .Tag }}-arm64"
+    dockerfile: docker/Dockerfile
+    use: buildx
+    build_flag_templates:
+      - "--pull"
+      - "--no-cache"
+      - "--label=org.opencontainers.image.created={{.Date}}"
+      - "--label=org.opencontainers.image.name={{.ProjectName}}"
+      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
+      - "--label=org.opencontainers.image.version={{.Version}}"
+      - "--label=org.opencontainers.image.source={{.GitURL}}"
+      - "--platform=linux/arm64"
+    goos: linux
+    goarch: arm64
+    extra_files:
+      - Makefile
+  #
+  # Build the slim images
+  #
+  - image_templates:
+      - "updatecli/updatecli:{{ .Tag }}-slim-amd64"
+      - "ghcr.io/updatecli/updatecli:{{ .Tag }}-slim-amd64"
+    dockerfile: docker/Dockerfile.slim
+    use: buildx
+    build_flag_templates:
+      - "--pull"
+      - "--no-cache"
+      - "--label=org.opencontainers.image.created={{.Date}}"
+      - "--label=org.opencontainers.image.name={{.ProjectName}}"
+      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
+      - "--label=org.opencontainers.image.version={{.Version}}"
+      - "--label=org.opencontainers.image.source={{.GitURL}}"
+      - "--platform=linux/amd64"
+    goos: linux
+    goarch: amd64
+    extra_files:
+      - Makefile
+  - image_templates:
+      - "updatecli/updatecli:{{ .Tag }}-slim-arm64"
+      - "ghcr.io/updatecli/updatecli:{{ .Tag }}-slim-arm64"
+    dockerfile: docker/Dockerfile.slim
+    use: buildx
+    build_flag_templates:
+      - "--pull"
+      - "--no-cache"
+      - "--label=org.opencontainers.image.created={{.Date}}"
+      - "--label=org.opencontainers.image.name={{.ProjectName}}"
+      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
+      - "--label=org.opencontainers.image.version={{.Version}}"
+      - "--label=org.opencontainers.image.source={{.GitURL}}"
+      - "--platform=linux/arm64"
+    goos: linux
+    goarch: arm64
+    extra_files:
+      - Makefile
+
+docker_signs:
+  - cmd: cosign
+    artifacts: manifests
+    output: true
+    args:
+      - "sign"
+      - "--yes"
+      - "${artifact}@${digest}"
+
+docker_manifests:
+  #
+  # Build the main images
+  #
+  - name_template: "updatecli/updatecli:{{ .Tag }}"
+    image_templates:
+      - "updatecli/updatecli:{{ .Tag }}-amd64"
+      - "updatecli/updatecli:{{ .Tag }}-arm64"
+  - name_template: "ghcr.io/updatecli/updatecli:{{ .Tag }}"
+    image_templates:
+      - "ghcr.io/updatecli/updatecli:{{ .Tag }}-amd64"
+      - "ghcr.io/updatecli/updatecli:{{ .Tag }}-arm64"
+  - name_template: "updatecli/updatecli:latest"
+    # "auto" keeps this floating tag pointing at the last non-prerelease.
+    skip_push: "auto"
+    image_templates:
+      - "updatecli/updatecli:{{ .Tag }}-amd64"
+      - "updatecli/updatecli:{{ .Tag }}-arm64"
+  - name_template: "ghcr.io/updatecli/updatecli:latest"
+    # "auto" keeps this floating tag pointing at the last non-prerelease.
+    skip_push: "auto"
+    image_templates:
+      - "ghcr.io/updatecli/updatecli:{{ .Tag }}-amd64"
+      - "ghcr.io/updatecli/updatecli:{{ .Tag }}-arm64"
+  #
+  # Build the slim images
+  #
+  - name_template: "updatecli/updatecli:{{ .Tag }}-slim"
+    image_templates:
+      - "updatecli/updatecli:{{ .Tag }}-slim-amd64"
+      - "updatecli/updatecli:{{ .Tag }}-slim-arm64"
+  - name_template: "ghcr.io/updatecli/updatecli:{{ .Tag }}-slim"
+    image_templates:
+      - "ghcr.io/updatecli/updatecli:{{ .Tag }}-slim-amd64"
+      - "ghcr.io/updatecli/updatecli:{{ .Tag }}-slim-arm64"
+  - name_template: "updatecli/updatecli:latest-slim"
+    # "auto" keeps this floating tag pointing at the last non-prerelease.
+    skip_push: "auto"
+    image_templates:
+      - "updatecli/updatecli:{{ .Tag }}-slim-amd64"
+      - "updatecli/updatecli:{{ .Tag }}-slim-arm64"
+  - name_template: "ghcr.io/updatecli/updatecli:latest-slim"
+    # "auto" keeps this floating tag pointing at the last non-prerelease.
+    skip_push: "auto"
+    image_templates:
+      - "ghcr.io/updatecli/updatecli:{{ .Tag }}-slim-amd64"
+      - "ghcr.io/updatecli/updatecli:{{ .Tag }}-slim-arm64"
+
+env:
+  - GO111MODULE=on
+  - CGO_ENABLED=0
+
+nfpms:
+  - file_name_template: "{{ .ProjectName }}_{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}"
+    homepage: "https://www.updatecli.io"
+    description: "A declarative update policy engine."
+    maintainer: "Olivier Vernin <olivier@vernin.me>"
+    license: "Apache-2.0"
+    vendor: Updatecli
+    section: utils
+    formats:
+      - apk
+      - deb
+      - rpm
+    dependencies:
+      - ca-certificates
+    contents:
+      - src: ./completions/updatecli.bash
+        dst: /usr/share/bash-completion/completions/updatecli
+        file_info:
+          mode: 0644
+      - src: ./completions/updatecli.fish
+        dst: /usr/share/fish/vendor_completions.d/updatecli.fish
+        file_info:
+          mode: 0644
+      - src: ./completions/updatecli.zsh
+        dst: /usr/share/zsh/vendor-completions/_updatecli
+        file_info:
+          mode: 0644
+      - src: ./manpages/updatecli.1.gz
+        dst: /usr/share/man/man1/updatecli.1.gz
+        file_info:
+          mode: 0644
+      - src: ./LICENSE
+        dst: /usr/share/doc/updatecli/copyright
+        file_info:
+          mode: 0644
+
+release:
+  # "auto" marks the GitHub release as a prerelease when the tag carries a
+  # semver prerelease identifier, for instance v1.0.0-rc.1. GitHub never
+  # resolves a prerelease as "latest".
+  prerelease: auto
+  # The changelog is delegated to release-drafter, so this header is the only
+  # body a release candidate gets. It renders empty for a final release.
+  header: |
+    {{ if .Prerelease }}> [!WARNING]
+    > `{{ .Tag }}` is a release candidate, published for testing.
+    > It is not covered by the stability guarantees described in COMPATIBILITY.md.
+    {{ end }}
+
+snapshot:
+  name_template: "{{ .Tag }}-next"
+
+sboms:
+  - artifacts: archive
+
+signs:
+  - cmd: cosign
+    signature: "${artifact}.sig"
+    output: true
+    artifacts: checksum
+    args:
+      - sign-blob
+      - "--bundle=${signature}"
+      - "--yes"
+      - "${artifact}"
+
+announce:
+  bluesky:
+    enabled: true
+    username: "bsky@updatecli.io"
+    message_template: "#updatecli {{ .Tag }} is out! Check it out: https://github.com/updatecli/updatecli/releases/tag/{{ .Tag }}"
+
+  mastodon:
+    enabled: true
+    server: https://fosstodon.org
+    message_template: "#updatecli {{ .Tag }} is out! Check it out: https://github.com/updatecli/updatecli/releases/tag/{{ .Tag }}"
+
+  opencollective:
+    enabled: true
+    slug: "updatecli"
+    title_template: "Release of {{ .Tag }}"

@@ -1,0 +1,41 @@
+package release
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"github.com/updatecli/updatecli/pkg/core/pipeline/scm"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/age"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/pathresolver"
+)
+
+func (g *Gitlab) Condition(_ context.Context, source string, scm scm.ScmHandler, pathResolver pathresolver.Resolver) (pass bool, message string, err error) {
+	if scm != nil {
+		log.Warningf("Condition not supported for the plugin GitLab release")
+	}
+
+	// A condition checks whether a specific release exists, so the age filter, which
+	// only narrows down which release to pick, doesn't apply here.
+	releases, err := g.SearchReleases(age.Spec{})
+	if err != nil {
+		return false, "", fmt.Errorf("looking for GitLab release: %w", err)
+	}
+
+	if len(releases) == 0 {
+		return false, "no GitLab release found", nil
+	}
+
+	release := source
+	if g.spec.Tag != "" {
+		release = g.spec.Tag
+	}
+	for _, r := range releases {
+		if r == release {
+
+			return true, fmt.Sprintf("GitLab release tag %q found", release), nil
+		}
+	}
+
+	return false, fmt.Sprintf("no GitLab release tag found matching pattern %q of kind %q", g.versionFilter.Pattern, g.versionFilter.Kind), nil
+}

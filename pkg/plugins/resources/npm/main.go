@@ -1,0 +1,538 @@
+package npm
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httputil"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"github.com/updatecli/updatecli/pkg/core/httpclient"
+
+	"gopkg.in/ini.v1"
+
+	"github.com/go-viper/mapstructure/v2"
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/age"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/redact"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/version"
+)
+
+/*
+"npm" defines the specification for retrieving npm package versions.
+It can be used as a "source" or a "condition".
+*/
+type Spec struct {
+	// "name" defines the npm package name.
+	//
+	// compatible:
+	//   * source
+	//   * condition
+	//
+	// remark:
+	//   * "name" is required.
+	//
+	// example:
+	//   * name: axios
+	//   * name: "@updatecli/example"
+	//
+	Name string `yaml:",omitempty"`
+	// "version" defines the package version to check.
+	//
+	// compatible:
+	//   * condition
+	//
+	// default:
+	//   the output of the associated source.
+	//
+	Version string `yaml:",omitempty"`
+	// "url" defines the npm registry url.
+	//
+	// compatible:
+	//   * source
+	//   * condition
+	//
+	// default:
+	//   https://registry.npmjs.org/
+	//
+	// remark:
+	//   * a scoped package uses the registry that the .npmrc file sets for its scope, if any.
+	//
+	URL string `yaml:",omitempty"`
+	// "registrytoken" defines the token used to authenticate with the registry set by "url".
+	//
+	// compatible:
+	//   * source
+	//   * condition
+	//
+	RegistryToken string `yaml:",omitempty"`
+	// "versionfilter" defines the version pattern and its kind, such as "regex", "semver" or "latest".
+	//
+	// compatible:
+	//   * source
+	//
+	// default:
+	//   latest
+	//
+	// remark:
+	//   * with the kind "latest", the version is the "latest" dist-tag of the package.
+	//
+	VersionFilter version.Filter `yaml:",omitempty"`
+	// "npmrcpath" defines the path of the .npmrc file.
+	//
+	// compatible:
+	//   * source
+	//   * condition
+	//
+	// default:
+	//   $HOME/.npmrc
+	//
+	// remark:
+	//   * the default is also used when the file does not exist.
+	//   * registry tokens and scoped registries are read from this file.
+	//
+	NpmrcPath string `yaml:"npmrcpath,omitempty"`
+	// "age" defines the minimum or maximum age a release must have to be considered.
+	//
+	// compatible:
+	//   * source
+	//   * condition
+	//
+	// remark:
+	//   * the release dates are read from the "time" object returned by the npm registry,
+	//     so no extra API call is needed. Versions without a release date are ignored.
+	//   * when "age" is combined with a "latest" versionfilter and the "latest" dist-tag is
+	//     too recent, Updatecli falls back to the most recently published non prerelease
+	//     version matching the age window, which may not be the highest semantic version.
+	//     Combine "age" with a "semver" versionfilter to control ordering.
+	//   * a source is skipped, not failed, when no version matches the age window yet.
+	//
+	// example:
+	//   * age:
+	//       minimum: 7d
+	//
+	Age age.Spec `yaml:",omitempty"`
+}
+
+type distTags struct {
+	Latest string
+	Next   string
+}
+
+type versions struct {
+	Name    string
+	Version string
+	// Deprecated can either be a boolean set to false
+	// or a string with a deprecating message
+	Deprecated interface{}
+}
+
+type Data struct {
+	orderedVersions []string
+	Versions        map[string]versions `json:"versions,omitempty"`
+	DistTags        distTags            `json:"dist-tags,omitempty"`
+	Repository      Repository
+	// Time maps every published version to its release date, as reported by the
+	// npm registry. It also contains the non version keys "created" and "modified".
+	// Dates are kept as raw strings so that a single malformed value doesn't fail
+	// the whole packument decoding.
+	Time map[string]string `json:"time,omitempty"`
+}
+
+type Repository struct {
+	Type string `json:"type,omitempty"`
+	URL  string `json:"url,omitempty"`
+}
+
+// githubHost is the host of the default npm repository shorthand.
+const githubHost = "github.com"
+
+// repositoryShorthandHosts maps the npm repository shorthand prefixes to their host.
+var repositoryShorthandHosts = map[string]string{
+	"github":    githubHost,
+	"gitlab":    "gitlab.com",
+	"bitbucket": "bitbucket.org",
+}
+
+// UnmarshalJSON accepts the two forms that a packument uses for "repository":
+// the object holding "type" and "url", and the string shorthand such as
+// "github:owner/repo" or "owner/repo".
+func (r *Repository) UnmarshalJSON(data []byte) error {
+	var shorthand string
+	if err := json.Unmarshal(data, &shorthand); err == nil {
+		*r = Repository{Type: "git", URL: repositoryShorthandURL(shorthand)}
+		return nil
+	}
+
+	type repository Repository
+	var object repository
+	if err := json.Unmarshal(data, &object); err != nil {
+		return err
+	}
+
+	*r = Repository(object)
+
+	return nil
+}
+
+// repositoryShorthandURL expands an npm shorthand into the git URL that the object
+// form carries, and returns the input untouched when it is not a known shorthand.
+func repositoryShorthandURL(shorthand string) string {
+	host := githubHost
+	path := shorthand
+
+	if prefix, remainder, found := strings.Cut(shorthand, ":"); found {
+		knownHost, ok := repositoryShorthandHosts[prefix]
+		if !ok {
+			return shorthand
+		}
+		host, path = knownHost, remainder
+	}
+
+	if strings.Count(path, "/") != 1 {
+		return shorthand
+	}
+
+	return fmt.Sprintf("git+https://%s/%s.git", host, path)
+}
+
+// Npm defines a resource of kind "npm"
+type Npm struct {
+	spec          Spec
+	versionFilter version.Filter // Holds the "valid" version.filter, that might be different than the user-specified filter (Spec.VersionFilter)
+	foundVersion  version.Version
+	data          Data
+	webClient     httpclient.HTTPClient
+	rcConfig      RcConfig
+}
+
+const (
+	// URL of the default Npm api data
+	npmDefaultApiURL string = "https://registry.npmjs.org/"
+)
+
+// New returns a new valid Npm package object.
+func New(spec interface{}) (*Npm, error) {
+	var newSpec Spec
+
+	err := mapstructure.Decode(spec, &newSpec)
+	if err != nil {
+		return &Npm{}, err
+	}
+
+	// parse the .npmrc files
+	rcConfig, err := getNpmrcConfig(newSpec.NpmrcPath, newSpec.URL, newSpec.RegistryToken)
+	if err != nil {
+		return &Npm{}, err
+	}
+
+	err = newSpec.Validate()
+	if err != nil {
+		return &Npm{}, err
+	}
+
+	newFilter, err := newSpec.VersionFilter.Init()
+	if err != nil {
+		return &Npm{}, err
+	}
+
+	if err := newSpec.Age.Validate(); err != nil {
+		return &Npm{}, fmt.Errorf("wrong age spec %v", err)
+	}
+
+	return &Npm{
+		spec:          newSpec,
+		versionFilter: newFilter,
+		rcConfig:      rcConfig,
+		webClient:     httpclient.NewRetryClient(),
+	}, nil
+}
+
+// Validate run some validation on the Npm struct
+func (s *Spec) Validate() (err error) {
+	if len(s.Name) == 0 {
+		log.Errorf("npm package name not defined")
+		return errors.New("npm package name not defined")
+	}
+	return nil
+}
+
+type Registry struct {
+	AuthToken string
+	Url       string
+}
+
+type RcConfig struct {
+	Registries map[string]Registry
+	Scopes     map[string]string
+}
+
+func defaultNpmConfig(defaultUrl string, defaultToken string) RcConfig {
+	var config RcConfig
+	config.Registries = make(map[string]Registry)
+	var url string
+	if defaultUrl == "" {
+		url = npmDefaultApiURL
+	} else {
+		url = defaultUrl
+	}
+	config.Registries["default"] = Registry{
+		Url:       url,
+		AuthToken: defaultToken,
+	}
+	config.Scopes = make(map[string]string)
+	return config
+}
+
+func fileExists(path string) bool {
+	// The path comes from the manifest or HOME, both controlled by the user running Updatecli.
+	_, err := os.Stat(filepath.Clean(path)) //nolint:gosec // G703
+	return !os.IsNotExist(err)
+}
+
+func getNpmrcConfig(path string, defaultUrl string, defaultToken string) (RcConfig, error) {
+	config := defaultNpmConfig(defaultUrl, defaultToken)
+	if path == "" || !fileExists(path) {
+		path = fmt.Sprintf("%s/.npmrc", os.Getenv("HOME"))
+	}
+	if !fileExists(path) {
+		return config, nil
+	}
+
+	cfg, err := ini.Load(path)
+	if err != nil {
+		return config, err
+	}
+	for _, section := range cfg.Section("").Keys() {
+		sectionName := section.Name()
+		if strings.HasPrefix(sectionName, "//") {
+			// Registry section
+			authTokenValue := strings.Split(section.Value(), "_authToken=")
+			if len(authTokenValue) == 2 {
+				config.Registries[sectionName[2:]] = Registry{
+					AuthToken: authTokenValue[1],
+					Url:       fmt.Sprintf("https:%s", sectionName),
+				}
+			}
+		} else if strings.HasPrefix(sectionName, "@") {
+			// Scope section
+			registryValue := strings.Split(section.Value(), "registry=https://")
+			if len(registryValue) == 2 {
+				config.Scopes[sectionName] = registryValue[1]
+			}
+		}
+
+	}
+	return config, nil
+}
+
+// GetVersions fetch all versions of the Npm package
+func (n *Npm) getVersions(ctx context.Context) (v string, versions []string, err error) {
+	n.data, err = n.getPackageData(ctx, n.spec.Name)
+
+	if err != nil {
+		return "", nil, err
+	}
+
+	publishedVersions := []string{}
+	for _, value := range n.data.Versions {
+		publishedVersions = append(publishedVersions, value.Version)
+	}
+
+	// Discard the versions published outside of the age window, if any is defined.
+	versions = filterVersionsByAge(publishedVersions, n.data.Time, n.spec.Age)
+
+	// dated holds the published versions whose release date is known, when an age filter is defined
+	var dated []string
+	if !n.spec.Age.IsZero() {
+		dated = datedVersions(publishedVersions, n.data.Time)
+		sort.Strings(dated)
+	}
+
+	/*
+		A registry reporting no release date for any version can't apply the age filter, which
+		discarded every version. Like a cooldown, it skips rather than fails, as the npm
+		autodiscovery sets a minimum age by default.
+	*/
+	if !n.spec.Age.IsZero() && len(publishedVersions) > 0 && len(versions) == 0 && len(dated) == 0 {
+		return "", versions, fmt.Errorf("%w for the npm package %q: the registry reports no release date", age.ErrNoVersionMatchingAge, n.spec.Name)
+	}
+
+	if n.versionFilter.Kind == version.LATESTVERSIONKIND {
+		if n.spec.Age.IsZero() {
+			return n.data.DistTags.Latest, versions, nil
+		}
+
+		latestVersion := latestVersionMatchingAge(n.data.DistTags.Latest, n.data.orderedVersions, versions)
+		if latestVersion == "" {
+			return "", versions, fmt.Errorf("%w for the npm package %q", age.ErrNoVersionMatchingAge, n.spec.Name)
+		}
+
+		return latestVersion, versions, nil
+	}
+
+	sort.Strings(versions)
+	/*
+		Every version matching the filter may still be cooling down, which reports an age
+		hold rather than a lookup failure, so callers are expected to skip rather than to
+		fail. A filter matching no published version still fails.
+	*/
+	n.foundVersion, err = age.Search(&n.versionFilter, dated, versions)
+	if err != nil {
+		if errors.Is(err, age.ErrNoVersionMatchingAge) {
+			return "", versions, fmt.Errorf("%w for the npm package %q", err, n.spec.Name)
+		}
+
+		// While no version passes the age filter, a version the filter matches may only lack a
+		// release date, which the age filter can't check
+		if !n.spec.Age.IsZero() && len(versions) == 0 && age.MatchesUndated(&n.versionFilter, publishedVersions, dated) {
+			return "", versions, fmt.Errorf("%w for the npm package %q: the registry reports no release date for the versions matching %q", age.ErrNoVersionMatchingAge, n.spec.Name, n.versionFilter.Pattern)
+		}
+		return "", nil, err
+	}
+
+	return n.foundVersion.GetVersion(), versions, nil
+}
+
+// Get package data from Json API
+func (n *Npm) getPackageData(ctx context.Context, packageName string) (Data, error) {
+	var d Data
+	var registry Registry
+	// We need to find the registry URL to use for the package
+	if strings.HasPrefix(packageName, "@") {
+		// Scoped package
+		if scope, ok := n.rcConfig.Scopes[packageName[:strings.Index(packageName, "/")]]; ok {
+			// We found a scope registry for the package
+			registry = n.rcConfig.Registries[scope]
+		} else {
+			// We didn't find a scope for the package, we use the default registry
+			registry = n.rcConfig.Registries["default"]
+		}
+	} else {
+		// Not a scoped package, using default registry
+		registry = n.rcConfig.Registries["default"]
+	}
+
+	URL := fmt.Sprintf("%s%s", registry.Url, packageName)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", URL, nil)
+	if err != nil {
+		log.Errorf("something went wrong while getting npm api data %q\n", err)
+	}
+
+	if registry.AuthToken != "" {
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", registry.AuthToken))
+	}
+
+	res, err := n.webClient.Do(req)
+	if err != nil {
+		log.Errorf("something went wrong while getting npm api data %q\n", err)
+		return Data{}, err
+	}
+
+	defer res.Body.Close()
+	if res.StatusCode >= 400 {
+		body, err := httputil.DumpResponse(res, false)
+		log.Errorf("something went wrong while getting npm api data %q\n", URL)
+		log.Errorf("Error %q\n", err)
+		log.Debugf("\n%v\n", string(body))
+		return Data{}, err
+	}
+
+	data, err := io.ReadAll(res.Body)
+	if err != nil {
+		log.Errorf("something went wrong while getting npm api data%q\n", err)
+		return Data{}, err
+	}
+
+	err = json.Unmarshal(data, &d)
+	if err != nil {
+		log.Errorf("error unmarshalling json: %q", err)
+		return Data{}, err
+	}
+
+	orderedVersion, err := getOrderedVersions(data)
+	if err != nil {
+		return Data{}, fmt.Errorf("error getting ordered versions: %q", err)
+	}
+
+	if len(orderedVersion) > 0 {
+		d.orderedVersions = orderedVersion
+	}
+
+	return d, nil
+}
+
+func getOrderedVersions(data []byte) ([]string, error) {
+	var rawStruct struct {
+		Versions json.RawMessage `json:"versions"`
+	}
+
+	var orderedVersions []string
+
+	err := json.Unmarshal(data, &rawStruct)
+	if err != nil {
+		return nil, fmt.Errorf("error unmarshalling json: %q", err)
+	}
+
+	// Now, use a json.Decoder to extract ordered keys from "versions"
+	decoder := json.NewDecoder(strings.NewReader(string(rawStruct.Versions)))
+
+	// Read the opening '{' of the "versions" object
+	_, err = decoder.Token()
+	if err != nil {
+		return nil, fmt.Errorf("error decoding json: %q", err)
+	}
+
+	// Read version keys in order
+	for decoder.More() {
+		// Read key
+		t, err := decoder.Token()
+		if err != nil {
+			return nil, err
+		}
+
+		// If we encounter '}', the object has ended
+		if t == json.Delim('}') {
+			break
+		}
+
+		// Ensure it's a string (version key)
+		versionKey, ok := t.(string)
+		if !ok {
+			return nil, fmt.Errorf("error decoding json: expected string key but got: %T", t)
+		}
+
+		// Store the key in order
+		orderedVersions = append(orderedVersions, versionKey)
+
+		// Skip the value (we don't need it)
+		var value json.RawMessage
+		err = decoder.Decode(&value)
+		if err != nil {
+			return nil, fmt.Errorf("error decoding json: %q", err)
+		}
+	}
+
+	return orderedVersions, nil
+
+}
+
+// ReportConfig returns a new configuration object with only the necessary fields
+// to identify the resource without any sensitive information or context specific data.
+func (n *Npm) ReportConfig() interface{} {
+	return Spec{
+		Name:          n.spec.Name,
+		Version:       n.spec.Version,
+		URL:           redact.URL(n.spec.URL),
+		VersionFilter: n.spec.VersionFilter,
+		NpmrcPath:     n.spec.NpmrcPath,
+		Age:           n.spec.Age,
+	}
+}

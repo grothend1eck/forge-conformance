@@ -1,0 +1,861 @@
+package yaml
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/updatecli/updatecli/pkg/core/pipeline/scm"
+	"github.com/updatecli/updatecli/pkg/core/text"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/pathresolver"
+)
+
+func ptrInt(i int) *int {
+	return &i
+}
+
+func Test_Condition(t *testing.T) {
+	tests := []struct {
+		name             string
+		spec             Spec
+		files            map[string]file
+		inputSourceValue string
+		mockedContents   map[string]string
+		mockedError      error
+		isResultWanted   bool
+		isErrorWanted    bool
+	}{
+		{
+			name: "yamlpath Passing Case with multiple document",
+			spec: Spec{
+				File:   "data.yaml",
+				Key:    "$.name",
+				Engine: "yamlpath",
+			},
+			files: map[string]file{
+				"data.yaml": {
+					originalFilePath: "data.yaml",
+					filePath:         "data.yaml",
+				},
+			},
+			inputSourceValue: "John",
+			mockedContents: map[string]string{
+				"data.yaml": `---
+name: John
+age: 30
+---
+name: Doe
+age: 25
+`,
+			},
+			isResultWanted: false,
+		},
+		{
+			name: "yamlpath Passing Case with multiple document",
+			spec: Spec{
+				File:          "data.yaml",
+				Key:           "$.name",
+				Engine:        "yamlpath",
+				DocumentIndex: ptrInt(1),
+			},
+			files: map[string]file{
+				"data.yaml": {
+					originalFilePath: "data.yaml",
+					filePath:         "data.yaml",
+				},
+			},
+			inputSourceValue: "Doe",
+			mockedContents: map[string]string{
+				"data.yaml": `---
+name: John
+age: 30
+---
+name: Doe
+age: 25
+`,
+			},
+			isResultWanted: true,
+		},
+		{
+			name: "Passing Case with multiple document",
+			spec: Spec{
+				File:          "data.yaml",
+				Key:           "$.name",
+				Engine:        "go-yaml",
+				DocumentIndex: ptrInt(1),
+			},
+			files: map[string]file{
+				"data.yaml": {
+					originalFilePath: "data.yaml",
+					filePath:         "data.yaml",
+				},
+			},
+			inputSourceValue: "Doe",
+			mockedContents: map[string]string{
+				"data.yaml": `---
+name: John
+age: 30
+---
+name: Doe
+age: 25
+`,
+			},
+			isResultWanted: true,
+		},
+		{
+			name: "Passing Case with complex key",
+			spec: Spec{
+				File:   "test.yaml",
+				Key:    "$.annotations['github.owner']",
+				Engine: "yamlpath",
+			},
+			files: map[string]file{
+				"test.yaml": {
+					originalFilePath: "test.yaml",
+					filePath:         "test.yaml",
+				},
+			},
+			inputSourceValue: "olblak",
+			mockedContents: map[string]string{
+				"test.yaml": `---
+annotations:
+  github.owner: olblak
+  repository: charts
+`,
+			},
+			isResultWanted: true,
+		},
+		{
+			name: "Passing Case",
+			spec: Spec{
+				File: "test.yaml",
+				Key:  "$.github.owner",
+			},
+			files: map[string]file{
+				"test.yaml": {
+					originalFilePath: "test.yaml",
+					filePath:         "test.yaml",
+				},
+			},
+			inputSourceValue: "olblak",
+			mockedContents: map[string]string{
+				"test.yaml": `---
+github:
+  owner: olblak
+  repository: charts
+`,
+			},
+			isResultWanted: true,
+		},
+		{
+			name: "Passing Case with quoted version string",
+			spec: Spec{
+				File: "test.yaml",
+				Key:  "$.version",
+			},
+			files: map[string]file{
+				"test.yaml": {
+					originalFilePath: "test.yaml",
+					filePath:         "test.yaml",
+				},
+			},
+			inputSourceValue: "4.3.1",
+			mockedContents: map[string]string{
+				"test.yaml": `---
+version: "4.3.1"
+`,
+			},
+			isResultWanted: true,
+		},
+		{
+			name: "Passing Case using yamlpath engine",
+			spec: Spec{
+				File:   "test.yaml",
+				Key:    "$.github.owner",
+				Engine: "yamlpath",
+			},
+			files: map[string]file{
+				"test.yaml": {
+					originalFilePath: "test.yaml",
+					filePath:         "test.yaml",
+				},
+			},
+			inputSourceValue: "olblak",
+			mockedContents: map[string]string{
+				"test.yaml": `---
+github:
+  owner: olblak
+  repository: charts
+`,
+			},
+			isResultWanted: true,
+		},
+		{
+			name: "Passing case with one 'Files' no input source and only specified value",
+			spec: Spec{
+				Files: []string{
+					"test.yaml",
+				},
+				Key:   "$.github.owner",
+				Value: "olblak",
+			},
+			files: map[string]file{
+				"test.yaml": {
+					originalFilePath: "test.yaml",
+					filePath:         "test.yaml",
+				},
+			},
+			mockedContents: map[string]string{
+				"test.yaml": `---
+github:
+  owner: olblak
+  repository: charts
+`,
+			},
+			isResultWanted: true,
+		},
+		{
+			name: "Passing case with one 'Files' no input source and only specified value using yamlpath engine",
+			spec: Spec{
+				Files: []string{
+					"test.yaml",
+				},
+				Key:    "$.github.owner",
+				Value:  "olblak",
+				Engine: "yamlpath",
+			},
+			files: map[string]file{
+				"test.yaml": {
+					originalFilePath: "test.yaml",
+					filePath:         "test.yaml",
+				},
+			},
+			mockedContents: map[string]string{
+				"test.yaml": `---
+github:
+  owner: olblak
+  repository: charts
+`,
+			},
+			isResultWanted: true,
+		},
+		{
+			name: "Validation with more than one 'Files'",
+			spec: Spec{
+				Files: []string{
+					"test.yaml",
+					"too-much.yaml",
+				},
+				Key:   "$.github.owner",
+				Value: "olblak",
+			},
+			files: map[string]file{
+				"test.yaml": {
+					filePath:         "test.yaml",
+					originalFilePath: "test.yaml",
+				},
+				"too-much.yaml": {
+					filePath:         "too-much.yaml",
+					originalFilePath: "too-much.yaml",
+				},
+			},
+			mockedContents: map[string]string{
+				"test.yaml": `---
+github:
+  owner: olblak
+  repository: charts
+`,
+				"too-much.yaml": `---
+github:
+  owner: olblak
+  repository: charts
+`,
+			},
+			isErrorWanted:  false,
+			isResultWanted: true,
+		},
+		{
+			name: "Validation with more than one 'Files' but only one success",
+			spec: Spec{
+				Files: []string{
+					"test.yaml",
+					"too-much.yaml",
+				},
+				Key:   "$.github.owner",
+				Value: "olblak",
+			},
+			files: map[string]file{
+				"test.yaml": {
+					filePath:         "test.yaml",
+					originalFilePath: "test.yaml",
+				},
+				"too-much.yaml": {
+					filePath:         "too-much.yaml",
+					originalFilePath: "too-much.yaml",
+				},
+			},
+			mockedContents: map[string]string{
+				"test.yaml": `---
+github:
+  owner: olblak
+  repository: charts
+`,
+				"too-much.yaml": `---
+github:
+  owner: john
+  repository: charts
+`,
+			},
+			isErrorWanted:  false,
+			isResultWanted: false,
+		},
+		{
+			name: "Validation with more than one 'Files' but only one success 2",
+			spec: Spec{
+				Files: []string{
+					"test.yaml",
+					"too-much.yaml",
+				},
+				Key:   "$.github.owner",
+				Value: "olblak",
+			},
+			files: map[string]file{
+				"test.yaml": {
+					filePath:         "test.yaml",
+					originalFilePath: "test.yaml",
+				},
+				"too-much.yaml": {
+					filePath:         "too-much.yaml",
+					originalFilePath: "too-much.yaml",
+				},
+			},
+			mockedContents: map[string]string{
+				"test.yaml": `---
+github:
+  owner: olblak
+  repository: charts
+`,
+				"too-much.yaml": `---
+github:
+  repository: charts
+`,
+			},
+			isErrorWanted:  true,
+			isResultWanted: false,
+		},
+		{
+			name: "Failing case with invalid YAML content (dash)",
+			spec: Spec{
+				Files: []string{
+					"test.yaml",
+				},
+				Key:   "$.github.owner",
+				Value: "olblak",
+			},
+			files: map[string]file{
+				"test.yaml": {
+					filePath:         "test.yaml",
+					originalFilePath: "test.yaml",
+				},
+			},
+			mockedContents: map[string]string{
+				"test.yaml": `---
+github:
+  - owner: olblak
+  repository: charts
+`,
+			},
+			isErrorWanted: true,
+		},
+		{
+			name: "Failing case with invalid YAML content (tabs)",
+			spec: Spec{
+				File: "test.yaml",
+				Key:  "$.github.owner",
+			},
+			files: map[string]file{
+				"test.yaml": {
+					filePath:         "test.yaml",
+					originalFilePath: "test.yaml",
+				},
+			},
+			inputSourceValue: "olblak",
+			mockedContents: map[string]string{
+				"test.yaml": `---
+github:
+	owner: olblak
+  	repository: charts
+`,
+			},
+			isErrorWanted: true,
+		},
+		{
+			name: "Passing case with keyonly and input source",
+			spec: Spec{
+				File:    "test.yaml",
+				Key:     "$.github.owner",
+				KeyOnly: true,
+			},
+			files: map[string]file{
+				"test.yaml": {
+					filePath:         "test.yaml",
+					originalFilePath: "test.yaml"},
+			},
+			inputSourceValue: "olblak",
+			mockedContents: map[string]string{
+				"test.yaml": `---
+github:
+  owner: olblak
+  repository: charts
+`,
+			},
+			isResultWanted: true,
+		},
+		{
+			name: "Passing case with keyonly and input source using yamlpath engine",
+			spec: Spec{
+				File:    "test.yaml",
+				Key:     "$.github.owner",
+				KeyOnly: true,
+				Engine:  "yamlpath",
+			},
+			files: map[string]file{
+				"test.yaml": {
+					filePath:         "test.yaml",
+					originalFilePath: "test.yaml"},
+			},
+			inputSourceValue: "olblak",
+			mockedContents: map[string]string{
+				"test.yaml": `---
+github:
+  owner: olblak
+  repository: charts
+`,
+			},
+			isResultWanted: true,
+		},
+		{
+			name: "'No result' case with keyonly and input source",
+			spec: Spec{
+				File:    "test.yaml",
+				Key:     "$.github.country",
+				KeyOnly: true,
+			},
+			files: map[string]file{
+				"test.yaml": {
+					originalFilePath: "test.yaml",
+					filePath:         "test.yaml",
+				},
+			},
+			inputSourceValue: "",
+			mockedContents: map[string]string{
+				"test.yaml": `---
+github:
+  owner: olblak
+  repository: charts
+`,
+			},
+			isResultWanted: false,
+		},
+		{
+			name: "'No result' case with keyonly and input source using yamlpath engine",
+			spec: Spec{
+				File:    "test.yaml",
+				Key:     "$.github.country",
+				KeyOnly: true,
+				Engine:  "yamlpath",
+			},
+			files: map[string]file{
+				"test.yaml": {
+					originalFilePath: "test.yaml",
+					filePath:         "test.yaml",
+				},
+			},
+			inputSourceValue: "",
+			mockedContents: map[string]string{
+				"test.yaml": `---
+github:
+  owner: olblak
+  repository: charts
+`,
+			},
+			isResultWanted: false,
+		},
+		{
+			name: "Validation error with both keyonly and specified value",
+			spec: Spec{
+				File:    "test.yaml",
+				Key:     "$.github.owner",
+				KeyOnly: true,
+				Value:   "olblak",
+			},
+			files: map[string]file{
+				"test.yaml": {
+					filePath:         "test.yaml",
+					originalFilePath: "test.yaml",
+				},
+			},
+			inputSourceValue: "",
+			mockedContents: map[string]string{
+				"test.yaml": `---
+github:
+  owner: olblak
+  repository: charts
+`,
+			},
+			isErrorWanted: true,
+		},
+		{
+			name: "File does not exist",
+			spec: Spec{
+				File: "not_existing.yaml",
+				Key:  "$.github.owner",
+			},
+			files: map[string]file{
+				"not_existing.yaml": {
+					filePath:         "not_existing.yaml",
+					originalFilePath: "not_existing.yaml",
+				},
+			},
+			mockedError:   fmt.Errorf("no such file or directory"),
+			isErrorWanted: true,
+		},
+		{
+			name: "'No result' case (key found but not the correct value)",
+			spec: Spec{
+				File: "test.yaml",
+				Key:  "$.github.owner",
+			},
+			files: map[string]file{
+				"test.yaml": {
+					originalFilePath: "test.yaml",
+					filePath:         "test.yaml",
+				},
+			},
+			inputSourceValue: "asterix",
+			mockedContents: map[string]string{
+				"test.yaml": `---
+github:
+  owner: olblak
+  repository: charts
+`,
+			},
+			isResultWanted: false,
+		},
+		{
+			name: "Failing case (key not found)",
+			spec: Spec{
+				File: "test.yaml",
+				Key:  "$.github.admin",
+			},
+			files: map[string]file{
+				"test.yaml": {
+					filePath:         "test.yaml",
+					originalFilePath: "test.yaml",
+				},
+			},
+			inputSourceValue: "asterix",
+			mockedContents: map[string]string{
+				"test.yaml": `---
+github:
+  owner: olblak
+  repository: charts
+`,
+			},
+			isErrorWanted: true,
+		},
+		{
+			name: "Validation Failure with both source and specified value",
+			spec: Spec{
+				File:  "test.yaml",
+				Key:   "$.github.owner",
+				Value: "asterix",
+			},
+			files: map[string]file{
+				"test.yaml": {
+					filePath:         "test.yaml",
+					originalFilePath: "test.yaml",
+				},
+			},
+			inputSourceValue: "olblak",
+			isErrorWanted:    true,
+		},
+		{
+			name: "Passing case with no input source and only specified value",
+			spec: Spec{
+				File:  "test.yaml",
+				Key:   "$.github.owner",
+				Value: "olblak",
+			},
+			files: map[string]file{
+				"test.yaml": {
+					originalFilePath: "test.yaml",
+					filePath:         "test.yaml",
+				},
+			},
+			mockedContents: map[string]string{
+				"test.yaml": `---
+github:
+  owner: olblak
+  repository: charts
+`,
+			},
+			isResultWanted: true,
+		},
+		{
+			name: "Passing case with one 'Files' input source and only specified value",
+			spec: Spec{
+				Files: []string{
+					"test.yaml",
+				},
+				Key:    "repos[?(@.repository == 'website')].owner",
+				Value:  "updatecli",
+				Engine: "yamlpath",
+			},
+			files: map[string]file{
+				"test.yaml": {
+					originalFilePath: "test.yaml",
+					filePath:         "test.yaml",
+				},
+			},
+			mockedContents: map[string]string{
+				"test.yaml": `---
+repos:
+  - owner: updatecli
+    repository: website
+  - owner: olblak
+    repository: updatecli
+`,
+			},
+			isResultWanted: true,
+		},
+		{
+			name: "Passing case with keyonly and searchpattern when at least one file contains the key (yamlpath)",
+			spec: Spec{
+				Files: []string{
+					"*.yaml",
+				},
+				Key:           "$.github.owner",
+				KeyOnly:       true,
+				Engine:        "yamlpath",
+				SearchPattern: true,
+			},
+			files: map[string]file{
+				"test.yaml": {
+					filePath:         "test.yaml",
+					originalFilePath: "test.yaml",
+				},
+				"too-much.yaml": {
+					filePath:         "too-much.yaml",
+					originalFilePath: "too-much.yaml",
+				},
+			},
+			mockedContents: map[string]string{
+				"test.yaml": `---
+github:
+  owner: olblak
+  repository: charts
+`,
+				"too-much.yaml": `---
+name: github
+`,
+			},
+			isResultWanted: true,
+		},
+		{
+			name: "Passing case with keyonly and searchpattern when at least one file contains the key (go-yaml)",
+			spec: Spec{
+				Files: []string{
+					"*.yaml",
+				},
+				Key:           "$.github.owner",
+				KeyOnly:       true,
+				SearchPattern: true,
+			},
+			files: map[string]file{
+				"test.yaml": {
+					filePath:         "test.yaml",
+					originalFilePath: "test.yaml",
+				},
+				"too-much.yaml": {
+					filePath:         "too-much.yaml",
+					originalFilePath: "too-much.yaml",
+				},
+			},
+			mockedContents: map[string]string{
+				"test.yaml": `---
+github:
+  owner: olblak
+  repository: charts
+`,
+				"too-much.yaml": `---
+name: github
+`,
+			},
+			isResultWanted: true,
+		},
+		{
+			name: "Failing case with keyonly and searchpattern when no file contains the key",
+			spec: Spec{
+				Files: []string{
+					"*.yaml",
+				},
+				Key:           "$.github.owner",
+				KeyOnly:       true,
+				Engine:        "yamlpath",
+				SearchPattern: true,
+			},
+			files: map[string]file{
+				"test.yaml": {
+					filePath:         "test.yaml",
+					originalFilePath: "test.yaml",
+				},
+				"too-much.yaml": {
+					filePath:         "too-much.yaml",
+					originalFilePath: "too-much.yaml",
+				},
+			},
+			mockedContents: map[string]string{
+				"test.yaml": `---
+name: github
+`,
+				"too-much.yaml": `---
+name: updatecli
+`,
+			},
+			isResultWanted: false,
+		},
+		{
+			name: "Failing case with keyonly and multiple files when not all files contain the key (no searchpattern)",
+			spec: Spec{
+				Files: []string{
+					"test.yaml",
+					"too-much.yaml",
+				},
+				Key:     "$.github.owner",
+				KeyOnly: true,
+				Engine:  "yamlpath",
+			},
+			files: map[string]file{
+				"test.yaml": {
+					filePath:         "test.yaml",
+					originalFilePath: "test.yaml",
+				},
+				"too-much.yaml": {
+					filePath:         "too-much.yaml",
+					originalFilePath: "too-much.yaml",
+				},
+			},
+			mockedContents: map[string]string{
+				"test.yaml": `---
+github:
+  owner: olblak
+  repository: charts
+`,
+				"too-much.yaml": `---
+name: github
+`,
+			},
+			isResultWanted: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockedContents := tt.mockedContents
+			var scmHandler scm.ScmHandler
+
+			// When a search pattern is used, initFiles resolves the pattern
+			// against the working directory, so we need real files on disk.
+			if tt.spec.SearchPattern {
+				tempDir := t.TempDir()
+				for fileName := range tt.files {
+					if err := os.WriteFile(filepath.Join(tempDir, fileName), []byte{}, 0600); err != nil {
+						t.Fatalf("failed to create temp file: %v", err)
+					}
+				}
+				scmHandler = &scm.MockScm{WorkingDir: tempDir}
+
+				updatedContents := make(map[string]string)
+				for fileName, content := range tt.mockedContents {
+					updatedContents[filepath.Join(tempDir, fileName)] = content
+				}
+				mockedContents = updatedContents
+			}
+
+			mockedText := text.MockTextRetriever{
+				Contents: mockedContents,
+				Err:      tt.mockedError,
+			}
+
+			y, err := New(tt.spec)
+			y.contentRetriever = &mockedText
+			y.files = tt.files
+
+			assert.NoError(t, err)
+
+			gotResult, _, gotErr := y.Condition(context.Background(), tt.inputSourceValue, scmHandler, pathresolver.New(scmHandler, ""))
+			if tt.isErrorWanted {
+				assert.Error(t, gotErr)
+				return
+			}
+
+			require.NoError(t, gotErr)
+			assert.Equal(t, tt.isResultWanted, gotResult)
+		})
+	}
+}
+
+// Test_Condition_yamlpathUndecodableFile guards against a decode loop that never
+// terminates. yaml.v3 does not advance past a syntax error, so a file whose first
+// document parses and whose remainder does not (a Markdown file dropped in a
+// workflows directory, say) makes the decoder return the same non-EOF error
+// forever. Retrying instead of stopping grew errorMessages until the process was
+// OOM-killed.
+func Test_Condition_yamlpathUndecodableFile(t *testing.T) {
+	spec := Spec{
+		File:   "README.md",
+		Key:    "$.name",
+		Engine: "yamlpath",
+	}
+
+	y, err := New(spec)
+	require.NoError(t, err)
+
+	y.contentRetriever = &text.MockTextRetriever{
+		Contents: map[string]string{
+			"README.md": `# OpenAPI Breaking Changes Detection
+
+## Overview
+
+This workflow detects breaking changes in the OpenAPI specification.
+
+## How It Works
+
+1. **Automatic Detection**: On every PR, the workflow:
+   - compares the spec against the base branch
+`,
+		},
+	}
+	y.files = map[string]file{
+		"README.md": {originalFilePath: "README.md", filePath: "README.md"},
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, condErr := y.Condition(context.Background(), "", nil, pathresolver.Resolver{})
+		done <- condErr
+	}()
+
+	select {
+	case condErr := <-done:
+		require.Error(t, condErr)
+		assert.Contains(t, condErr.Error(), "parsing yaml file")
+	case <-time.After(10 * time.Second):
+		t.Fatal("Condition did not return: the decoder loop is spinning on a non-EOF error")
+	}
+}

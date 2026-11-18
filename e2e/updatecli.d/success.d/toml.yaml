@@ -1,0 +1,31 @@
+name: Basic Toml Example
+
+sources:
+  local:
+    name: Get value from toml
+    kind: toml
+    spec:
+      file: pkg/plugins/resources/toml/testdata/data.toml
+      key: owner.firstName
+      engine: dasel/v3
+
+conditions:
+  local:
+    name: Test value from toml
+    kind: toml
+    sourceid: local
+    spec:
+      file: pkg/plugins/resources/toml/testdata/data.toml
+      key: owner.firstName
+      engine: dasel/v3
+
+targets:
+  local:
+    name: Test value from toml
+    kind: toml
+    sourceid: local
+    spec:
+      file: pkg/plugins/resources/toml/testdata/data.toml
+      key: owner.firstName
+      value: John
+      engine: dasel/v3

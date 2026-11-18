@@ -1,0 +1,35 @@
+# Deprecation Warning message expected:
+## This manifest has a 'pullrequests:' top-level directive which is deprecated in favor of 'actions'
+name: Test GitHub Pullrequest
+
+scms:
+  default:
+    kind: github
+    spec:
+      owner: updatecli
+      repository: updatecli
+      branch: main
+
+sources:
+  jenkins:
+    name: Get updatecli config title
+    kind: yaml
+    scmid: default
+    spec:
+      file: "updatecli/updatecli.d/updatecli.yaml"
+      key: "name"
+
+targets:
+  jenkins:
+    name: Update updatecli config title
+    kind: yaml
+    scmid: default
+    spec:
+      file: "updatecli/updatecli.d/updatecli.yaml"
+      key: "name"
+
+# Deprecated in favor of actions
+pullrequests:
+  prID1:
+    scmid: default
+    kind: github

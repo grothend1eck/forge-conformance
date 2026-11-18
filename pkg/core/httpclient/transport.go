@@ -1,0 +1,76 @@
+package httpclient
+
+import (
+	"net/http"
+	"sync"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+)
+
+var (
+	cacheMu     sync.Mutex
+	activeCache *cachingTransport
+)
+
+// EnableHTTPCache activates in-memory caching of GET responses for all
+// HTTP clients created via this package after this call.
+// Call once before pipeline execution begins.
+func EnableHTTPCache() {
+	cacheMu.Lock()
+	defer cacheMu.Unlock()
+	activeCache = newCachingTransport(otelhttp.NewTransport(&http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+	}))
+}
+
+// DisableHTTPCache deactivates the HTTP cache so that new clients no longer
+// use it. Already-created clients may still hold a reference to the previous
+// cache until they are garbage collected. Safe to call even if caching was
+// never enabled.
+func DisableHTTPCache() {
+	cacheMu.Lock()
+	defer cacheMu.Unlock()
+	activeCache = nil
+}
+
+// DefaultTransport returns a RoundTripper with retry and proxy support.
+// When HTTP caching is enabled via EnableHTTPCache, GET responses are served
+// from cache: retryTransport -> cachingTransport -> otelhttp -> http.Transport.
+func DefaultTransport() http.RoundTripper {
+	cacheMu.Lock()
+	inner := activeCache
+	cacheMu.Unlock()
+
+	if inner != nil {
+		return &retryTransport{transport: inner}
+	}
+
+	return UncachedTransport()
+}
+
+// UncachedTransport returns a RoundTripper with retry and proxy support that
+// never uses the HTTP cache, even when EnableHTTPCache was called.
+// Use it for API clients that also write, such as SCM clients: the cache keys
+// GET responses by URL only and nothing invalidates them after a write, so a
+// later read in the same run could miss a branch, tag or pull request just created.
+func UncachedTransport() http.RoundTripper {
+	return &retryTransport{
+		transport: otelhttp.NewTransport(&http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+		}),
+	}
+}
+
+// ProxyOnlyTransport returns a RoundTripper with proxy support but no retry.
+// Use when the caller handles its own retry (e.g. go-containerregistry) or
+// for non-idempotent operations (e.g. OAuth token exchange) where retry is unsafe.
+func ProxyOnlyTransport() http.RoundTripper {
+	return &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+	}
+}
+
+// NewPlainClient returns an HTTP client with proxy support but no retry.
+func NewPlainClient() *http.Client {
+	return &http.Client{Transport: ProxyOnlyTransport()}
+}

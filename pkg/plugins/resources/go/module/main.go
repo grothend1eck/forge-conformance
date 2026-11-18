@@ -1,0 +1,79 @@
+package gomodule
+
+import (
+	"fmt"
+
+	"github.com/go-viper/mapstructure/v2"
+	"github.com/updatecli/updatecli/pkg/core/httpclient"
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/redact"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/version"
+)
+
+/*
+	https://go.dev/ref/mod#goproxy-protocol
+*/
+
+const (
+	goModuleDefaultProxy string = "https://proxy.golang.org"
+)
+
+// GoModule defines a resource of type "gomodule"
+type GoModule struct {
+	Spec Spec
+	// versionFilter holds the "valid" version.filter, that might be different from the user-specified filter (Spec.VersionFilter)
+	versionFilter version.Filter
+	Version       version.Version
+	webClient     httpclient.HTTPClient
+}
+
+// New returns a reference to a newly initialized Go Module object from a godmodule.Spec
+// or an error if the provided Spec triggers a validation error.
+func New(spec interface{}) (*GoModule, error) {
+	newSpec := Spec{}
+
+	err := mapstructure.Decode(spec, &newSpec)
+	if err != nil {
+		return nil, err
+	}
+
+	newFilter := newSpec.VersionFilter
+	if newSpec.VersionFilter.IsZero() {
+		log.Debugln("no versioning filtering specified, fallback to semantic versioning")
+		// By default, golang versioning uses semantic versioning
+		newFilter.Kind = version.SEMVERVERSIONKIND
+		newFilter.Pattern = "*"
+	}
+
+	/*
+		Init must run after the fallback above, as it defaults an empty kind to "latest"
+		which would silently override the semantic versioning default of that resource.
+		It also provides the default pattern of a partially specified filter, such as
+		"latest" for a filter only setting `kind: latest`.
+	*/
+	newFilter, err = newFilter.Init()
+	if err != nil {
+		return nil, err
+	}
+
+	if err = newSpec.Age.Validate(); err != nil {
+		return nil, fmt.Errorf("wrong age spec %v", err)
+	}
+
+	return &GoModule{
+		Spec:          newSpec,
+		versionFilter: newFilter,
+		webClient:     httpclient.NewRetryClient(),
+	}, nil
+}
+
+// ReportConfig returns a new configuration without any sensitive information or context specific information.
+func (g *GoModule) ReportConfig() interface{} {
+	return Spec{
+		Proxy:         redact.URL(g.Spec.Proxy),
+		Module:        g.Spec.Module,
+		Version:       g.Spec.Version,
+		VersionFilter: g.Spec.VersionFilter,
+		Age:           g.Spec.Age,
+	}
+}

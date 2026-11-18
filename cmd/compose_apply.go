@@ -1,0 +1,92 @@
+package cmd
+
+import (
+	"os"
+
+	"github.com/spf13/cobra"
+	"github.com/updatecli/updatecli/pkg/core/compose"
+	"github.com/updatecli/updatecli/pkg/core/config"
+	"github.com/updatecli/updatecli/pkg/core/engine/manifest"
+	"github.com/updatecli/updatecli/pkg/core/log"
+)
+
+var (
+	composeApplyCommit           bool
+	composeApplyClean            bool
+	composeApplyPush             bool
+	composeApplyCleanGitBranches bool
+	composeApplyExistingOnly     bool
+	composeApplyOnlyPolicyIDs    []string
+	composeApplyIgnoredPolicyIDs []string
+
+	composeApplyCmd = &cobra.Command{
+		Use:   "apply",
+		Short: "apply checks and apply changes defined by the compose file",
+		Run: func(cmd *cobra.Command, args []string) {
+
+			composeFiles, err := compose.New(composeCmdFile, map[string]bool{})
+			if err != nil {
+				log.Errorf("command failed: %s", err)
+				os.Exit(1)
+			}
+
+			manifests := []manifest.Manifest{}
+			for i := range composeFiles {
+				c := composeFiles[i]
+				policies, err := c.GetPolicies(
+					disableTLS,
+					parseParametersList(composeApplyOnlyPolicyIDs),
+					parseParametersList(composeApplyIgnoredPolicyIDs),
+				)
+				if err != nil {
+					log.Errorf("command failed: %s", err)
+					os.Exit(1)
+				}
+
+				manifests = append(manifests, policies...)
+			}
+
+			e.Options.Manifests = append(e.Options.Manifests, manifests...)
+
+			e.Options.Pipeline.Target.Commit = composeApplyCommit
+			e.Options.Pipeline.Target.Push = composeApplyPush
+			e.Options.Pipeline.Target.Clean = composeApplyClean
+			e.Options.Pipeline.Target.DryRun = false
+			e.Options.Pipeline.Target.CleanGitBranches = composeApplyCleanGitBranches
+			e.Options.Pipeline.Target.ExistingOnly = composeApplyExistingOnly
+			e.Options.Pipeline.DisableChangelog = disableChangelog
+			e.Options.Config.ValidateSchema = validateSchema
+			e.Options.ManifestOptions.RelativePaths = config.RelativePathBase(relativePaths)
+			compose.ValidateSchema = validateSchema
+
+			err = run("compose/apply")
+			if err != nil {
+				log.Errorf("command failed: %s", err)
+				os.Exit(1)
+			}
+		},
+	}
+)
+
+func init() {
+	addUdashAPIURLFlag(composeApplyCmd)
+	composeApplyCmd.Flags().StringVarP(&composeCmdFile, "file", "f", composeDefaultCmdFile, "Define the update-compose file")
+	composeApplyCmd.Flags().BoolVar(&composeApplyExistingOnly, "existing-only", false, "Skip targets when pipeline has no existing remote branch '--existing-only=true'")
+	composeApplyCmd.Flags().BoolVarP(&composeApplyCommit, "commit", "", true, "Record changes to the repository, '--commit=false'")
+	composeApplyCmd.Flags().BoolVarP(&composeApplyPush, "push", "", true, "Update remote refs '--push=false'")
+	composeApplyCmd.Flags().BoolVar(&disableTLS, "disable-tls", false, "Disable TLS verification like '--disable-tls=true'")
+	composeApplyCmd.Flags().BoolVar(&composeApplyClean, "clean", false, "Remove updatecli working directory like '--clean=true'")
+	composeApplyCmd.Flags().BoolVar(&composeApplyCleanGitBranches, "clean-git-branches", false, "Remove git branches created by updatecli like '--clean-git-branches=true'")
+	composeApplyCmd.Flags().StringArrayVar(&pipelineIds, "pipeline-ids", []string{}, "Filter pipelines to apply by their pipeline IDs, accepted as a comma separated list")
+	composeApplyCmd.Flags().StringArrayVar(&labels, "labels", []string{}, "Filter pipelines to apply by their labels, accepted as a comma separated list (key:value)")
+	composeApplyCmd.Flags().StringArrayVar(&composeApplyOnlyPolicyIDs, "only-policy-ids", []string{}, "Filter policies to apply by their policy IDs, accepted as a comma separated list")
+	composeApplyCmd.Flags().StringArrayVar(&composeApplyIgnoredPolicyIDs, "ignored-policy-ids", []string{}, "Filter policies to ignore by their policy IDs, accepted as a comma separated list")
+
+	addDisableChangelogFlag(composeApplyCmd, &disableChangelog)
+	addValidateSchemaFlag(composeApplyCmd, &validateSchema)
+	addRelativePathsFlag(composeApplyCmd, &relativePaths)
+	addExportReportToYAMLFlag(composeApplyCmd, &exportReportToYAML)
+	addDisableUdashReportFlag(composeApplyCmd, &disableUdashReport)
+
+	composeCmd.AddCommand(composeApplyCmd)
+}

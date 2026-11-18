@@ -1,0 +1,106 @@
+package gomodule
+
+import (
+	"context"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/age"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/pathresolver"
+)
+
+func TestCondition(t *testing.T) {
+	tests := []struct {
+		name             string
+		spec             Spec
+		expectedResult   bool
+		expectedError    bool
+		expectedErrorMsg error
+	}{
+		{
+			name: "canonical test",
+			spec: Spec{
+				Module:  "github.com/updatecli/updatecli",
+				Version: "v0.47.2",
+			},
+			expectedResult: true,
+		},
+		{
+			name: "Test go module with upper case character",
+			spec: Spec{
+				Module:  "github.com/MakeNowJust/heredoc",
+				Version: "v1.0.0",
+			},
+			expectedResult: true,
+		},
+		{
+			name: "Test go module with minimum age",
+			spec: Spec{
+				Module:  "github.com/MakeNowJust/heredoc",
+				Version: "v1.0.0",
+				Age: age.Spec{
+					Minimum: "1y",
+				},
+			},
+			expectedResult: true,
+		},
+		{
+			name: "Test go module with unrealistic minimum age",
+			spec: Spec{
+				Module:  "github.com/MakeNowJust/heredoc",
+				Version: "v1.0.0",
+				Age: age.Spec{
+					Minimum: "100y",
+				},
+			},
+			expectedResult: false,
+		},
+		{
+			name: "Test go module with maximum age",
+			spec: Spec{
+				Module:  "github.com/MakeNowJust/heredoc",
+				Version: "v1.0.0",
+				Age: age.Spec{
+					Maximum: "1y",
+				},
+			},
+			expectedResult: false,
+		},
+		{
+			name: "Test go module with unrealistic maximum age",
+			spec: Spec{
+				Module:  "github.com/MakeNowJust/heredoc",
+				Version: "v1.0.0",
+				Age: age.Spec{
+					Maximum: "100y",
+				},
+			},
+			expectedResult: true,
+		},
+		{
+			name: "Test go module version do not exist",
+			spec: Spec{
+				Module:  "github.com/MakeNowJust/heredoc",
+				Version: "v0.0.0",
+			},
+			expectedResult: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := New(tt.spec)
+			require.NoError(t, err)
+			gotResult, _, gotErr := got.Condition(context.Background(), "", nil, pathresolver.Resolver{})
+			if tt.expectedError {
+				if assert.Error(t, gotErr) {
+					assert.Equal(t, tt.expectedErrorMsg.Error(), gotErr.Error())
+				}
+				return
+			}
+			require.NoError(t, gotErr)
+			assert.Equal(t, tt.expectedResult, gotResult)
+		})
+	}
+
+}

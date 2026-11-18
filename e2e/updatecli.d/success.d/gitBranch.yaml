@@ -1,0 +1,88 @@
+scms:
+  default:
+    kind: github
+    spec:
+      branch: master
+      email: me@olblak.com
+      owner: olblak
+      repository: nocode
+      user: updatecli
+    disabled: false
+
+sources:
+  scmid:
+    name: Get Latest committed branch
+    kind: gitbranch
+    scmid: default
+  #  path:
+  #    name: Get Latest committed branch
+  #    kind: gitbranch
+  #    spec:
+  #      path: ./
+  url:
+    name: Get latest committed branch from url
+    kind: gitbranch
+    spec:
+      url: https://github.com/olblak/nocode.git
+  hash:
+    name: Get Latest committed branch
+    kind: gitbranch
+    scmid: default
+    spec:
+      key: hash
+
+conditions:
+  default:
+    name: Check branch from source exist
+    kind: gitbranch
+    scmid: default
+    sourceid: scmid
+  master:
+    name: Get specified branch exist
+    kind: gitbranch
+    scmid: default
+    disablesourceinput: true
+    spec:
+      branch: master
+  #  path:
+  #    name: Get Latest committed branch
+  #    kind: gitbranch
+  #    sourceid: path
+  #    spec:
+  #      path: ./
+  url:
+    name: Get latest committed branch from url
+    kind: gitbranch
+    sourceid: url
+    spec:
+      url: https://github.com/olblak/nocode.git
+
+targets:
+  #  default:
+  #    name: Create the branch v4 if needed
+  #    kind: gitbranch
+  #    scmid: default
+  #    disablesourceinput: true
+  #    spec:
+  #      branch: v4
+  scmid-1:
+    name: Create branch master.
+    kind: gitbranch
+    scmid: default
+    sourceid: scmid
+    spec:
+      branch: master
+
+  scmid-2:
+    name: Create branch retrieved from source.
+    kind: gitbranch
+    scmid: default
+    sourceid: scmid
+#  url:
+#    name: Create branch v3 from url
+#    kind: gitbranch
+#    disablesourceinput: true
+#    spec:
+#      url: https://github.com/olblak/nocode.git
+#      branch: "v3"
+#      sourceBranch: "master"

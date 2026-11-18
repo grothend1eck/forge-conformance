@@ -1,0 +1,112 @@
+package xml
+
+import (
+	"context"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/pathresolver"
+)
+
+func TestCondition(t *testing.T) {
+
+	testData := []struct {
+		name             string
+		spec             Spec
+		expectedResult   bool
+		expectedErrorMsg error
+		wantErr          bool
+	}{
+		{
+			spec: Spec{
+				File: "testdata/data_0.xml",
+				Path: "/name/firstname",
+			},
+			expectedResult: false,
+		},
+		{
+			spec: Spec{
+				File:  "testdata/data_0.xml",
+				Path:  "/name/firstname",
+				Value: "John",
+			},
+			expectedResult: true,
+		},
+		{
+			spec: Spec{
+				File:  "https://raw.githubusercontent.com/updatecli/updatecli/main/pkg/plugins/resources/xml/testdata/data_0.xml",
+				Path:  "/name/firstname",
+				Value: "John",
+			},
+			expectedResult: true,
+		},
+		{
+			spec: Spec{
+				File:  "testdata/data_0.xml",
+				Path:  "/name/firstname",
+				Value: "wrongValue",
+			},
+			expectedResult: false,
+		},
+		{
+			spec: Spec{
+				File: "testdata/data_0.xml",
+				Path: ".name.donotExit",
+			},
+			expectedResult: false,
+		},
+		{
+			spec: Spec{
+				File: "testdata/data_1.xml",
+				Path: "/breakfast_menu/food[0]/name",
+			},
+			expectedResult: false,
+		},
+		{
+			spec: Spec{
+				File:  "testdata/data_1.xml",
+				Path:  "/breakfast_menu/food[0]/name",
+				Value: "Belgian Waffles",
+			},
+			expectedResult: true,
+		},
+		{
+			spec: Spec{
+				File:  "testdata/data_1.xml",
+				Path:  "/breakfast_menu.food[0]/name",
+				Value: "wrongValue",
+			},
+			expectedResult: false,
+		},
+		{
+			name: "Whitespace around a multi-line value is ignored",
+			spec: Spec{
+				File:  "testdata/data_3.xml",
+				Path:  "/project/dependency/version",
+				Value: "3.2.1",
+			},
+			expectedResult: true,
+		},
+	}
+
+	for _, tt := range testData {
+
+		t.Run(tt.name, func(t *testing.T) {
+			x, err := New(tt.spec)
+
+			require.NoError(t, err)
+
+			gotResult, _, gotErr := x.Condition(context.Background(), "", nil, pathresolver.Resolver{})
+
+			if tt.wantErr {
+				assert.Equal(t, tt.expectedErrorMsg.Error(), gotErr.Error())
+			} else {
+				require.NoError(t, gotErr)
+			}
+
+			assert.Equal(t, tt.expectedResult, gotResult)
+		})
+	}
+
+}

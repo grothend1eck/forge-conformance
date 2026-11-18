@@ -1,0 +1,62 @@
+package githubrelease
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"github.com/updatecli/updatecli/pkg/core/pipeline/scm"
+	"github.com/updatecli/updatecli/pkg/core/result"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/pathresolver"
+)
+
+func (gr GitHubRelease) Condition(ctx context.Context, source string, scm scm.ScmHandler, pathResolver pathresolver.Resolver) (pass bool, message string, err error) {
+
+	if scm != nil {
+		log.Warningf("condition not supported for plugin GitHub Release used with scm")
+	}
+
+	expectedValue := source
+	if gr.spec.Tag != "" {
+		expectedValue = gr.spec.Tag
+	}
+
+	var versions []string
+	switch gr.spec.Key {
+	case KeyTagHash:
+		versions, err = gr.ghHandler.SearchReleasesByTagHash(ctx, gr.typeFilter)
+	case KeyTitle:
+		versions, err = gr.ghHandler.SearchReleasesByTitle(ctx, gr.typeFilter)
+	default:
+		versions, err = gr.ghHandler.SearchReleasesByTagName(ctx, gr.typeFilter)
+	}
+
+	if err != nil {
+		return false, "", fmt.Errorf("searching GitHub release: %w", err)
+	}
+
+	if len(versions) == 0 {
+		switch gr.spec.TypeFilter.IsZero() {
+		case true:
+			log.Warningf("%s No GitHub Release found, we fallback to published git tags", result.ATTENTION)
+
+			versions, err = gr.ghHandler.SearchTags(ctx, 0)
+			if err != nil {
+				return false, "", fmt.Errorf("looking for GitHub release tag: %w", err)
+			}
+			if len(versions) == 0 {
+				return false, "no GitHub release or git tags found", nil
+			}
+		case false:
+			return false, "no GitHub release found", nil
+		}
+	}
+
+	for _, version := range versions {
+		if version == expectedValue {
+			return true, fmt.Sprintf("GitHub release %q found", expectedValue), nil
+		}
+	}
+
+	return false, fmt.Sprintf("GitHub release %q not found", expectedValue), nil
+}

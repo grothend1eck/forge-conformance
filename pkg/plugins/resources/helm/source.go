@@ -1,0 +1,62 @@
+package helm
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/updatecli/updatecli/pkg/core/result"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/pathresolver"
+	"helm.sh/helm/v3/pkg/repo"
+)
+
+// Source return the latest version
+func (c *Chart) Source(ctx context.Context, pathResolver pathresolver.Resolver, resultSource *result.Source) error {
+
+	if strings.HasPrefix(c.spec.URL, "oci://") {
+		return c.OCISource(resultSource)
+	}
+
+	var index repo.IndexFile
+	var err error
+
+	if strings.HasPrefix(c.spec.URL, "https://") || strings.HasPrefix(c.spec.URL, "http://") {
+		index, err = c.GetRepoIndexFromURL(ctx)
+		if err != nil {
+			return fmt.Errorf("getting repo index from url: %w", err)
+		}
+	} else {
+		index, err = c.GetRepoIndexFromFile(pathResolver)
+		if err != nil {
+			return fmt.Errorf("getting repo index from file: %w", err)
+		}
+	}
+
+	entriesVersion, found := index.Entries[c.spec.Name]
+	if !found {
+		return fmt.Errorf("helm chart %q not found from Helm Chart repository %q", c.spec.Name, c.spec.URL)
+	}
+
+	versions := []string{}
+	for i := len(entriesVersion) - 1; i >= 0; i-- {
+		versions = append(versions, entriesVersion[i].Version)
+	}
+
+	c.foundVersion, err = c.versionFilter.Search(versions)
+	if err != nil {
+		return fmt.Errorf("filtering version: %w", err)
+	}
+
+	resultSource.Information = c.foundVersion.GetVersion()
+	if resultSource.Information == "" {
+		return fmt.Errorf("no Helm Chart version found for %q", c.spec.Name)
+	}
+
+	resultSource.Result = result.SUCCESS
+	resultSource.Description = fmt.Sprintf("Helm Chart %q version %q is found from repository %q",
+		c.spec.Name,
+		resultSource.Information,
+		c.spec.URL)
+
+	return nil
+}

@@ -1,0 +1,46 @@
+package dasel
+
+/*
+ Dasel package provides an abstraction of https://github.com/TomWright/dasel/
+ So it's easier to integrate it in Updatecli by various data file such as Json,Toml, or csv
+*/
+
+import (
+	"errors"
+
+	"github.com/tomwright/dasel"
+	"github.com/updatecli/updatecli/pkg/core/text"
+)
+
+const (
+	// TYPEJSON defines the json data type
+	TYPEJSON string = "json"
+	// TYPETOML defines the toml data type
+	TYPETOML string = "toml"
+)
+
+var (
+	// ErrDaselFailedParsingByteFormat is returned if dasel couldn't parse the byteData
+	ErrDaselFailedParsingByteFormat error = errors.New("failed to parse file")
+	// ErrEmptyDaselNode is returned when we try to manipulate a null Dasel node
+	ErrEmptyDaselNode error = errors.New("no Dasel data")
+)
+
+type FileContent struct {
+	// DataType defines what type of Dasel file we have, accepted value ["json"]
+	DataType string
+	// FilePath defines the fullpath filename
+	FilePath string
+	// OriginalFilePath keeps the path as written in the manifest, so that resolving
+	// FilePath twice cannot join the base directory twice.
+	OriginalFilePath string
+	// ContentRetriever is an interface to manipulate raw files
+	ContentRetriever text.TextRetriever
+	// DaselNode contains the dasel representation of the file
+	DaselNode *dasel.Node
+	// DaselV2Node contains the dasel v2 representation of the file
+	DaselV2Node any
+	// DaselV3Data contains the native parsed data manipulated by the dasel v3 engine.
+	// dasel v3 has no stateful node object: its API operates directly on this value.
+	DaselV3Data any
+}

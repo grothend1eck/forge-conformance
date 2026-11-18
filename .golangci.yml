@@ -1,0 +1,165 @@
+version: "2"
+linters:
+  default: none
+  enable:
+    - asciicheck
+    - depguard
+    - dogsled
+    - errcheck
+    - forbidigo
+    - funlen
+    - goconst
+    - goprintffuncname
+    - gosec
+    - ineffassign
+    - misspell
+    - nakedret
+    - nolintlint
+    - rowserrcheck
+    - staticcheck
+    - unconvert
+    - unparam
+    - unused
+  settings:
+    depguard:
+      rules:
+        main:
+          deny:
+            - pkg: github.com/alecthomas/assert
+              desc: not allowed
+            - pkg: github.com/magiconair/properties/assert
+              desc: not allowed
+        logging:
+          files:
+            - "!**/pkg/core/log/**"
+          deny:
+            - pkg: github.com/sirupsen/logrus
+              desc: use github.com/updatecli/updatecli/pkg/core/log
+    dupl:
+      threshold: 100
+    exhaustive:
+      default-signifies-exhaustive: false
+    forbidigo:
+      analyze-types: true
+      forbid:
+        - pattern: ^fmt\.Print(f|ln)?$
+          msg: use pkg/core/log so the output reaches pipeline reports
+        - pattern: ^os\.Std(out|err)$
+          msg: use pkg/core/log (or log.Progress for transient output) so the output reaches pipeline reports
+        # Banning http.Client or http.Transport here would also flag the type the
+        # httpclient constructors return and the Client.Transport field, so
+        # pkg/core/httpclient/lint_test.go catches literals of both instead.
+        - pattern: ^http\.(DefaultClient|DefaultTransport|Get|Head|Post|PostForm)$
+          pkg: ^net/http$
+          msg: use pkg/core/httpclient so requests get the shared proxy, retry, throttling and caching behaviour
+        - pattern: .*
+          pkg: ^(gopkg\.in/yaml\.v[23]|go\.yaml\.in/yaml/v[23])$
+          msg: use go.yaml.in/yaml/v4
+    funlen:
+      lines: 200
+      statements: 150
+    goconst:
+      min-len: 3
+      min-occurrences: 3
+    gocritic:
+      disabled-checks:
+        - dupImport
+        - ifElseChain
+        - octalLiteral
+        - whyNoLint
+        - wrapperFunc
+      enabled-tags:
+        - diagnostic
+        - experimental
+        - opinionated
+        - performance
+        - style
+    gocyclo:
+      min-complexity: 15
+    govet:
+      enable-all: true
+      settings:
+        shadow:
+          strict: true
+    lll:
+      line-length: 140
+    misspell:
+      locale: US
+    nolintlint:
+      require-explanation: false
+      require-specific: false
+      allow-unused: false
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - funlen
+          - mnd
+        path: _test\.go
+      # Test tables are full of throwaway credentials and echo-back HTTP handlers,
+      # which gosec reports as leaked secrets and XSS sinks.
+      - linters:
+          - gosec
+        path: _test\.go
+        text: G101|G705
+      # Table-driven tests repeat fixture values (versions, URLs, testdata paths)
+      # on purpose: naming each one hurts readability more than it helps.
+      - linters:
+          - goconst
+        path: _test\.go
+      # The deprecated field is set on purpose, next to its replacement, so that
+      # older GitLab servers keep working.
+      - linters:
+          - staticcheck
+        path: pkg/plugins/resources/gitlab/mergerequest/create\.go
+        text: SA1019
+      - linters:
+          - testpackage
+        path: _expansion_test\.go
+      # The exclusions below match the forbidden identifier in the report, not
+      # the rule message, so rewording a message does not change what they skip.
+      # Commands write their own output to the terminal and the log package owns
+      # the terminal.
+      - linters:
+          - forbidigo
+        path: (^cmd/|^pkg/core/log/|^main\.go$)
+        text: "use of `[^`]+\\.(Print(f|ln)?|Std(out|err))`"
+      # The httpclient package builds the shared client from net/http.
+      - linters:
+          - forbidigo
+        path: ^pkg/core/httpclient/
+        text: "use of `[^`]+\\.(DefaultClient|DefaultTransport|Get|Head|Post|PostForm)`"
+      # Tests print what they like and talk to httptest servers with a bare client.
+      - linters:
+          - forbidigo
+        path: _test\.go$
+      - linters:
+          - gocritic
+        text: "unnecessaryDefer:"
+    paths:
+      - test/testdata_etc
+      - internal/cache
+      - internal/renameio
+      - internal/robustio
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - test/testdata_etc
+      - internal/cache
+      - internal/renameio
+      - internal/robustio
+      - third_party$
+      - builtin$
+      - examples$

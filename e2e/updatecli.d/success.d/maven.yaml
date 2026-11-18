@@ -1,0 +1,77 @@
+---
+name: Show a set of maven resources as a generic example
+pipelineid: "e2e/maven"
+
+scms:
+  local:
+    disabled: true
+
+sources:
+  getLatestJunitVersion:
+    kind: maven
+    spec:
+      repository: "repo.maven.apache.org/maven2"
+      groupid: "junit"
+      artifactid: "junit"
+  getLatestJunitVersionfromRepositories:
+    kind: maven
+    spec:
+      repositories:
+        - "repo.maven.apache.org/maven2"
+        - "https://repo.maven.apache.org/maven2"
+      groupid: "junit"
+      artifactid: "junit"
+
+  getJunitVersion:
+    # https://repo.maven.apache.org/maven2/junit/junit/
+    kind: maven
+    spec:
+      repository: "repo.maven.apache.org/maven2"
+      groupid: "junit"
+      artifactid: "junit"
+      versionfilter:
+        kind: semver
+        pattern: "3.8.x"
+
+conditions:
+  checkIfOlderJunitExist:
+    kind: maven
+    name: Is there a version 4.3.1 of junit/junit at https://repo.maven.apache.org/maven2
+    disablesourceinput: true
+    spec:
+      repository: "repo.maven.apache.org/maven2"
+      groupid: "junit"
+      artifactid: "junit"
+      version: "4.3.1"
+
+  checkIfOlderJunitExistr2:
+    kind: maven
+    name: Is there a version 4.3.1 of junit/junit at https://repo.maven.apache.org/maven2
+    disablesourceinput: true
+    spec:
+      repository: "https://repo.maven.apache.org/maven2"
+      groupid: "junit"
+      artifactid: "junit"
+      version: "4.3.1"
+
+  checkIfOlderJunitExist3:
+    kind: maven
+    name: Is there a version 4.3.1 of junit/junit at https://repo.maven.apache.org/maven2
+    disablesourceinput: true
+    spec:
+      repositories:
+        - "repo.maven.apache.org/maven2"
+      groupid: "junit"
+      artifactid: "junit"
+      version: "4.3.1"
+
+  checkIfOlderJunitExist4:
+    kind: maven
+    name: Is there a version 4.3.1 of junit/junit at https://repo.maven.apache.org/maven2
+    disablesourceinput: true
+    spec:
+      repositories:
+        - "https://repo.maven.apache.org/maven2"
+      groupid: "junit"
+      artifactid: "junit"
+      version: "4.3.1"

@@ -1,0 +1,96 @@
+package engine
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"github.com/updatecli/updatecli/pkg/core/result"
+)
+
+// sanitizeUpdatecliManifestFilePath receives a list of files (directory or file)
+// and returns both a list of files that could be accepted by Updatecli.
+// a list of files that can be used as helpers.
+func sanitizeUpdatecliManifestFilePath(rawFilePaths []string) (sanitizedFilePaths, sanitizedPartialPaths []string) {
+	for _, rawFilePath := range rawFilePaths {
+		// Only sanitize Updatecli manifest which are not partial manifests.
+		rawBaseFilePath := filepath.Base(rawFilePath)
+		if strings.HasPrefix(rawBaseFilePath, "_") {
+			continue
+		}
+
+		rawFileInfo, err := os.Stat(rawFilePath)
+		if err != nil {
+			log.Error(fmt.Sprintf("Loading Updatecli manifest %q: %s", rawFilePath, err))
+			continue
+		}
+
+		// If the manifest if a directory, then we walk trough it to find all manifest files
+		// and partial files.
+		if rawFileInfo.IsDir() {
+			err = filepath.Walk(rawFilePath, func(path string, info os.FileInfo, err error) error {
+				if err != nil {
+					log.Errorf("\n%s File %s: %s\n", result.FAILURE, path, err)
+					return fmt.Errorf("unable to walk %q: %s", path, err)
+				}
+				if info.Mode().IsRegular() {
+					baseFile := filepath.Base(path)
+
+					if strings.HasPrefix(baseFile, "_") {
+						sanitizedPartialPaths = append(sanitizedPartialPaths, path)
+					} else {
+						sanitizedFilePaths = append(sanitizedFilePaths, path)
+					}
+				}
+				return nil
+			})
+		}
+
+		// If the manifest is a file, then we check any additional partial files
+		// in the same directory that start with an underscore.
+		if rawFileInfo.Mode().IsRegular() {
+			manifestDirname := filepath.Dir(rawFilePath)
+			dirEntries, err := os.ReadDir(manifestDirname) // Ensure the directory exists
+			if err != nil {
+				log.Errorf("unable to read directory %q: %s", manifestDirname, err)
+				return nil, nil
+			}
+
+			for _, entry := range dirEntries {
+				if entry.IsDir() {
+					continue // Skip directories
+				}
+
+				baseFile := entry.Name()
+				if strings.HasPrefix(baseFile, "_") && (strings.HasSuffix(baseFile, ".yaml") || strings.HasSuffix(baseFile, ".yml")) {
+					// If the file starts with an underscore, we consider it a partial file
+					partialFilePath := filepath.Join(manifestDirname, baseFile)
+					sanitizedPartialPaths = append(sanitizedPartialPaths, partialFilePath)
+				}
+			}
+
+			sanitizedFilePaths = append(sanitizedFilePaths, rawFilePath)
+		}
+
+		if err != nil {
+			log.Errorf("err - %s", err)
+		}
+	}
+
+	trimDuplicate := func(input []string) []string {
+		result := []string{}
+		exist := map[string]bool{}
+
+		for v := range input {
+			if !exist[input[v]] {
+				exist[input[v]] = true
+				result = append(result, input[v])
+			}
+		}
+		return result
+	}
+
+	return trimDuplicate(sanitizedFilePaths), trimDuplicate(sanitizedPartialPaths)
+}

@@ -1,0 +1,13 @@
+---
+name: 'Updatecli Deprecated Commands TestSuite'
+vars:
+  message:
+    deprecated: 'Deprecated command'
+testcases:
+  - name: "Test deprecated diff and apply commands show warnings but still work"
+    steps:
+      - script: '../scripts/test_deprecated.bash'
+        type: 'exec'
+        assertions:
+          - 'result.code ShouldEqual 0'
+          - 'result.systemout ShouldContainSubstring "{{ .message.deprecated }}"'

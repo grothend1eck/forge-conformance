@@ -1,0 +1,552 @@
+package engine
+
+import (
+	"cmp"
+	"fmt"
+	"io"
+	"maps"
+	"slices"
+	"strings"
+	"sync"
+
+	"github.com/mitchellh/hashstructure"
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"github.com/updatecli/updatecli/pkg/core/pipeline"
+	"github.com/updatecli/updatecli/pkg/core/pipeline/scm"
+	"github.com/updatecli/updatecli/pkg/core/result"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/redact"
+)
+
+// InitSCM search and clone only once SCM configurations found.
+func (e *Engine) InitSCM() (err error) {
+	hashes := []uint64{}
+
+	wg := sync.WaitGroup{}
+	channel := make(chan int, 20)
+	defer wg.Wait()
+
+	for i := range e.Pipelines {
+		pipeline := e.Pipelines[i]
+
+		for j := range pipeline.SCMs {
+			s := pipeline.SCMs[j]
+
+			if s.Handler != nil {
+				err = Clone(&s.Handler, channel, &hashes, &wg, e.failedSCMMap())
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
+	log.Infof("\nSCM repository retrieved: %d", len(hashes))
+
+	return err
+}
+
+// Clone parses a scm configuration then clone the git repository if needed.
+func Clone(
+	s *scm.ScmHandler,
+	channel chan int,
+	hashes *[]uint64,
+	wg *sync.WaitGroup,
+	failed *sync.Map,
+) error {
+	scmhandler := *s
+
+	hash, err := hashstructure.Hash(scmhandler.GetDirectory(), nil)
+	if err != nil {
+		return err
+	}
+	found := false
+
+	for _, h := range *hashes {
+		if h == hash {
+			found = true
+		}
+	}
+
+	if !found {
+		*hashes = append(*hashes, hash)
+		wg.Add(1)
+		go func(s scm.ScmHandler) {
+			channel <- 1
+			defer wg.Done()
+			_, err := s.Clone()
+			if err != nil {
+				log.Errorf("err - %s", err)
+				failed.Store(s.GetDirectory(), err)
+			}
+		}(scmhandler)
+		<-channel
+	}
+
+	return nil
+}
+
+// failedSCMMap returns the scm clone failures, creating the map on first use.
+func (e *Engine) failedSCMMap() *sync.Map {
+	if e.failedSCMs == nil {
+		e.failedSCMs = &sync.Map{}
+	}
+	return e.failedSCMs
+}
+
+// failedSCMError returns an error if the pipeline uses an scm that couldn't be cloned.
+func (e *Engine) failedSCMError(p *pipeline.Pipeline) error {
+	for id, s := range p.SCMs {
+		if s.Handler == nil {
+			continue
+		}
+		if err, ok := e.failedSCMMap().Load(s.Handler.GetDirectory()); ok {
+			return fmt.Errorf("scm %q failed to clone: %v", id, err)
+		}
+	}
+	return nil
+}
+
+// pushSCMCommits push all pending commits for configured SCMs remotes.
+func (e *Engine) pushSCMCommits() error {
+	errs := []string{}
+
+	// pushFailureKey identifies the working copy a push failure belongs to.
+	// SCM configurations may share a repository URL and a working branch while
+	// using different working directories, so the directory is part of the key:
+	// a push from one checkout must not clear the failure of another checkout
+	// whose commits were not published. Such a failure is only recovered when
+	// the branch publication below visits that checkout, which is the same
+	// outcome as before failures could be recovered at all.
+	type pushFailureKey struct {
+		url       string
+		branch    string
+		directory string
+	}
+
+	// pushErrs records push errors per working copy.
+	// A working branch is shared by every target of the same SCM, so an error
+	// reported while pushing one target must be cleared as soon as another
+	// target, or the branch publication below, manages to push that branch or
+	// finds it up to date.
+	// Every message is kept, not only the last one: two targets sharing a working
+	// branch may fail for different reasons, and dropping the earlier cause would
+	// hide it from the returned error.
+	pushErrs := map[pushFailureKey][]string{}
+
+	// pushFailedTargets records, per working copy, the targets whose push
+	// failed with the result they had before the failure.
+	// Failing to push sets the target result to FAILURE, and actions are only
+	// created for targets in an attention state, so the previous result must be
+	// restored once the branch is published: otherwise the action would silently
+	// be skipped even though the target's changes have been pushed.
+	type failedTarget struct {
+		result *result.Target
+		before result.Target
+	}
+	pushFailedTargets := map[pushFailureKey][]failedTarget{}
+
+	recordPushFailure := func(key pushFailureKey, msg string, targetResult *result.Target, before result.Target) {
+		pushErrs[key] = append(pushErrs[key], msg)
+		pushFailedTargets[key] = append(pushFailedTargets[key], failedTarget{
+			result: targetResult,
+			before: before,
+		})
+	}
+
+	// checkoutFailed records, per working copy, whether a
+	// checkout failed before pushing. The remote branch status check reports a
+	// branch as up to date when the local working branch does not exist, which
+	// is what a failed checkout may leave behind, so such failures are only
+	// cleared by an actual push and never by finding the remote branch up to date.
+	checkoutFailed := map[pushFailureKey]bool{}
+
+	// clearPushFailure forgets the failures of a working copy and restores its
+	// failed targets. When the recovery comes from a push, pushed is true and
+	// branchReset is what that push reported: the restored results must carry
+	// it, as actions rely on it to know that the working branch was reset,
+	// while the saved results predate any push of this execution.
+	clearPushFailure := func(key pushFailureKey, pushed, branchReset bool) {
+		delete(pushErrs, key)
+		delete(checkoutFailed, key)
+
+		for _, failed := range pushFailedTargets[key] {
+			if failed.result != nil {
+				*failed.result = failed.before
+				if pushed {
+					failed.result.Scm.BranchReset = branchReset
+				}
+			}
+		}
+		delete(pushFailedTargets, key)
+	}
+
+	changedSCM := map[string][]string{}
+
+	inconclusiveSCM := e.inconclusiveSCMBranches()
+
+	allScm := map[string]map[string]*scm.ScmHandler{}
+	log.Title("Pushing Git changes")
+
+	countScms := 0
+	countPushedScms := 0
+
+	for id := range e.Pipelines {
+		pipeline := e.Pipelines[id]
+		if len(pipeline.Targets) == 0 {
+			continue
+		}
+
+		stopCapture := pipeline.CaptureConsoleOutput()
+		for id := range pipeline.Targets {
+			target := pipeline.Targets[id]
+
+			// Sanity check, skip if no SCM is configured
+			if target.Scm == nil {
+				continue
+			}
+
+			scmHandler := *target.Scm
+
+			url := scmHandler.GetURL()
+			_, branch, _ := scmHandler.GetBranches()
+			pushKey := pushFailureKey{
+				url:       url,
+				branch:    branch,
+				directory: scmHandler.GetDirectory(),
+			}
+
+			if _, ok := allScm[url]; !ok {
+				allScm[url] = map[string]*scm.ScmHandler{}
+			}
+
+			if _, ok := allScm[url][branch]; !ok {
+				allScm[url][branch] = &scmHandler
+				countScms++
+			}
+
+			if target.ToPush {
+				if _, ok := changedSCM[url]; ok {
+					if slices.Contains(changedSCM[url], branch) {
+						log.Debugf("Changes for target %q already pushed to %q on branch %q, skipping...\n", target.Config.Name, redact.URL(url), branch)
+						continue
+					}
+				}
+
+				err := scmHandler.Checkout()
+				if err != nil {
+					msg := fmt.Sprintf("checking out git repository: %v", err)
+					log.Errorf("%s", msg)
+					recordPushFailure(pushKey, msg, target.Result, *target.Result)
+					checkoutFailed[pushKey] = true
+					target.Result.Result = result.FAILURE
+					continue
+				}
+
+				// PushCommits reports the failure by overwriting the target
+				// result, so its previous value is saved first to be restored if
+				// the branch is eventually published.
+				resultBeforePush := *target.Result
+				err = target.PushCommits()
+				if err != nil {
+					// PushCommits already names the target in its error.
+					msg := err.Error()
+					log.Errorf("%s", msg)
+					recordPushFailure(pushKey, msg, target.Result, resultBeforePush)
+					// PushCommits already marks the target failed, but the
+					// result must not depend on how it reports the error.
+					target.Result.Result = result.FAILURE
+					continue
+				}
+				// The shared working branch has been pushed, so errors reported
+				// by previous targets of that working copy are no longer relevant.
+				clearPushFailure(pushKey, true, target.Result.Scm.BranchReset)
+				log.Debugf("Pushed to URL: %q on branch: %q", redact.URL(url), branch)
+
+				if _, ok := changedSCM[url]; !ok {
+					changedSCM[url] = []string{}
+				}
+
+				changedSCM[url] = append(changedSCM[url], branch)
+
+				countPushedScms++
+			}
+		}
+		stopCapture()
+	}
+
+	if countPushedScms == 0 {
+		log.Info("No SCM repositories have changes to push")
+	} else {
+		log.Infof("Pushed changes to %d of %d SCM repositories", countPushedScms, countScms)
+	}
+
+	// Repositories and branches are visited in a stable order, so that the
+	// output and the returned error do not depend on map iteration.
+	for _, url := range slices.Sorted(maps.Keys(allScm)) {
+		for _, branch := range slices.Sorted(maps.Keys(allScm[url])) {
+			scmHandlerPtr := allScm[url][branch]
+			if scmHandlerPtr == nil {
+				continue
+			}
+
+			stopCapture := e.captureSCMConsoleOutput(url, branch)
+			// Only the working copy of the first target found for this branch is
+			// published, so only its failures can be recovered here.
+			pushKey := pushFailureKey{
+				url:       url,
+				branch:    branch,
+				directory: (*scmHandlerPtr).GetDirectory(),
+			}
+			branchInconclusive := slices.Contains(inconclusiveSCM[url], branch)
+			pushed, branchReset, err := pushSCMBranch(*scmHandlerPtr, url, branch, branchInconclusive)
+			switch {
+			case err != nil:
+				log.Errorf("%s", err)
+				errs = append(errs, err.Error())
+			case branchInconclusive:
+				// Nothing was checked, so earlier failures are kept.
+			case pushed || !checkoutFailed[pushKey]:
+				// The working branch has just been pushed, or the remote branch
+				// already contains the local commits, so earlier push errors for
+				// that working copy are no longer relevant.
+				clearPushFailure(pushKey, pushed, branchReset)
+			}
+			stopCapture()
+		}
+	}
+
+	// Only keep push errors that no later push of the same working copy managed
+	// to recover from, in a stable order.
+	failedKeys := slices.SortedFunc(maps.Keys(pushErrs), func(a, b pushFailureKey) int {
+		return cmp.Or(
+			cmp.Compare(a.url, b.url),
+			cmp.Compare(a.branch, b.branch),
+			cmp.Compare(a.directory, b.directory),
+		)
+	})
+	for _, key := range failedKeys {
+		errs = append(errs, pushErrs[key]...)
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf(
+			"errors occurred while pushing SCM commits:\n\t* %s",
+			strings.Join(errs, "\n\t* "))
+	}
+
+	return nil
+}
+
+// pushSCMBranch pushes the commits of a working branch, unless one of its targets didn't run.
+// It reports whether a push was performed, false meaning the branch was found up to date
+// or was not checked at all because it is inconclusive, and, when it was, whether the
+// push reset the working branch.
+func pushSCMBranch(scmHandler scm.ScmHandler, url, branch string, inconclusive bool) (pushed, branchReset bool, err error) {
+	if inconclusive {
+		log.Debugf("Not publishing branch %q to %q as at least one of its target(s) didn't run during this execution\n", branch, redact.URL(url))
+		return false, false, nil
+	}
+
+	isRemoteBranchUpToDate, err := scmHandler.IsRemoteBranchUpToDate()
+	if err != nil {
+		return false, false, fmt.Errorf("checking remote branch status for %q on branch %q: %s", redact.URL(url), branch, err.Error())
+	}
+
+	if isRemoteBranchUpToDate {
+		log.Debugf("No changes to push to %q on branch %q\n", redact.URL(url), branch)
+		return false, false, nil
+	}
+
+	log.Infof("\n\u26A0 According to the git history, some commits must be pushed to %q %q\n", redact.URL(url), branch)
+
+	err = scmHandler.Checkout()
+	if err != nil {
+		return false, false, fmt.Errorf("checking out git repository: %v", err)
+	}
+
+	isPushed, err := scmHandler.Push()
+	if err != nil {
+		return false, false, fmt.Errorf("pushing commits to %q on branch %q: %s", redact.URL(url), branch, err.Error())
+	}
+	log.Debugf("Pushed changes to %q on branch %q: %t\n", redact.URL(url), branch, isPushed)
+
+	return true, isPushed, nil
+}
+
+// pruneSCMBranches removes all working branches from the SCM.
+func (e *Engine) pruneSCMBranches() error {
+	errs := []string{}
+
+	allScm := e.getUniqueTargetSCMTargets()
+	inconclusiveSCM := e.inconclusiveSCMBranches()
+
+	log.Debugf("Cleaning working branches")
+
+	for url := range allScm {
+		for branch := range allScm[url] {
+			scmHandlerPtr := allScm[url][branch]
+
+			// Sanity check
+			if scmHandlerPtr == nil {
+				errs = append(errs, fmt.Sprintf("retrieving SCM handler for %q on branch %q", redact.URL(url), branch))
+				continue
+			}
+
+			stopCapture := e.captureSCMConsoleOutput(url, branch)
+			if err := pruneSCMBranch(*scmHandlerPtr, url, branch, slices.Contains(inconclusiveSCM[url], branch)); err != nil {
+				log.Errorf("%s", err)
+				errs = append(errs, err.Error())
+			}
+			stopCapture()
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf(
+			"errors occurred while cleaning working branches:\n\t* %s",
+			strings.Join(errs, "\n\t* "))
+	}
+
+	return nil
+}
+
+// pruneSCMBranch deletes a working branch, unless one of its targets didn't run.
+func pruneSCMBranch(scmHandler scm.ScmHandler, url, branch string, inconclusive bool) error {
+	_, workingBranch, targetBranch := scmHandler.GetBranches()
+
+	/*
+		Deleting a working branch closes the pull request associated with it so it
+		must only happen when Updatecli knows that the working branch isn't needed
+		anymore.
+	*/
+	if inconclusive {
+		log.Debugf("Not cleaning working branch %q on %q as at least one of its target(s) didn't run during this execution\n", workingBranch, redact.URL(url))
+		return nil
+	}
+
+	if workingBranch == targetBranch {
+		log.Debugf("Skipping cleaning working branch %q on %q (same as target branch)\n", workingBranch, redact.URL(url))
+		return nil
+	}
+
+	isCleaned, err := scmHandler.CleanWorkingBranch()
+	if err != nil {
+		return fmt.Errorf("cleaning working branch on %q for branch %q: %s", redact.URL(url), branch, err.Error())
+	}
+
+	if isCleaned {
+		log.Debugf("cleaning working branch %q for %q\n", branch, redact.URL(url))
+	}
+
+	return nil
+}
+
+// captureSCMConsoleOutput collects the console output in the report of every pipeline
+// having a target on the given repository branch, until stop is called.
+func (e *Engine) captureSCMConsoleOutput(url, branch string) (stop func()) {
+	var writers []io.Writer
+
+	for _, p := range e.Pipelines {
+		for _, target := range p.Targets {
+			if target.Scm == nil {
+				continue
+			}
+
+			scmHandler := *target.Scm
+			_, targetBranch, _ := scmHandler.GetBranches()
+			if scmHandler.GetURL() == url && targetBranch == branch {
+				writers = append(writers, p.ConsoleOutputWriter())
+				break
+			}
+		}
+	}
+
+	if len(writers) == 0 {
+		return func() {}
+	}
+
+	return log.Capture(io.MultiWriter(writers...))
+}
+
+/*
+inconclusiveSCMBranches returns, per repository url, the working branches having at least
+one target which didn't run to completion during this execution, such as a target skipped
+because its source failed.
+
+In that situation Updatecli doesn't know which content the working branch should have, so
+it must not publish nor delete it: doing so would remove the changes published by a
+previous execution and close the associated pull request, which would then be reopened by
+a later execution.
+*/
+func (e *Engine) inconclusiveSCMBranches() map[string][]string {
+	inconclusive := map[string][]string{}
+
+	for id := range e.Pipelines {
+		pipeline := e.Pipelines[id]
+
+		for id := range pipeline.Targets {
+			target := pipeline.Targets[id]
+
+			// Sanity check, skip if no SCM is configured
+			if target.Scm == nil {
+				continue
+			}
+
+			targetResult := ""
+			if target.Result != nil {
+				targetResult = target.Result.Result
+			}
+
+			// The target ran so we know the state that it expects
+			if targetResult == result.SUCCESS || targetResult == result.ATTENTION {
+				continue
+			}
+
+			s := *target.Scm
+			url := s.GetURL()
+			_, branch, _ := s.GetBranches()
+
+			if !slices.Contains(inconclusive[url], branch) {
+				inconclusive[url] = append(inconclusive[url], branch)
+			}
+		}
+	}
+
+	return inconclusive
+}
+
+// getUniqueTargetSCMTargets retrieves all the target scm configurations
+func (e *Engine) getUniqueTargetSCMTargets() (result map[string]map[string]*scm.ScmHandler) {
+	for id := range e.Pipelines {
+		pipeline := e.Pipelines[id]
+		if len(pipeline.Targets) == 0 {
+			continue
+		}
+
+		for id := range pipeline.Targets {
+			target := pipeline.Targets[id]
+
+			// Sanity check, skip if no SCM is configured
+			if target.Scm == nil {
+				continue
+			}
+
+			s := *target.Scm
+			url := s.GetURL()
+			_, branch, _ := s.GetBranches()
+
+			if result == nil {
+				result = make(map[string]map[string]*scm.ScmHandler)
+			}
+
+			if _, ok := result[url]; !ok {
+				result[url] = map[string]*scm.ScmHandler{}
+			}
+
+			if _, ok := result[url][branch]; !ok {
+				result[url][branch] = &s
+			}
+		}
+	}
+
+	return result
+}

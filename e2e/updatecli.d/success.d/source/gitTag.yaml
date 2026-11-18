@@ -1,0 +1,23 @@
+name: "Test new gitTag resource"
+pipelineid: "e2e/gitTag"
+
+scms:
+  updatecli:
+    kind: git
+    spec:
+      url: "https://github.com/updatecli/updatecli.git"
+      branch: "main"
+
+sources:
+  git:
+    name: Get latest updatecli test
+    kind: gittag
+    scmid: updatecli
+  githubRegex:
+    name: Get latest updatecli test
+    kind: gittag
+    spec:
+      versionfilter:
+        kind: semver
+        pattern: "~0.1"
+    scmid: updatecli

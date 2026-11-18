@@ -1,0 +1,77 @@
+package engine
+
+import (
+	"fmt"
+
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"github.com/updatecli/updatecli/pkg/core/result"
+)
+
+// ManifestUpgrade load Updatecli Manifest to update them then written them back on disk
+func (e *Engine) ManifestUpgrade(saveToDisk bool) (err error) {
+
+	log.Title("Manifest Upgrade")
+
+	err = e.LoadConfigurations()
+
+	if len(e.Pipelines) == 0 {
+		log.Errorln(err)
+		return fmt.Errorf("no valid pipeline found")
+	}
+
+	// Don't exit if we identify at least one valid pipeline configuration
+	if err != nil {
+		log.Errorln(err)
+		log.Infof("\n%d pipeline(s) successfully loaded\n", len(e.Pipelines))
+	}
+
+	for _, pipeline := range e.Pipelines {
+
+		isManifestDifferentThanOnDisk, err := pipeline.Config.IsManifestDifferentThanOnDisk()
+
+		if err != nil {
+			pipeline.Report.Result = result.FAILURE
+			e.Reports = append(e.Reports, pipeline.Report)
+			log.Errorf("skipping manifest upgrade because of %q", err)
+			continue
+		}
+
+		if saveToDisk && isManifestDifferentThanOnDisk {
+			err = pipeline.Config.SaveOnDisk()
+			if err != nil {
+				pipeline.Report.Result = result.FAILURE
+				e.Reports = append(e.Reports, pipeline.Report)
+				log.Errorf("failed writing manifest change back to disk because of %q", err)
+				continue
+			}
+		}
+
+		switch isManifestDifferentThanOnDisk {
+		case true:
+			pipeline.Report.Result = result.ATTENTION
+		default:
+			pipeline.Report.Result = result.SUCCESS
+		}
+
+		e.Reports = append(e.Reports, pipeline.Report)
+	}
+
+	totalSuccessUpgrade, totalChangedAppliedUpgrade, totalFailedUpgrade, totalSkippedUpgrade, _ := e.Reports.Summary()
+
+	totalUpgrade := totalSuccessUpgrade + totalChangedAppliedUpgrade + totalFailedUpgrade + totalSkippedUpgrade
+
+	log.Title("Summary")
+	log.Infof("Manifest(s) upgrade:")
+	log.Infof("  * Changed:\t%d", totalChangedAppliedUpgrade)
+	log.Infof("  * Failed:\t%d", totalFailedUpgrade)
+	log.Infof("  * Skipped:\t%d", totalSkippedUpgrade)
+	log.Infof("  * Succeeded:\t%d", totalSuccessUpgrade)
+	log.Infof("  * Total:\t%d", totalUpgrade)
+
+	// Exit on error if at least one upgrade failed
+	if totalFailedUpgrade > 0 {
+		return fmt.Errorf("%d over %d manifest upgrade failed", totalFailedUpgrade, totalUpgrade)
+	}
+
+	return err
+}

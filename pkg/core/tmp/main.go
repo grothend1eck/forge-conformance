@@ -1,0 +1,72 @@
+package tmp
+
+import (
+	"os"
+	"path"
+)
+
+var (
+	//Directory defines where updatecli will save temporary files like git clone.
+	Directory       = path.Join(os.TempDir(), "updatecli")
+	BinDirectory    = path.Join(Directory, "bin")
+	ReportDirectory = path.Join(Directory, "report")
+)
+
+// Clean removes the Updatecli temporary root directory.
+func Clean() error {
+	err := os.RemoveAll(Directory)
+
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// Create creates Updatecli temporary directory
+func Create() error {
+	if _, err := os.Stat(Directory); os.IsNotExist(err) {
+
+		err := os.MkdirAll(Directory, 0755)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// InitUnique sets a unique temporary directory for this Updatecli execution.
+// This is useful when running multiple Updatecli instances in parallel targeting
+// the same repository, to avoid conflicts between cloned directories.
+func InitUnique() error {
+	dir, err := os.MkdirTemp("", "updatecli-")
+	if err != nil {
+		return err
+	}
+	Directory = dir
+	BinDirectory = path.Join(Directory, "bin")
+	ReportDirectory = path.Join(Directory, "report")
+	return nil
+}
+
+// InitBin creates a bin directory used by updatecli to store and execute command
+func InitBin() (string, error) {
+	if _, err := os.Stat(BinDirectory); os.IsNotExist(err) {
+		err := os.MkdirAll(BinDirectory, 0755)
+		if err != nil {
+			return "", err
+		}
+	}
+	return BinDirectory, nil
+}
+
+// InitReport creates a report directory used by updatecli to store reports
+func InitReport() (string, error) {
+	if _, err := os.Stat(ReportDirectory); os.IsNotExist(err) {
+		err := os.MkdirAll(ReportDirectory, 0755)
+		if err != nil {
+			return "", err
+		}
+	}
+	return ReportDirectory, nil
+}

@@ -1,0 +1,666 @@
+package engine
+
+import (
+	"context"
+	"errors"
+
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/updatecli/updatecli/pkg/core/pipeline"
+	"github.com/updatecli/updatecli/pkg/core/pipeline/action"
+	"github.com/updatecli/updatecli/pkg/core/pipeline/resource"
+	"github.com/updatecli/updatecli/pkg/core/pipeline/scm"
+	"github.com/updatecli/updatecli/pkg/core/pipeline/target"
+	"github.com/updatecli/updatecli/pkg/core/reports"
+	"github.com/updatecli/updatecli/pkg/core/result"
+	"go.opentelemetry.io/otel/trace/noop"
+)
+
+// mockPushScm implements the scm methods used while pushing pending git changes.
+type mockPushScm struct {
+	scm.ScmHandler
+	url           string
+	workingBranch string
+	targetBranch  string
+	directory     string
+	// remoteBranchUpToDate reports if the remote branch already contains the local commits
+	remoteBranchUpToDate bool
+
+	// pushErrors holds the error returned by each successive Push call, if any.
+	// A nil entry makes the corresponding Push call succeed.
+	pushErrors []error
+
+	// checkoutErrors holds the error returned by each successive Checkout call, if any.
+	// A nil entry makes the corresponding Checkout call succeed.
+	checkoutErrors []error
+
+	pushCounter               int
+	checkoutCounter           int
+	cleanWorkingBranchCounter int
+}
+
+func (m *mockPushScm) GetURL() string {
+	return m.url
+}
+
+func (m *mockPushScm) GetDirectory() string {
+	return m.directory
+}
+
+func (m *mockPushScm) GetBranches() (sourceBranch, workingBranch, targetBranch string) {
+	return m.targetBranch, m.workingBranch, m.targetBranch
+}
+
+func (m *mockPushScm) CleanWorkingBranch() (bool, error) {
+	m.cleanWorkingBranchCounter++
+	return true, nil
+}
+
+func (m *mockPushScm) IsRemoteBranchUpToDate() (bool, error) {
+	return m.remoteBranchUpToDate, nil
+}
+
+func (m *mockPushScm) Checkout() error {
+	m.checkoutCounter++
+	if m.checkoutCounter <= len(m.checkoutErrors) {
+		return m.checkoutErrors[m.checkoutCounter-1]
+	}
+	return nil
+}
+
+func (m *mockPushScm) Push() (bool, error) {
+	m.pushCounter++
+	if m.pushCounter <= len(m.pushErrors) {
+		if err := m.pushErrors[m.pushCounter-1]; err != nil {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+func TestPushSCMCommits(t *testing.T) {
+	testdata := []struct {
+		name string
+		// targetResult is the result of the only target attached to the scm
+		targetResult string
+		// expectedPushCounter reports how many times the working branch was published
+		expectedPushCounter int
+	}{
+		{
+			/*
+				All targets ran so Updatecli knows the content that the working branch
+				must have, such as a working branch reset because the change is not
+				needed anymore.
+			*/
+			name:                "local branch of a fully executed pipeline is published",
+			targetResult:        result.SUCCESS,
+			expectedPushCounter: 1,
+		},
+		{
+			/*
+				The target didn't run, for example because its source failed, so the
+				working branch doesn't hold the expected content.
+				Publishing it would remove the changes pushed by a previous execution and
+				would then close the associated pull request.
+			*/
+			name:                "local branch is not published when a target didn't run",
+			targetResult:        result.SKIPPED,
+			expectedPushCounter: 0,
+		},
+		{
+			name:                "local branch is not published when a target failed",
+			targetResult:        result.FAILURE,
+			expectedPushCounter: 0,
+		},
+	}
+
+	for _, tt := range testdata {
+		t.Run(tt.name, func(t *testing.T) {
+			mockScm := mockPushScm{
+				url:                  "https://github.com/updatecli/updatecli.git",
+				workingBranch:        "updatecli_main",
+				targetBranch:         "main",
+				remoteBranchUpToDate: false,
+			}
+
+			var scmHandler scm.ScmHandler = &mockScm
+
+			e := Engine{
+				Pipelines: []*pipeline.Pipeline{
+					{
+						Name: "test",
+						Targets: map[string]target.Target{
+							"default": {
+								Scm:    &scmHandler,
+								Result: &result.Target{Result: tt.targetResult},
+							},
+						},
+					},
+				},
+			}
+
+			gotErr := e.pushSCMCommits()
+
+			require.NoError(t, gotErr)
+			assert.Equal(t, tt.expectedPushCounter, mockScm.pushCounter)
+		})
+	}
+}
+
+func TestPruneSCMBranches(t *testing.T) {
+	testdata := []struct {
+		name string
+		// targetResult is the result of the only target attached to the scm
+		targetResult string
+		// expectedCleanWorkingBranchCounter reports how many times the working branch cleanup ran
+		expectedCleanWorkingBranchCounter int
+	}{
+		{
+			name:                              "working branch of a fully executed pipeline can be cleaned",
+			targetResult:                      result.SUCCESS,
+			expectedCleanWorkingBranchCounter: 1,
+		},
+		{
+			/*
+				Deleting the working branch closes the pull request associated with it, so
+				it must not happen based on an execution which didn't run its target(s).
+			*/
+			name:                              "working branch is not cleaned when a target didn't run",
+			targetResult:                      result.SKIPPED,
+			expectedCleanWorkingBranchCounter: 0,
+		},
+	}
+
+	for _, tt := range testdata {
+		t.Run(tt.name, func(t *testing.T) {
+			mockScm := mockPushScm{
+				url:           "https://github.com/updatecli/updatecli.git",
+				workingBranch: "updatecli_main",
+				targetBranch:  "main",
+			}
+
+			var scmHandler scm.ScmHandler = &mockScm
+
+			e := Engine{
+				Pipelines: []*pipeline.Pipeline{
+					{
+						Name: "test",
+						Targets: map[string]target.Target{
+							"default": {
+								Scm:    &scmHandler,
+								Result: &result.Target{Result: tt.targetResult},
+							},
+						},
+					},
+				},
+			}
+
+			gotErr := e.pruneSCMBranches()
+
+			require.NoError(t, gotErr)
+			assert.Equal(t, tt.expectedCleanWorkingBranchCounter, mockScm.cleanWorkingBranchCounter)
+		})
+	}
+}
+
+// mockCloneScm implements the scm methods used while cloning git repositories.
+type mockCloneScm struct {
+	scm.ScmHandler
+	directory string
+	cloneErr  error
+}
+
+func (m *mockCloneScm) GetDirectory() string {
+	return m.directory
+}
+
+func (m *mockCloneScm) Clone() (string, error) {
+	return m.directory, m.cloneErr
+}
+
+func TestInitSCMFailedClone(t *testing.T) {
+	failing := &pipeline.Pipeline{
+		Name: "failing",
+		SCMs: map[string]scm.Scm{
+			"broken": {Handler: &mockCloneScm{directory: "/tmp/broken", cloneErr: errors.New("authentication required")}},
+		},
+	}
+	working := &pipeline.Pipeline{
+		Name: "working",
+		SCMs: map[string]scm.Scm{
+			"default": {Handler: &mockCloneScm{directory: "/tmp/default"}},
+		},
+	}
+
+	e := Engine{Pipelines: []*pipeline.Pipeline{failing, working}}
+
+	require.NoError(t, e.InitSCM())
+
+	assert.EqualError(t, e.failedSCMError(failing), `scm "broken" failed to clone: authentication required`)
+	assert.NoError(t, e.failedSCMError(working))
+}
+
+type recordingActionHandler struct {
+	action.ActionHandler
+	cleaned int
+}
+
+func (h *recordingActionHandler) CleanAction(ctx context.Context, report *reports.Action) error {
+	h.cleaned++
+	return nil
+}
+
+func TestRunActionsSkipsFailedClonePipeline(t *testing.T) {
+	handler := &recordingActionHandler{}
+	failing := &pipeline.Pipeline{
+		Name:    "failing",
+		SCMs:    map[string]scm.Scm{"broken": {Handler: &mockCloneScm{directory: "/tmp/broken", cloneErr: errors.New("authentication required")}}},
+		Targets: map[string]target.Target{"t": {}},
+		Actions: map[string]action.Action{"pr": {Handler: handler}},
+	}
+
+	e := Engine{Pipelines: []*pipeline.Pipeline{failing}}
+	require.NoError(t, e.InitSCM())
+
+	require.NoError(t, e.runActions(context.Background()))
+	assert.Zero(t, handler.cleaned, "a pipeline whose scm failed to clone must not clean up or merge actions")
+}
+
+func TestRunReportsFailedClone(t *testing.T) {
+	failing := &pipeline.Pipeline{
+		Name: "failing",
+		SCMs: map[string]scm.Scm{
+			"broken": {Handler: &mockCloneScm{directory: "/tmp/broken", cloneErr: errors.New("authentication required")}},
+		},
+	}
+
+	e := Engine{Pipelines: []*pipeline.Pipeline{failing}}
+	e.Options.DisableUdashReport = true
+	e.SetTracer(noop.NewTracerProvider().Tracer("test"))
+	require.NoError(t, e.InitSCM())
+
+	require.Error(t, e.Run(context.Background()))
+	assert.Equal(t, result.FAILURE, failing.Report.Result)
+	assert.Equal(t, `scm "broken" failed to clone: authentication required`, failing.Report.Err)
+}
+
+// mockBranchScm is an scm whose url and branches identify a shared pull request.
+type mockBranchScm struct {
+	mockCloneScm
+}
+
+func (m *mockBranchScm) GetURL() string {
+	return "https://example.com/org/repo.git"
+}
+
+func (m *mockBranchScm) GetBranches() (string, string, string) {
+	return "main", "updatecli_main", "main"
+}
+
+func TestHandledCleanupKeysKeepsActionSharedWithFailedClonePipeline(t *testing.T) {
+	brokenSCM := scm.Scm{Handler: &mockBranchScm{mockCloneScm{directory: "/tmp/broken", cloneErr: errors.New("authentication required")}}}
+	healthySCM := scm.Scm{Handler: &mockBranchScm{mockCloneScm{directory: "/tmp/healthy"}}}
+
+	handler := &recordingActionHandler{}
+	failing := &pipeline.Pipeline{
+		Name:    "failing",
+		SCMs:    map[string]scm.Scm{"broken": brokenSCM},
+		Targets: map[string]target.Target{"t": {}},
+		Actions: map[string]action.Action{"pr": {Handler: handler, Scm: &brokenSCM, Config: action.Config{Kind: "github/pullrequest"}}},
+	}
+	healthy := &pipeline.Pipeline{
+		Name:    "healthy",
+		SCMs:    map[string]scm.Scm{"healthy": healthySCM},
+		Targets: map[string]target.Target{"t": {}},
+		Actions: map[string]action.Action{"pr": {Handler: handler, Scm: &healthySCM, Config: action.Config{Kind: "github/pullrequest"}}},
+	}
+
+	e := Engine{Pipelines: []*pipeline.Pipeline{failing, healthy}}
+	require.NoError(t, e.InitSCM())
+
+	require.NoError(t, healthy.RunCleanActions(context.Background(), e.handledCleanupKeys()))
+	assert.Zero(t, handler.cleaned, "a pull request shared with a pipeline whose scm failed to clone must not be cleaned up")
+}
+
+// TestPushSCMCommitsRecoversFromPushErrors checks that a working branch which
+// ends up pushed is not reported as a failure because an earlier push attempt
+// of the same branch errored. See https://github.com/updatecli/updatecli/issues/10825
+func TestPushSCMCommitsRecoversFromPushErrors(t *testing.T) {
+	refLockErr := errors.New("cannot lock ref 'refs/heads/updatecli_main': reference already exists")
+
+	testdata := []struct {
+		name string
+		// pipelines is the number of pipelines sharing the same SCM working branch
+		pipelines            int
+		pushErrors           []error
+		remoteBranchUpToDate bool
+		expectedError        bool
+		expectedPushCounter  int
+	}{
+		{
+			name:                 "an earlier push error is cleared when a later target pushes the branch",
+			pipelines:            2,
+			pushErrors:           []error{refLockErr, nil},
+			remoteBranchUpToDate: true,
+			expectedError:        false,
+			expectedPushCounter:  2,
+		},
+		{
+			name:                 "an earlier push error is cleared when the remote branch is up to date",
+			pipelines:            1,
+			pushErrors:           []error{refLockErr},
+			remoteBranchUpToDate: true,
+			expectedError:        false,
+			expectedPushCounter:  1,
+		},
+		{
+			name:                 "push errors are kept when the branch cannot be published",
+			pipelines:            1,
+			pushErrors:           []error{refLockErr, refLockErr},
+			remoteBranchUpToDate: false,
+			expectedError:        true,
+			expectedPushCounter:  2,
+		},
+	}
+
+	for _, tt := range testdata {
+		t.Run(tt.name, func(t *testing.T) {
+			mockScm := mockPushScm{
+				url:                  "https://github.com/updatecli/updatecli.git",
+				workingBranch:        "updatecli_main",
+				targetBranch:         "main",
+				remoteBranchUpToDate: tt.remoteBranchUpToDate,
+				pushErrors:           tt.pushErrors,
+			}
+
+			var scmHandler scm.ScmHandler = &mockScm
+
+			pipelines := make([]*pipeline.Pipeline, 0, tt.pipelines)
+			targetResults := make([]*result.Target, 0, tt.pipelines)
+			for i := 0; i < tt.pipelines; i++ {
+				targetResult := &result.Target{Result: result.SUCCESS}
+				targetResults = append(targetResults, targetResult)
+				pipelines = append(pipelines, &pipeline.Pipeline{
+					Name: "test",
+					Targets: map[string]target.Target{
+						"default": {
+							Scm:    &scmHandler,
+							ToPush: true,
+							Result: targetResult,
+						},
+					},
+				})
+			}
+
+			e := Engine{Pipelines: pipelines}
+
+			gotErr := e.pushSCMCommits()
+
+			if tt.expectedError {
+				require.Error(t, gotErr)
+				for _, targetResult := range targetResults {
+					// A branch which is not published must keep its targets failed,
+					// otherwise actions would run for changes that were not pushed.
+					assert.Equal(t, result.FAILURE, targetResult.Result)
+					assert.Equal(t, "failed to push commits", targetResult.Description)
+				}
+			} else {
+				require.NoError(t, gotErr)
+				for _, targetResult := range targetResults {
+					// Once the branch is published the previous target result must be
+					// restored, otherwise the action creating the pull request is
+					// skipped as it only runs for targets requiring attention.
+					assert.Equal(t, result.SUCCESS, targetResult.Result)
+					assert.Empty(t, targetResult.Description)
+				}
+			}
+			assert.Equal(t, tt.expectedPushCounter, mockScm.pushCounter)
+		})
+	}
+}
+
+// TestPushSCMCommitsKeepsCheckoutFailures checks that a checkout failure is not
+// cleared because the remote branch is reported up to date. The remote branch
+// status check also reports a branch as up to date when the local working
+// branch does not exist, which a failed checkout may leave behind, so only an
+// actual push proves that the target's changes have been published.
+func TestPushSCMCommitsKeepsCheckoutFailures(t *testing.T) {
+	checkoutErr := errors.New("creating working branch \"updatecli_main\"")
+
+	testdata := []struct {
+		name                 string
+		remoteBranchUpToDate bool
+		expectedError        bool
+		expectedPushCounter  int
+	}{
+		{
+			name:                 "a checkout failure is kept when the remote branch is reported up to date",
+			remoteBranchUpToDate: true,
+			expectedError:        true,
+			expectedPushCounter:  0,
+		},
+		{
+			name:                 "a checkout failure is cleared when the branch is pushed",
+			remoteBranchUpToDate: false,
+			expectedError:        false,
+			expectedPushCounter:  1,
+		},
+	}
+
+	for _, tt := range testdata {
+		t.Run(tt.name, func(t *testing.T) {
+			mockScm := mockPushScm{
+				url:                  "https://github.com/updatecli/updatecli.git",
+				workingBranch:        "updatecli_main",
+				targetBranch:         "main",
+				remoteBranchUpToDate: tt.remoteBranchUpToDate,
+				checkoutErrors:       []error{checkoutErr},
+			}
+
+			var scmHandler scm.ScmHandler = &mockScm
+			targetResult := &result.Target{Result: result.ATTENTION}
+
+			e := Engine{Pipelines: []*pipeline.Pipeline{
+				{
+					Name: "test",
+					Targets: map[string]target.Target{
+						"default": {
+							Scm:    &scmHandler,
+							ToPush: true,
+							Result: targetResult,
+						},
+					},
+				},
+			}}
+
+			gotErr := e.pushSCMCommits()
+
+			if tt.expectedError {
+				require.Error(t, gotErr)
+				assert.Contains(t, gotErr.Error(), checkoutErr.Error())
+				assert.Equal(t, result.FAILURE, targetResult.Result)
+			} else {
+				require.NoError(t, gotErr)
+				assert.Equal(t, result.ATTENTION, targetResult.Result)
+			}
+			assert.Equal(t, tt.expectedPushCounter, mockScm.pushCounter)
+		})
+	}
+}
+
+// TestPushSCMCommitsRecoveredTargetKeepsBranchReset checks that a target whose
+// push failed, and which is recovered by the branch publication pass pushing
+// its working branch, reports what that push did to the branch: actions rely
+// on BranchReset to know that the pull request content was reset.
+func TestPushSCMCommitsRecoveredTargetKeepsBranchReset(t *testing.T) {
+	refLockErr := errors.New("cannot lock ref 'refs/heads/updatecli_main': reference already exists")
+
+	mockScm := mockPushScm{
+		url:                  "https://github.com/updatecli/updatecli.git",
+		workingBranch:        "updatecli_main",
+		targetBranch:         "main",
+		remoteBranchUpToDate: false,
+		// The target push fails, then the branch publication push succeeds
+		// and reports a branch reset.
+		pushErrors: []error{refLockErr, nil},
+	}
+
+	var scmHandler scm.ScmHandler = &mockScm
+	targetResult := &result.Target{Result: result.ATTENTION}
+
+	e := Engine{Pipelines: []*pipeline.Pipeline{
+		{
+			Name: "test",
+			Targets: map[string]target.Target{
+				"default": {
+					Scm:    &scmHandler,
+					ToPush: true,
+					Result: targetResult,
+				},
+			},
+		},
+	}}
+
+	gotErr := e.pushSCMCommits()
+
+	require.NoError(t, gotErr)
+	assert.Equal(t, 2, mockScm.pushCounter)
+	assert.Equal(t, result.ATTENTION, targetResult.Result)
+	assert.True(t, targetResult.Scm.BranchReset)
+}
+
+// TestPushSCMCommitsReportsFailuresInStableOrder checks that every push
+// failure left is reported, ordered by repository, and that the target is only
+// named once per message.
+func TestPushSCMCommitsReportsFailuresInStableOrder(t *testing.T) {
+	refLockErr := errors.New("cannot lock ref 'refs/heads/updatecli_main': reference already exists")
+
+	for range 20 {
+		pipelines := []*pipeline.Pipeline{}
+		for _, url := range []string{"https://example.com/c.git", "https://example.com/a.git", "https://example.com/b.git"} {
+			var handler scm.ScmHandler = &mockPushScm{
+				url:           url,
+				workingBranch: "updatecli_main",
+				targetBranch:  "main",
+				pushErrors:    []error{refLockErr, refLockErr},
+			}
+			pipelines = append(pipelines, &pipeline.Pipeline{
+				Name: url,
+				Targets: map[string]target.Target{
+					"default": {
+						Config: target.Config{ResourceConfig: resource.ResourceConfig{Name: url}},
+						Scm:    &handler,
+						ToPush: true,
+						Result: &result.Target{Result: result.ATTENTION},
+					},
+				},
+			})
+		}
+
+		e := Engine{Pipelines: pipelines}
+
+		gotErr := e.pushSCMCommits()
+
+		require.Error(t, gotErr)
+		assert.Equal(t, 3, strings.Count(gotErr.Error(), "pushing commits for target"))
+
+		a := strings.Index(gotErr.Error(), "a.git")
+		b := strings.Index(gotErr.Error(), "b.git")
+		c := strings.Index(gotErr.Error(), "c.git")
+		assert.True(t, a < b && b < c, "failures must be ordered by repository: %s", gotErr)
+	}
+}
+
+// TestPushSCMCommitsKeepsEveryFailureMessage checks that two targets sharing a
+// working branch and failing for different reasons are both reported.
+func TestPushSCMCommitsKeepsEveryFailureMessage(t *testing.T) {
+	checkoutErr := errors.New("creating working branch")
+	refLockErr := errors.New("cannot lock ref 'refs/heads/updatecli_main': reference already exists")
+
+	mockScm := mockPushScm{
+		url:            "https://github.com/updatecli/updatecli.git",
+		workingBranch:  "updatecli_main",
+		targetBranch:   "main",
+		checkoutErrors: []error{checkoutErr},
+		pushErrors:     []error{refLockErr, refLockErr},
+	}
+
+	var scmHandler scm.ScmHandler = &mockScm
+
+	e := Engine{Pipelines: []*pipeline.Pipeline{
+		{
+			Name: "first",
+			Targets: map[string]target.Target{
+				"default": {Scm: &scmHandler, ToPush: true, Result: &result.Target{Result: result.ATTENTION}},
+			},
+		},
+		{
+			Name: "second",
+			Targets: map[string]target.Target{
+				"default": {Scm: &scmHandler, ToPush: true, Result: &result.Target{Result: result.ATTENTION}},
+			},
+		},
+	}}
+
+	gotErr := e.pushSCMCommits()
+
+	require.Error(t, gotErr)
+	assert.Contains(t, gotErr.Error(), checkoutErr.Error())
+	assert.Contains(t, gotErr.Error(), refLockErr.Error())
+}
+
+// TestPushSCMCommitsKeepsFailuresFromOtherCheckouts checks that a push from one
+// working directory does not clear the push failure of another checkout sharing
+// the same repository URL and working branch, whose commits were not published.
+func TestPushSCMCommitsKeepsFailuresFromOtherCheckouts(t *testing.T) {
+	refLockErr := errors.New("cannot lock ref 'refs/heads/updatecli_main': reference already exists")
+
+	failedScm := mockPushScm{
+		url:           "https://github.com/updatecli/updatecli.git",
+		workingBranch: "updatecli_main",
+		targetBranch:  "main",
+		directory:     "/checkouts/one",
+		// The target push fails, and so does the branch publication retry.
+		pushErrors: []error{refLockErr, refLockErr},
+	}
+	pushedScm := mockPushScm{
+		url:                  "https://github.com/updatecli/updatecli.git",
+		workingBranch:        "updatecli_main",
+		targetBranch:         "main",
+		directory:            "/checkouts/two",
+		remoteBranchUpToDate: true,
+	}
+
+	var failedHandler scm.ScmHandler = &failedScm
+	var pushedHandler scm.ScmHandler = &pushedScm
+
+	failedResult := &result.Target{Result: result.ATTENTION}
+	pushedResult := &result.Target{Result: result.ATTENTION}
+
+	e := Engine{Pipelines: []*pipeline.Pipeline{
+		{
+			Name: "failing checkout",
+			Targets: map[string]target.Target{
+				"default": {Scm: &failedHandler, ToPush: true, Result: failedResult},
+			},
+		},
+		{
+			Name: "pushing checkout",
+			Targets: map[string]target.Target{
+				"default": {Scm: &pushedHandler, ToPush: true, Result: pushedResult},
+			},
+		},
+	}}
+
+	gotErr := e.pushSCMCommits()
+
+	// The second checkout pushed its commits, but nothing proves that the first
+	// checkout's commits have been published, so its failure must be kept.
+	require.Error(t, gotErr)
+	assert.Contains(t, gotErr.Error(), refLockErr.Error())
+	assert.Equal(t, result.FAILURE, failedResult.Result)
+	assert.Equal(t, result.ATTENTION, pushedResult.Result)
+}

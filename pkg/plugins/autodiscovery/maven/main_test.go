@@ -1,0 +1,502 @@
+package maven
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.yaml.in/yaml/v4"
+
+	mavenresource "github.com/updatecli/updatecli/pkg/plugins/resources/maven"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/age"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/version"
+)
+
+// TestMain isolates HOME/MAVEN_HOME/M2_HOME for the whole package so that
+// getSettingsXMLPath never picks up a developer's real ~/.m2/settings.xml,
+// which would otherwise leak real mirror credentials into test assertions.
+func TestMain(m *testing.M) {
+	tmpHome, err := os.MkdirTemp("", "maven-test-home")
+	if err != nil {
+		panic(err)
+	}
+
+	os.Setenv("HOME", tmpHome)
+	os.Unsetenv("MAVEN_HOME")
+	os.Unsetenv("M2_HOME")
+
+	code := m.Run()
+	os.RemoveAll(tmpHome)
+	os.Exit(code)
+}
+
+func TestDiscoverManifests(t *testing.T) {
+	testdata := []struct {
+		name              string
+		rootDir           string
+		expectedPipelines []string
+	}{
+		{
+			name:    "Scenario - with external http mirrorof",
+			rootDir: "testdata/externalhttp",
+			expectedPipelines: []string{`name: 'Bump Maven dependency org.apache.commons/commons-lang3'
+sources:
+  org.apache.commons/commons-lang3:
+    name: 'Get latest Maven Artifact version "org.apache.commons/commons-lang3"'
+    kind: 'maven'
+    spec:
+      artifactid: 'commons-lang3'
+      groupid: 'org.apache.commons'
+      repositories:
+        - 'https://mirror.example.com/maven'
+      versionfilter:
+        kind: 'latest'
+        pattern: 'latest'
+conditions:
+  artifactid:
+    name: 'Ensure dependency artifactId "commons-lang3" is specified'
+    kind: 'xml'
+    spec:
+      file: 'pom.xml'
+      path: '/project/dependencies/dependency[1]/artifactId'
+      value: 'commons-lang3'
+    disablesourceinput: true
+  groupid:
+    name: 'Ensure dependency groupId "org.apache.commons" is specified'
+    kind: 'xml'
+    spec:
+      file: 'pom.xml'
+      path: '/project/dependencies/dependency[1]/groupId'
+      value: 'org.apache.commons'
+    disablesourceinput: true
+targets:
+  org.apache.commons/commons-lang3:
+    name: 'deps(maven): update "org.apache.commons/commons-lang3" to {{ source "org.apache.commons/commons-lang3" }}'
+    kind: 'xml'
+    spec:
+      file: 'pom.xml'
+      path: '/project/dependencies/dependency[1]/version'
+    sourceid: 'org.apache.commons/commons-lang3'
+`},
+		},
+		{
+			name:    "Scenario - with excluded mirrorof",
+			rootDir: "testdata/exclude",
+			expectedPipelines: []string{`name: 'Bump Maven dependency org.apache.commons/commons-lang3'
+sources:
+  org.apache.commons/commons-lang3:
+    name: 'Get latest Maven Artifact version "org.apache.commons/commons-lang3"'
+    kind: 'maven'
+    spec:
+      artifactid: 'commons-lang3'
+      groupid: 'org.apache.commons'
+      repositories:
+        - 'https://foo:bar@mirror.example.com/maven'
+        - 'http://bar-repo.example.com/maven'
+      versionfilter:
+        kind: 'latest'
+        pattern: 'latest'
+conditions:
+  artifactid:
+    name: 'Ensure dependency artifactId "commons-lang3" is specified'
+    kind: 'xml'
+    spec:
+      file: 'pom.xml'
+      path: '/project/dependencies/dependency[1]/artifactId'
+      value: 'commons-lang3'
+    disablesourceinput: true
+  groupid:
+    name: 'Ensure dependency groupId "org.apache.commons" is specified'
+    kind: 'xml'
+    spec:
+      file: 'pom.xml'
+      path: '/project/dependencies/dependency[1]/groupId'
+      value: 'org.apache.commons'
+    disablesourceinput: true
+targets:
+  org.apache.commons/commons-lang3:
+    name: 'deps(maven): update "org.apache.commons/commons-lang3" to {{ source "org.apache.commons/commons-lang3" }}'
+    kind: 'xml'
+    spec:
+      file: 'pom.xml'
+      path: '/project/dependencies/dependency[1]/version'
+    sourceid: 'org.apache.commons/commons-lang3'
+`},
+		},
+		{
+			name:    "Scenario - Default",
+			rootDir: "testdata/default",
+			expectedPipelines: []string{`name: 'Bump Maven dependency com.jcraft/jsch'
+sources:
+  com.jcraft/jsch:
+    name: 'Get latest Maven Artifact version "com.jcraft/jsch"'
+    kind: 'maven'
+    spec:
+      artifactid: 'jsch'
+      groupid: 'com.jcraft'
+      repositories:
+        - 'https://repo.jenkins-ci.org/public/'
+        - 'https://mirror.example.com/maven2'
+      versionfilter:
+        kind: 'latest'
+        pattern: 'latest'
+conditions:
+  artifactid:
+    name: 'Ensure dependency artifactId "jsch" is specified'
+    kind: 'xml'
+    spec:
+      file: 'pom.xml'
+      path: '/project/dependencies/dependency[1]/artifactId'
+      value: 'jsch'
+    disablesourceinput: true
+  groupid:
+    name: 'Ensure dependency groupId "com.jcraft" is specified'
+    kind: 'xml'
+    spec:
+      file: 'pom.xml'
+      path: '/project/dependencies/dependency[1]/groupId'
+      value: 'com.jcraft'
+    disablesourceinput: true
+targets:
+  com.jcraft/jsch:
+    name: 'deps(maven): update "com.jcraft/jsch" to {{ source "com.jcraft/jsch" }}'
+    kind: 'xml'
+    spec:
+      file: 'pom.xml'
+      path: '/project/dependencies/dependency[1]/version'
+    sourceid: 'com.jcraft/jsch'
+`, `name: 'Bump Maven dependencyManagement io.jenkins.tools.bom/bom-2.346.x'
+sources:
+  io.jenkins.tools.bom/bom-2.346.x:
+    name: 'Get latest Maven Artifact version "io.jenkins.tools.bom/bom-2.346.x"'
+    kind: 'maven'
+    spec:
+      artifactid: 'bom-2.346.x'
+      groupid: 'io.jenkins.tools.bom'
+      repositories:
+        - 'https://repo.jenkins-ci.org/public/'
+        - 'https://mirror.example.com/maven2'
+      versionfilter:
+        kind: 'latest'
+        pattern: 'latest'
+conditions:
+  artifactid:
+    name: 'Ensure dependencyManagement artifactId "bom-2.346.x" is specified'
+    kind: 'xml'
+    spec:
+      file: 'pom.xml'
+      path: '/project/dependencyManagement/dependencies/dependency[1]/artifactId'
+      value: 'bom-2.346.x'
+    disablesourceinput: true
+  groupid:
+    name: 'Ensure dependencyManagement groupId "io.jenkins.tools.bom" is specified'
+    kind: 'xml'
+    spec:
+      file: 'pom.xml'
+      path: '/project/dependencyManagement/dependencies/dependency[1]/groupId'
+      value: 'io.jenkins.tools.bom'
+    disablesourceinput: true
+targets:
+  io.jenkins.tools.bom/bom-2.346.x:
+    name: 'deps(maven): update "io.jenkins.tools.bom/bom-2.346.x" to {{ source "io.jenkins.tools.bom/bom-2.346.x" }}'
+    kind: 'xml'
+    spec:
+      file: 'pom.xml'
+      path: '/project/dependencyManagement/dependencies/dependency[1]/version'
+    sourceid: 'io.jenkins.tools.bom/bom-2.346.x'
+`, `name: 'Bump Maven parent Pom org.jenkins-ci.plugins/plugin'
+sources:
+  org.jenkins-ci.plugins/plugin:
+    name: 'Get latest Parent Pom Artifact version "org.jenkins-ci.plugins/plugin"'
+    kind: 'maven'
+    spec:
+      artifactid: 'plugin'
+      groupid: 'org.jenkins-ci.plugins'
+      repositories:
+        - 'https://repo.jenkins-ci.org/public/'
+        - 'https://mirror.example.com/maven2'
+      versionfilter:
+        kind: 'latest'
+        pattern: 'latest'
+conditions:
+  artifactid:
+    name: 'Ensure parent artifactId "plugin" is specified'
+    kind: 'xml'
+    spec:
+      file: 'pom.xml'
+      path: '/project/parent/artifactId'
+      value: 'plugin'
+    disablesourceinput: true
+  groupid:
+    name: 'Ensure parent pom.xml groupId "org.jenkins-ci.plugins" is specified'
+    kind: 'xml'
+    spec:
+      file: 'pom.xml'
+      path: '/project/parent/groupId'
+      value: 'org.jenkins-ci.plugins'
+    disablesourceinput: true
+targets:
+  org.jenkins-ci.plugins/plugin:
+    name: 'deps(maven): update "org.jenkins-ci.plugins/plugin" to {{ source "org.jenkins-ci.plugins/plugin" }}'
+    kind: 'xml'
+    spec:
+      file: 'pom.xml'
+      path: '/project/parent/version'
+    sourceid: 'org.jenkins-ci.plugins/plugin'
+`},
+		},
+	}
+
+	for _, tt := range testdata {
+
+		t.Run(tt.name, func(t *testing.T) {
+			maven, err := New(
+				Spec{}, tt.rootDir, "", "")
+
+			require.NoError(t, err)
+
+			var pipelines []string
+			rawPipelines, err := maven.DiscoverManifests()
+			require.NoError(t, err)
+
+			assert.Equal(t, len(tt.expectedPipelines), len(rawPipelines))
+
+			for i := range rawPipelines {
+				// We expect manifest generated by the autodiscovery to use the yaml syntax
+				pipelines = append(pipelines, string(rawPipelines[i]))
+				assert.Equal(t, tt.expectedPipelines[i], pipelines[i])
+			}
+		})
+	}
+
+}
+
+func TestDiscoverManifestsWithoutRepository(t *testing.T) {
+	// Without repositories in the pom.xml or settings.xml, the source uses Maven Central
+	// and must still apply the version filter
+	maven, err := New(Spec{VersionFilter: version.Filter{Kind: "semver", Pattern: "minor"}}, "testdata/norepository", "", "")
+	require.NoError(t, err)
+
+	manifests, err := maven.DiscoverManifests()
+	require.NoError(t, err)
+	require.Len(t, manifests, 1)
+
+	assert.NotContains(t, string(manifests[0]), "repositories:")
+	assert.Contains(t, string(manifests[0]), "      versionfilter:\n        kind: 'semver'\n")
+}
+
+func TestDiscoverManifestsAge(t *testing.T) {
+	tests := []struct {
+		name    string
+		spec    map[string]interface{}
+		want    string
+		wantErr bool
+	}{
+		{
+			name: "no age by default",
+			spec: map[string]interface{}{},
+		},
+		{
+			name: "explicit age",
+			spec: map[string]interface{}{"age": map[string]interface{}{"minimum": "3d", "maximum": "1y"}},
+			want: "      age:\n        minimum: '3d'\n        maximum: '1y'\n",
+		},
+		{
+			name: "empty age",
+			spec: map[string]interface{}{"age": map[string]interface{}{}},
+		},
+		{
+			name:    "invalid age",
+			spec:    map[string]interface{}{"age": map[string]interface{}{"minimum": "soon"}},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			maven, err := New(tt.spec, "testdata/externalhttp", "", "")
+			if tt.wantErr {
+				require.ErrorContains(t, err, "wrong age spec")
+				return
+			}
+			require.NoError(t, err)
+
+			manifests, err := maven.DiscoverManifests()
+			require.NoError(t, err)
+			require.NotEmpty(t, manifests)
+
+			for _, manifest := range manifests {
+				if tt.want == "" {
+					assert.NotContains(t, string(manifest), "age:")
+					continue
+				}
+				assert.Contains(t, string(manifest), tt.want)
+			}
+		})
+	}
+}
+
+func TestDiscoverManifestsSkipsVersionRanges(t *testing.T) {
+	maven, err := New(Spec{}, "testdata/vulnerability", "", "")
+	require.NoError(t, err)
+
+	manifests, err := maven.DiscoverManifests()
+	require.NoError(t, err)
+
+	// The dependencies relying on a property or a version range are ignored
+	require.Len(t, manifests, 2)
+	for _, manifest := range manifests {
+		assert.NotContains(t, string(manifest), "commons-collections")
+	}
+}
+
+// TestDiscoverManifestsSkipsTemplateSyntax checks that values read from a pom.xml can't inject
+// Go template actions, as a generated manifest is executed as a template at runtime.
+func TestDiscoverManifestsSkipsTemplateSyntax(t *testing.T) {
+	maven, err := New(Spec{}, "testdata/templatesyntax", "", "")
+	require.NoError(t, err)
+
+	manifests, err := maven.DiscoverManifests()
+	require.NoError(t, err)
+
+	// Only log4j-core is left, the parent pom and the other dependencies contain template syntax
+	require.Len(t, manifests, 1)
+	assert.Contains(t, string(manifests[0]), "log4j-core")
+	assert.NotContains(t, string(manifests[0]), "{{ .Name }}")
+	assert.NotContains(t, string(manifests[0]), "pipeline")
+	// Only the repository URL with template syntax is dropped
+	assert.Contains(t, string(manifests[0]), "https://repo.example.com/maven2")
+	assert.NotContains(t, string(manifests[0]), "attacker.example.com")
+}
+
+// TestDiscoverManifestsSkipsTemplateSyntaxInPath checks that a pom.xml path can't inject Go
+// template actions either, as the manifest references it.
+func TestDiscoverManifestsSkipsTemplateSyntaxInPath(t *testing.T) {
+	pom, err := os.ReadFile("testdata/default/pom.xml")
+	require.NoError(t, err)
+
+	rootDir := t.TempDir()
+	pomDir := filepath.Join(rootDir, `{{ pipeline "Name" }}`)
+	require.NoError(t, os.MkdirAll(pomDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(pomDir, "pom.xml"), pom, 0o600)) //nolint:gosec // G703 false positive: pomDir is under t.TempDir()
+
+	maven, err := New(Spec{}, rootDir, "", "")
+	require.NoError(t, err)
+
+	manifests, err := maven.DiscoverManifests()
+	require.NoError(t, err)
+	assert.Empty(t, manifests)
+}
+
+// TestDiscoverManifestsAgeCondition checks that a routine update waits for the current version to
+// reach the minimum age when the version filter can't exclude versions lower than the current one.
+func TestDiscoverManifestsAgeCondition(t *testing.T) {
+	tests := []struct {
+		name          string
+		spec          map[string]interface{}
+		wantCondition bool
+	}{
+		{
+			name:          "default latest filter with a minimum age",
+			spec:          map[string]interface{}{"age": map[string]interface{}{"minimum": "3d", "maximum": "1y"}},
+			wantCondition: true,
+		},
+		{
+			name: "regex filter with a minimum age",
+			spec: map[string]interface{}{
+				"age":           map[string]interface{}{"minimum": "3d"},
+				"versionfilter": map[string]interface{}{"kind": "regex", "pattern": "^3"},
+			},
+			wantCondition: true,
+		},
+		{
+			name: "semver filter bounded at the current version",
+			spec: map[string]interface{}{
+				"age":           map[string]interface{}{"minimum": "3d"},
+				"versionfilter": map[string]interface{}{"kind": "semver", "pattern": "minor"},
+			},
+		},
+		{
+			name: "downgrade allowed",
+			spec: map[string]interface{}{"age": map[string]interface{}{"minimum": "3d", "allowdowngrade": true}},
+		},
+		{
+			name: "maximum age only",
+			spec: map[string]interface{}{"age": map[string]interface{}{"maximum": "1y"}},
+		},
+		{
+			name: "no age",
+			spec: map[string]interface{}{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			crawler, err := New(tt.spec, "testdata/externalhttp", "", "")
+			require.NoError(t, err)
+
+			manifests, err := crawler.DiscoverManifests()
+			require.NoError(t, err)
+			require.Len(t, manifests, 1)
+
+			var pipeline securityPipeline
+			require.NoError(t, yaml.Unmarshal(manifests[0], &pipeline))
+			condition, found := pipeline.Conditions["currentversionage"]
+			require.Equal(t, tt.wantCondition, found)
+			if !tt.wantCondition {
+				return
+			}
+
+			assert.Equal(t, "maven", condition.Kind)
+			assert.Equal(t, "3.12.0", condition.Spec["version"])
+			assert.Equal(t, "org.apache.commons", condition.Spec["groupid"])
+			assert.Equal(t, "commons-lang3", condition.Spec["artifactid"])
+			// Only the minimum age is checked, a maximum would hold back every old version forever.
+			// The condition is inverted, so that it only fails when the repository dates the
+			// current version within the minimum age, and a version it doesn't list passes.
+			assert.True(t, condition.FailWhen)
+			assert.Equal(t, map[string]interface{}{"maximum": "3d"}, condition.Spec["age"])
+
+			_, err = mavenresource.New(condition.Spec)
+			require.NoError(t, err)
+		})
+	}
+}
+
+// TestWithRoutineUpdateAgeConditionNonSemverVersion checks that a semver filter can't exclude
+// versions lower than a current version that isn't a semantic version, so the update waits
+// for the current version to reach the minimum age instead.
+func TestWithRoutineUpdateAgeConditionNonSemverVersion(t *testing.T) {
+	tests := []struct {
+		name           string
+		currentVersion string
+		wantCondition  bool
+	}{
+		{name: "semantic version", currentVersion: "5.3.0"},
+		{name: "not a semantic version", currentVersion: "5.3.0.Final", wantCondition: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := Maven{
+				spec: Spec{
+					Age:           age.AutodiscoverySpec{Spec: age.Spec{Minimum: "7d"}},
+					VersionFilter: version.Filter{Kind: "semver", Pattern: "patch"},
+				},
+				versionFilter: version.Filter{Kind: "semver", Pattern: "patch"},
+			}
+
+			params := manifestTemplateParams{}
+			m.withRoutineUpdate(&params, tt.currentVersion)
+
+			if !tt.wantCondition {
+				assert.Empty(t, params.ConditionAge.Maximum)
+				return
+			}
+			assert.Equal(t, "7d", params.ConditionAge.Maximum)
+			assert.Equal(t, tt.currentVersion, params.CurrentVersion)
+		})
+	}
+}

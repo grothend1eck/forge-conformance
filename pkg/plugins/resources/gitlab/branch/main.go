@@ -1,0 +1,271 @@
+package branch
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/go-viper/mapstructure/v2"
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"github.com/updatecli/updatecli/pkg/plugins/resources/gitlab/client"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/age"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/redact"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/version"
+	gitlab "gitlab.com/gitlab-org/api/client-go"
+)
+
+/*
+"gitlab/branch" defines the specification for retrieving branches from a GitLab repository.
+It can be used as a "source" or a "condition".
+*/
+type Spec struct {
+	client.Spec `yaml:",inline,omitempty"`
+	// "owner" defines the owner of the GitLab repository.
+	//
+	// compatible:
+	//   * source
+	//   * condition
+	//
+	// example:
+	//   * owner: updatecli
+	//
+	Owner string `yaml:",omitempty" jsonschema:"required"`
+	// "repository" defines the name of the GitLab repository, for a specific owner.
+	//
+	// compatible:
+	//   * source
+	//   * condition
+	//
+	// example:
+	//   * repository: updatecli
+	//
+	Repository string `yaml:",omitempty" jsonschema:"required"`
+	// "versionfilter" defines the version pattern and kind used to select the branch, such as regex, semver or latest.
+	//
+	// compatible:
+	//   * source
+	//
+	// default:
+	//   kind: latest
+	//
+	VersionFilter version.Filter `yaml:",omitempty"`
+	// "age" defines the minimum or maximum age of a branch to be considered valid.
+	//
+	// compatible:
+	//   * source
+	//
+	// remark:
+	//   * it accepts a duration string such as "24h", "7d", "3w" or "1y".
+	//   * the age of a branch is the committer date of its latest commit.
+	//   * when no branch matches the age filter yet, the source is skipped instead of failing.
+	//
+	Age age.Spec `yaml:",omitempty"`
+	// "branch" defines the name of the branch to look for.
+	//
+	// compatible:
+	//   * condition
+	//
+	// default:
+	//   the output of the associated source.
+	//
+	// example:
+	//   * branch: main
+	//
+	Branch string `yaml:",omitempty"`
+}
+
+// Gitlab contains information to interact with GitLab api
+type Gitlab struct {
+	// spec contains inputs coming from updatecli configuration
+	spec Spec
+	// client handle the api authentication
+	client        client.Client
+	HeadBranch    string
+	foundVersion  version.Version
+	versionFilter version.Filter
+}
+
+// New returns a new valid GitLab object.
+func New(spec interface{}) (*Gitlab, error) {
+
+	var s Spec
+	var clientSpec client.Spec
+
+	// mapstructure.Decode cannot handle embedded fields
+	// hence we decode it in two steps
+	err := mapstructure.Decode(spec, &clientSpec)
+	if err != nil {
+		return &Gitlab{}, err
+	}
+
+	err = mapstructure.Decode(spec, &s)
+	if err != nil {
+		return &Gitlab{}, nil
+	}
+
+	s.Spec = clientSpec
+
+	err = s.Validate()
+
+	if err != nil {
+		return &Gitlab{}, err
+	}
+
+	c, err := client.New(clientSpec)
+
+	if err != nil {
+		return &Gitlab{}, err
+	}
+
+	newFilter, err := s.VersionFilter.Init()
+	if err != nil {
+		return &Gitlab{}, err
+	}
+	s.VersionFilter = newFilter
+
+	g := Gitlab{
+		spec:          s,
+		client:        c,
+		versionFilter: newFilter,
+	}
+
+	return &g, nil
+
+}
+
+// SearchBranches retrieves the branches of a remote GitLab repository, keeping only
+// the ones whose latest commit falls inside the provided age window. GitLab orders
+// branches by name rather than by date, so the result is left in that order.
+func (g *Gitlab) SearchBranches(branchAge age.Spec) ([]string, error) {
+
+	// Timeout api query after 30sec
+	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	results := []string{}
+	// Tracks whether the repository holds branches at all, so that a running cooldown
+	// isn't reported as a repository without any branch.
+	foundBranch := false
+	// GitLab paginates from page 1, so starting anywhere else fetches the first page twice.
+	page := int64(1)
+	for {
+		opt := &gitlab.ListBranchesOptions{ListOptions: gitlab.ListOptions{Page: page, PerPage: 30}}
+
+		branches, resp, err := g.client.Branches.ListBranches(
+			g.getPID(),
+			opt,
+			gitlab.WithContext(ctx),
+		)
+
+		if err != nil {
+			return nil, err
+		}
+
+		if resp.StatusCode > 400 {
+			log.Debugf("RC: %q\nBody:\n%s", resp.Status, resp.Body)
+		}
+
+		for _, branch := range branches {
+			foundBranch = true
+
+			if !branchAge.IsZero() {
+				date, ok := branchDate(branch)
+				if !ok {
+					log.Debugf("ignoring branch %q, which carries no date, as the age filter cannot be applied to it", branch.Name)
+					continue
+				}
+				if !branchAge.Matches(date) {
+					log.Debugf("ignoring branch %q, dated %s, as outside of the age window", branch.Name, date)
+					continue
+				}
+			}
+
+			results = append(results, branch.Name)
+		}
+		// GitLab reports no next page once the last one has been visited.
+		if resp.NextPage == 0 {
+			break
+		}
+		page = resp.NextPage
+	}
+
+	/*
+		The repository does hold branches but the age filter discarded every one of them,
+		which means the branch we would have returned is still cooling down. That's not a
+		lookup failure, so the sentinel lets the caller skip rather than fail.
+	*/
+	if !branchAge.IsZero() && foundBranch && len(results) == 0 {
+		return nil, fmt.Errorf("%w for the GitLab branches of %s", age.ErrNoVersionMatchingAge, g.getPID())
+	}
+
+	return results, nil
+}
+
+// branchDate returns the committer date of the latest commit of a branch, and whether
+// GitLab reported one.
+func branchDate(b *gitlab.Branch) (time.Time, bool) {
+	if b.Commit == nil {
+		return time.Time{}, false
+	}
+	if b.Commit.CommittedDate != nil && !b.Commit.CommittedDate.IsZero() {
+		return *b.Commit.CommittedDate, true
+	}
+	if b.Commit.AuthoredDate != nil && !b.Commit.AuthoredDate.IsZero() {
+		return *b.Commit.AuthoredDate, true
+	}
+	return time.Time{}, false
+}
+
+func (s Spec) Validate() error {
+	gotError := false
+	missingParameters := []string{}
+
+	if len(s.Owner) == 0 {
+		gotError = true
+		missingParameters = append(missingParameters, "owner")
+	}
+
+	if len(s.Repository) == 0 {
+		gotError = true
+		missingParameters = append(missingParameters, "repository")
+	}
+
+	if err := s.Age.Validate(); err != nil {
+		gotError = true
+		log.Errorln(err)
+	}
+
+	if len(missingParameters) > 0 {
+		log.Errorf("missing parameter(s) [%s]", strings.Join(missingParameters, ","))
+	}
+
+	if gotError {
+		return fmt.Errorf("wrong GitLab configuration")
+	}
+
+	return nil
+}
+
+// ReportConfiguration returns a new configuration with only the necessary fields
+// to identify the resource without any sensitive information
+// and context specific data.
+func (g *Gitlab) ReportConfig() interface{} {
+	return Spec{
+		Owner:         g.spec.Owner,
+		Repository:    g.spec.Repository,
+		VersionFilter: g.spec.VersionFilter,
+		Age:           g.spec.Age,
+		Branch:        g.spec.Branch,
+		Spec: client.Spec{
+			URL: redact.URL(g.spec.URL),
+		},
+	}
+}
+
+func (g *Gitlab) getPID() string {
+	return strings.Join([]string{
+		g.spec.Owner,
+		g.spec.Repository}, "/")
+}

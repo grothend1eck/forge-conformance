@@ -1,0 +1,85 @@
+package kubernetes
+
+import (
+	"fmt"
+
+	"github.com/updatecli/updatecli/pkg/core/log"
+)
+
+func (k Kubernetes) discoverKubernetesManifest(file, relativeFile string) [][]byte {
+	var manifests [][]byte
+
+	kubernetesManifestData, err := getKubernetesManifestData(file)
+	if err != nil {
+		log.Debugln(err)
+		return manifests
+	}
+	if kubernetesManifestData == nil {
+		return manifests
+	}
+
+	for yamlDocument, data := range kubernetesManifestData {
+
+		if data == nil {
+			continue
+		}
+
+		list := []struct {
+			cs  []containerSpec
+			key string
+		}{
+			{
+				cs:  data.Spec.Containers,
+				key: "$.spec.containers[%d].image",
+			},
+			{
+				cs:  data.Spec.InitContainers,
+				key: "$.spec.initContainers[%d].image",
+			},
+			{
+				cs:  data.Spec.Template.Spec.Containers,
+				key: "$.spec.template.spec.containers[%d].image",
+			},
+			{
+				cs:  data.Spec.Template.Spec.InitContainers,
+				key: "$.spec.template.spec.initContainers[%d].image",
+			},
+			{
+				cs:  data.Spec.JobTemplateSpec.Spec.Template.Spec.Containers,
+				key: "$.spec.jobTemplate.spec.template.spec.containers[%d].image",
+			},
+			{
+				cs:  data.Spec.JobTemplateSpec.Spec.Template.Spec.InitContainers,
+				key: "$.spec.jobTemplate.spec.template.spec.initContainers[%d].image",
+			},
+		}
+		for _, v := range list {
+			for i, container := range v.cs {
+				containerName := container.Name
+				if containerName == "" {
+					containerName = container.Image
+				}
+
+				manifest, err := k.generateContainerManifest(
+					fmt.Sprintf(v.key, i),
+					containerName,
+					container.Image,
+					relativeFile,
+					"",
+					yamlDocument,
+				)
+				if err != nil {
+					log.Debugln(err)
+					continue
+				}
+
+				if manifest == nil {
+					continue
+				}
+
+				manifests = append(manifests, manifest)
+			}
+		}
+	}
+	return manifests
+}

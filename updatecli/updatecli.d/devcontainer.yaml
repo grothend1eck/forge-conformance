@@ -1,0 +1,65 @@
+name: "deps: Bump Golang version"
+pipelineid: "golang/version"
+
+labels:
+  monitor: active
+  ecosystem: golang
+
+actions:
+  default:
+    kind: github/pullrequest
+    title: 'deps: Bump Golang version to {{ source "golangfullversion" }}'
+    spec:
+      automerge: true
+      labels:
+        - chore
+        - skip-changelog
+    scmid: default
+
+scms:
+  default:
+    kind: github
+    spec:
+      branch: "{{ .scm.branch }}"
+      email: "{{ .scm.email }}"
+      owner: "{{ .scm.owner }}"
+      repository: "{{ .scm.repository }}"
+      user: "{{ .scm.user }}"
+      commitusingapi: true
+      commitmessage:
+        type: chore
+        scope: deps
+
+sources:
+  golang:
+    name: Get latest golang version
+    kind: golang
+    transformers:
+      - findsubmatch:
+          pattern: '(\d+\.\d+)'
+      - addprefix: "dev-"
+
+  golangfullversion:
+    name: Get latest golang version
+    kind: golang
+
+conditions:
+  docker:
+    name: 'Check if mcr.microsoft.com/devcontainers/go:{{ source "golang" }} exist'
+    kind: dockerimage
+    sourceid: golang
+    spec:
+      image: mcr.microsoft.com/devcontainers/go
+
+targets:
+  # Apparently devcontainer json file is not a valid json file
+  # so we can't use the json plugin
+  devcontainer:
+    name: 'update devcontainer to golang {{ source "golang" }}'
+    disablesourceinput: true
+    kind: file
+    scmid: default
+    spec:
+      file: ".devcontainer/devcontainer.json"
+      matchpattern: '"image": "mcr\.microsoft\.com/devcontainers/go:.*"'
+      replacepattern: '"image": "mcr.microsoft.com/devcontainers/go:{{ source "golang" }}"'

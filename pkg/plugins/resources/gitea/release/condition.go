@@ -1,0 +1,42 @@
+package release
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/updatecli/updatecli/pkg/core/log"
+	"github.com/updatecli/updatecli/pkg/core/pipeline/scm"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/age"
+	"github.com/updatecli/updatecli/pkg/plugins/utils/pathresolver"
+)
+
+func (g *Gitea) Condition(ctx context.Context, source string, scm scm.ScmHandler, pathResolver pathresolver.Resolver) (pass bool, message string, err error) {
+
+	if scm != nil {
+		log.Warningf("Condition not supported for the plugin Gitea Release")
+	}
+
+	// A condition checks whether a specific release exists, so the age filter,
+	// which only narrows down which release to pick, doesn't apply here.
+	releases, err := g.SearchReleases(ctx, age.Spec{})
+	if err != nil {
+		return false, "", fmt.Errorf("looking for Gitea release: %w", err)
+	}
+
+	release := source
+	if g.spec.Tag != "" {
+		release = g.spec.Tag
+	}
+
+	if len(releases) == 0 {
+		return false, "no Gitea release found", nil
+	}
+
+	for _, r := range releases {
+		if r == release {
+			return true, fmt.Sprintf("Gitea release %q found", release), nil
+		}
+	}
+
+	return false, fmt.Sprintf("no Gitea Release tag found matching pattern %q", g.versionFilter.Pattern), nil
+}

@@ -1,0 +1,32 @@
+name: Test GitHub Pullrequest
+
+scms:
+  default:
+    kind: github
+    spec:
+      owner: updatecli
+      repository: updatecli
+      branch: main
+
+sources:
+  jenkins:
+    name: Get updatecli config title
+    kind: yaml
+    scmid: default
+    spec:
+      file: "updatecli/updatecli.d/updatecli.yaml"
+      key: "$.name"
+
+targets:
+  jenkins:
+    name: Update updatecli config title
+    kind: yaml
+    scmid: default
+    spec:
+      file: "updatecli/updatecli.d/updatecli.yaml"
+      key: "$.name"
+
+actions:
+  prID1:
+    scmid: default
+    kind: github/pullrequest
