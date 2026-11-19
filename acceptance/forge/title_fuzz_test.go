@@ -20,8 +20,15 @@ type titleEdit struct {
 // Read the title from the same SDK options CreateAction sends to the forge.
 // Both Gitea and Forgejo use the Gitea action.
 type titleEditor struct {
-	edit        func(titleEdit) *string
-	draftMarker *regexp.Regexp
+	edit   func(titleEdit) *string
+	drafts *draftMarkers
+}
+
+// Each adapter supplies its notation and examples; the properties below
+// don't need to know which spelling or capitalization a forge recognizes.
+type draftMarkers struct {
+	prefix   *regexp.Regexp
+	examples []string
 }
 
 var giteaEditor = titleEditor{
@@ -30,7 +37,7 @@ var giteaEditor = titleEditor{
 		opts := spec.EditOptions(&sdk.PullRequest{Title: e.current, Draft: e.draft}, e.generated, "")
 		return &opts.Title
 	},
-	draftMarker: regexp.MustCompile(`(?i)^(?:WIP:|\[WIP\])`),
+	drafts: &draftMarkers{regexp.MustCompile(`(?i)^(?:WIP:|\[WIP\])`), []string{"WIP:", "[wIp]"}},
 }
 
 var titleEditors = map[string]titleEditor{
@@ -79,21 +86,28 @@ func FuzzEditRequestTitle(f *testing.F) {
 
 func FuzzPreserveDraftTitle(f *testing.F) {
 	editors := editorsFor(f, draftTitleMarker)
+	seeded := make(map[*draftMarkers]bool)
+	f.Add("Held by the reviewer", "New title", true) // Server-side draft with an unknown marker.
 	for _, impl := range editors {
-		if impl.Driver.draftMarker == nil {
-			f.Fatalf("%s: missing a draft marker for this capability", impl.Name)
+		drafts := impl.Driver.drafts
+		if drafts == nil || len(drafts.examples) == 0 {
+			f.Fatalf("%s: missing draft notation for this capability", impl.Name)
+		}
+		if !seeded[drafts] {
+			for _, mark := range drafts.examples {
+				f.Add(mark+" old", "New title", true)
+				f.Add(mark+"old", "New title", false)
+				f.Add(strings.ToLower(mark)+" old", mark+" "+mark+" new", true)
+				f.Add(mark+" "+mark+" old", " \t"+mark+" new", true)
+				f.Add(mark+" old", "", false)
+				f.Add("Old title", mark+" new", false)
+			}
+			seeded[drafts] = true
 		}
 	}
-	f.Add("WIP: Update v1", "Update v2", true)
-	f.Add("[wIp]Update v1", "Update v2", false)
-	f.Add("wip: Update v1", "[WIP] WIP: Update v2", true)
-	f.Add("WIP: [WIP] Update v1", " \t[WIP] Update v2", true)
-	f.Add("Draft: Update v1", "Update v2", true)
-	f.Add("[WIP] Update v1", "", false)
-	f.Add("Update v1", "WIP: Update v2", false)
 	f.Fuzz(func(t *testing.T, current, requested string, draft bool) {
 		for _, impl := range editors {
-			marker := impl.Driver.draftMarker
+			marker := impl.Driver.drafts.prefix
 			input := titleEdit{current: current, generated: requested, draft: draft}
 			got := impl.Driver.edit(input)
 			if got == nil {
