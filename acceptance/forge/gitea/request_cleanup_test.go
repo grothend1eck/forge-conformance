@@ -15,7 +15,7 @@ import (
 	"github.com/updatecli/updatecli/acceptance/forge"
 )
 
-func testClean(t *testing.T, s *server) {
+func (s *server) testClean(t *testing.T) {
 	r := s.newRepo(t)
 	c := newCLI(t, s)
 	const (
@@ -78,7 +78,7 @@ func testClean(t *testing.T, s *server) {
 	require.Equal(t, obsolete, r.Refs(t), "only the obsolete working ref should disappear")
 }
 
-func testFork(t *testing.T, s *server) {
+func (s *server) testFork(t *testing.T) {
 	r := s.newRepo(t)
 	c := newCLI(t, s)
 	upstream := publishRepo(t, r)

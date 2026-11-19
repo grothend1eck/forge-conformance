@@ -22,11 +22,10 @@ may exercise several families without qualifying every one of them.
 | Policy distribution | Push a policy, resolve and pull the intended artifact, and preserve its assets and values. | OCI registries, policy bundles, tag and digest references | Not enrolled |
 | Reporting and diagnostics | Report what changed without exposing credentials; preserve request/report identity across updates. | Console and exported reports, CI run links, `udash`, telemetry | PR report cases in forge suite; no separate matrix |
 
-“Not enrolled” means this reporting system has no family matrix yet. The
-existing package and end-to-end tests still count as tests; their results
-are not silently converted into compliance scores. Each measured family
-owns its applicable capabilities, reasons for N/A, and required profiles.
-There is no project-wide percentage that adds unrelated denominators.
+“Not enrolled” means the family has no matrix yet. Existing package and
+end-to-end tests still run. Within a measured family, supported features
+must pass; gaps and non-applicable features have reasons. Unassessed
+implementations are shown separately rather than guessed from missing tests.
 
 For example, a writing contract can give `controller.version` and
 `audit.version` the same value and edit only the controller. `diff` leaves

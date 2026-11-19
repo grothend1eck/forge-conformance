@@ -22,28 +22,23 @@ func TestCapabilities(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			s := startServer(t, name)
-			for _, test := range []struct {
-				name string
-				run  func(*testing.T, *server)
-			}{
-				{"authentication", testAuthentication},
-				{"publish_update", func(t *testing.T, s *server) { forge.RunPublishUpdate(t, s.newPublication) }},
-				{"publish_review_metadata", testPublishReviewMetadata},
-				{"request_safety", testRequestSafety},
-				{"close_obsolete_request", testClean},
-				{"fork_isolation", testFork},
-				{"server_automerge", testProtectedMerge},
-				{"manual_merge", testManualMerge},
-				{"draft_request", testDraft},
-				{"git_scm", testSCM},
-				{"branch_resource", testBranches},
-				{"tag_resource", testTags},
-				{"release_resource", testReleases},
-				{"workflow_discovery", testWorkflowDiscovery},
-				{"gitea_actions_run_link", testWorkflowRunLink},
-			} {
-				t.Run(test.name, func(t *testing.T) { test.run(t, s) })
-			}
+			forge.Matrix.Run(t, name, forge.PublicationCases(s.newPublication), map[string]func(*testing.T){
+				"authentication":          s.testAuthentication,
+				"draft_title_marker":      s.testDraftSurvivesEdit,
+				"publish_review_metadata": s.testPublishReviewMetadata,
+				"request_safety":          s.testRequestSafety,
+				"close_obsolete_request":  s.testClean,
+				"fork_isolation":          s.testFork,
+				"server_automerge":        s.testProtectedMerge,
+				"manual_merge":            s.testManualMerge,
+				"draft_request":           s.testDraft,
+				"git_scm":                 s.testSCM,
+				"branch_resource":         s.testBranches,
+				"tag_resource":            s.testTags,
+				"release_resource":        s.testReleases,
+				"workflow_discovery":      s.testWorkflowDiscovery,
+				"gitea_actions_run_link":  s.testGiteaActionsRunLink,
+			})
 		})
 	}
 }

@@ -17,7 +17,7 @@ import (
 	"go.yaml.in/yaml/v4"
 )
 
-func testWorkflowDiscovery(t *testing.T, s *server) {
+func (s *server) testWorkflowDiscovery(t *testing.T) {
 	const (
 		oldRelease = "v1.0.0"
 		newRelease = "v1.1.0"

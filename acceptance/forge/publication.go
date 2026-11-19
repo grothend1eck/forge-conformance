@@ -48,9 +48,15 @@ func PublicationHead(r *GitRepository) string {
 	return "updatecli_" + r.Base + "_" + PublicationID
 }
 
-// RunPublishUpdate runs the common publication contract. Each case gets its
-// own fixture on the same running forge; enroll the contract as a whole.
-func RunPublishUpdate(t *testing.T, newFixture func(*testing.T) PublicationFixture) {
+// PublicationCases binds the shared publication contracts to a provider fixture.
+func PublicationCases(newFixture func(*testing.T) PublicationFixture) map[string]func(*testing.T) {
+	return map[string]func(*testing.T){
+		publishUpdate:    func(t *testing.T) { runPublishUpdate(t, newFixture) },
+		editRequestTitle: func(t *testing.T) { runRequestTitle(t, newFixture) },
+	}
+}
+
+func runPublishUpdate(t *testing.T, newFixture func(*testing.T) PublicationFixture) {
 	t.Helper()
 	for _, test := range []struct {
 		name string

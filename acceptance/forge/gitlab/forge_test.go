@@ -13,6 +13,6 @@ func TestCapabilities(t *testing.T) {
 	conformance.Observe(t)
 	t.Run("gitlab", func(t *testing.T) {
 		s := start(t)
-		t.Run("publish_update", func(t *testing.T) { forge.RunPublishUpdate(t, s.newPublication) })
+		forge.Matrix.Run(t, "gitlab", forge.PublicationCases(s.newPublication))
 	})
 }

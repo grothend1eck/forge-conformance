@@ -13,7 +13,7 @@ import (
 	"github.com/updatecli/updatecli/acceptance/internal/cli"
 )
 
-func testReleases(t *testing.T, s *server) {
+func (s *server) testReleases(t *testing.T) {
 	t.Run("pagination", func(t *testing.T) { testReleasePagination(t, s) })
 	t.Run("selection-and-conditions", func(t *testing.T) {
 		r := s.newRepo(t)

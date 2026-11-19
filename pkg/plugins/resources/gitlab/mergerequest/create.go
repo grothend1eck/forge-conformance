@@ -1,6 +1,7 @@
 package mergerequest
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"net/http"
@@ -21,8 +22,6 @@ func (g *Gitlab) CreateAction(ctx context.Context, report *reports.Action, reset
 	ctx, cancel := context.WithTimeout(ctx, gitlabRequestTimeout)
 	defer cancel()
 
-	labelOptions := gitlab.LabelOptions(g.spec.Labels)
-
 	acceptMergeRequestOptions := &gitlab.AcceptMergeRequestOptions{
 		AutoMerge:                 &g.spec.AutoMerge,
 		MergeWhenPipelineSucceeds: &g.spec.AutoMerge, // Deprecated, kept for backward compatible clients
@@ -33,13 +32,8 @@ func (g *Gitlab) CreateAction(ctx context.Context, report *reports.Action, reset
 	}
 
 	var body string
-	title := report.Title
 
-	if len(g.spec.Title) > 0 {
-		title = g.spec.Title
-	}
-
-	// Check if a merge-request is already opened then exit early if it does.
+	// Check if a merge request is already open so we can update it.
 	existingMR, err := g.findExistingMR()
 	if err != nil {
 		return fmt.Errorf("check if a mergerequest already exist: %s", err.Error())
@@ -56,20 +50,10 @@ func (g *Gitlab) CreateAction(ctx context.Context, report *reports.Action, reset
 			return fmt.Errorf("generate GitLab body: %s", err.Error())
 		}
 
+		opts := g.spec.EditOptions(report.Title, body)
 		report.Title = existingMR.Title
 		report.Link = existingMR.WebURL
 		report.Description = body
-
-		opts := &gitlab.UpdateMergeRequestOptions{
-			Description:        &body,
-			Title:              &title,
-			AssigneeIDs:        &g.spec.Assignees,
-			ReviewerIDs:        &g.spec.Reviewers,
-			Squash:             g.spec.Squash,
-			RemoveSourceBranch: g.spec.RemoveSourceBranch,
-			Labels:             &labelOptions,
-			AllowCollaboration: g.spec.AllowCollaboration,
-		}
 
 		_, _, err := g.client.MergeRequests.UpdateMergeRequest(
 			g.getPID(),
@@ -140,6 +124,8 @@ func (g *Gitlab) CreateAction(ctx context.Context, report *reports.Action, reset
 		return fmt.Errorf("remote branches %q and %q do not exist, we can't open a mergerequest", g.SourceBranch, g.TargetBranch)
 	}
 
+	title := cmp.Or(g.spec.Title, report.Title)
+	labelOptions := gitlab.LabelOptions(g.spec.Labels)
 	opts := &gitlab.CreateMergeRequestOptions{
 		Title:              &title,
 		Description:        &body,
@@ -213,4 +199,20 @@ func (g *Gitlab) CreateAction(ctx context.Context, report *reports.Action, reset
 	log.Infof("GitLab mergerequest successfully opened on %q", mr.WebURL)
 
 	return nil
+}
+
+// EditOptions builds the SDK options for updating an existing merge request.
+func (s *Spec) EditOptions(reportTitle, body string) *gitlab.UpdateMergeRequestOptions {
+	title := cmp.Or(s.Title, reportTitle)
+	labelOptions := gitlab.LabelOptions(s.Labels)
+	return &gitlab.UpdateMergeRequestOptions{
+		Description:        &body,
+		Title:              &title,
+		AssigneeIDs:        &s.Assignees,
+		ReviewerIDs:        &s.Reviewers,
+		Squash:             s.Squash,
+		RemoveSourceBranch: s.RemoveSourceBranch,
+		Labels:             &labelOptions,
+		AllowCollaboration: s.AllowCollaboration,
+	}
 }

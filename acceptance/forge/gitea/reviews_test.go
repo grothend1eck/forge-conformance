@@ -27,7 +27,7 @@ func (s *server) newPublication(t *testing.T) forge.PublicationFixture {
 
 // Use a separate PR so the common lifecycle never needs provider-specific
 // collaborators, review reads or a mutation between its apply calls.
-func testPublishReviewMetadata(t *testing.T, s *server) {
+func (s *server) testPublishReviewMetadata(t *testing.T) {
 	r := s.newRepo(t)
 	c := newCLI(t, s)
 	const (

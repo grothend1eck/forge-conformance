@@ -3,7 +3,6 @@ package conformance
 import (
 	"fmt"
 	"io"
-	"slices"
 	"strings"
 )
 
@@ -15,57 +14,78 @@ func (m Matrix) Overview(w io.Writer) error {
 	return m.render(w, nil)
 }
 
-func (m Matrix) render(w io.Writer, passed []bool) error {
+func (m Matrix) render(w io.Writer, results map[string]profileResult) error {
 	var table, notes strings.Builder
 	fmt.Fprintf(&table, "## Conformance: %s\n\n", m.Family)
-	row := func(label string, text func(int) string) {
+	row := func(label string, text func(string) string) {
 		fmt.Fprintf(&table, "| %s |", label)
-		for i := range m.Profiles {
-			fmt.Fprintf(&table, " %s |", text(i))
+		for _, profile := range m.Profiles {
+			fmt.Fprintf(&table, " %s |", text(profile))
 		}
 		table.WriteByte('\n')
 	}
-	row("Capability", func(i int) string { return m.Profiles[i] })
-	row("---", func(int) string { return "---" })
-	type count struct{ required, applicable int }
-	counts := make([]count, len(m.Profiles))
+	row("Capability", func(profile string) string { return profile })
+	row("---", func(string) string { return "---" })
+	type count struct{ supported, applicable, unassessed int }
+	counts := make(map[string]count, len(m.Profiles))
 	for _, cap := range m.Rows {
-		row(cap.Label, func(i int) string {
-			cell := cap.Cells[i]
-			if cell.Reason != "" && !slices.Contains(cap.Cells[:i], cell) {
-				fmt.Fprintf(&notes, "- %s (%s): %s\n", cap.Label, cell.Status, cell.Reason)
+		row(cap.Label, func(profile string) string {
+			cell, assessed := cap.Cells[profile]
+			c := counts[profile]
+			switch {
+			case !assessed:
+				c.unassessed++
+			case cell.Status == Supported:
+				c.supported++
+				c.applicable++
+			case cell.Status == Gap:
+				c.applicable++
 			}
-			if cell.Status != NotApplicable {
-				counts[i].applicable++
+			counts[profile] = c
+			if !assessed {
+				return "unassessed"
 			}
-			switch cell.Status {
-			case NotEnrolled:
-				return "not enrolled"
-			case Required:
-				counts[i].required++
-				if passed != nil {
-					if passed[i] {
-						return "pass"
-					}
-					return "unverified"
+			if cell.Reason != "" {
+				fmt.Fprintf(&notes, "- %s / %s (%s): %s\n", cap.Label, profile, cell.Status, cell.Reason)
+			}
+			if cell.Status == Supported && results != nil {
+				result := results[profile]
+				if result.passed {
+					return "pass"
 				}
+				if outcome := result.outcomes[cap.ID]; outcome != "" {
+					return outcome
+				}
+				return "unverified"
 			}
 			return string(cell.Status)
 		})
 	}
-	if passed == nil {
-		row("**Required / applicable**", func(i int) string { c := counts[i]; return fmt.Sprintf("%d/%d", c.required, c.applicable) })
+	if results == nil {
+		row("**Supported / assessed applicable**", func(profile string) string {
+			c := counts[profile]
+			return fmt.Sprintf("%d/%d", c.supported, c.applicable)
+		})
 	} else {
-		verified := func(i int) int {
-			if passed[i] {
-				return counts[i].required
+		verified := func(profile string) int {
+			if results[profile].passed {
+				return counts[profile].supported
 			}
 			return 0
 		}
-		row("**Verified / required**", func(i int) string { return fmt.Sprintf("%d/%d", verified(i), counts[i].required) })
-		row("**Verified / applicable**", func(i int) string { return fmt.Sprintf("%d/%d", verified(i), counts[i].applicable) })
+		row("**Verified / supported**", func(profile string) string {
+			return fmt.Sprintf("%d/%d", verified(profile), counts[profile].supported)
+		})
+		row("**Verified / assessed applicable**", func(profile string) string {
+			return fmt.Sprintf("%d/%d", verified(profile), counts[profile].applicable)
+		})
 	}
-	fmt.Fprintf(&table, "\nOnly N/A is excluded from applicable capabilities.\n\n%s", notes.String())
+	row("**Unassessed**", func(profile string) string { return fmt.Sprint(counts[profile].unassessed) })
+	table.WriteString("\nAssessed applicable counts supported capabilities and gaps, not unassessed or not-applicable cells.\n")
+	if results != nil {
+		table.WriteString("Failed and skipped describe test outcomes for supported capabilities, not changes to product support.\n")
+	}
+	fmt.Fprintf(&table, "\n%s", notes.String())
 	_, err := io.WriteString(w, table.String())
 	return err
 }

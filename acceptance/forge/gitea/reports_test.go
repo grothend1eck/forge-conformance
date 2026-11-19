@@ -11,17 +11,19 @@ import (
 	"github.com/updatecli/updatecli/acceptance/internal/cli"
 )
 
-func testRequestSafety(t *testing.T, s *server) {
+func (s *server) testRequestSafety(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		run  func(*testing.T, *server)
 	}{
 		{"generated_report_persists", testGeneratedPRReport},
 		{"explicit_patch_branches", testPRBranchOverrides},
-		{"draft_survives_edit", testDraftSurvivesEdit},
 		{"review_failure_blocks_automerge", testReviewFailureBlocksAutomerge},
 	} {
 		t.Run(tc.name, func(t *testing.T) { tc.run(t, s) })
+	}
+	if s.provider == "forgejo" {
+		t.Run("report_link_with_gitea_compatible_environment", s.testGiteaActionsRunLink)
 	}
 }
 
@@ -131,9 +133,10 @@ func testGeneratedPRReport(t *testing.T, s *server) {
 	require.Equal(t, "channel: rc\n", r.Git(t, "show", reset.Head.Sha+":channel.yaml"))
 }
 
-func testWorkflowRunLink(t *testing.T, s *server) {
+func (s *server) testGiteaActionsRunLink(t *testing.T) {
 	r := s.newRepo(t)
-	// Simulate only the runner environment. No Actions workflow is executed.
+	// Test the report with a simulated Gitea Actions environment, not a live
+	// runner or link. The Forgejo compatibility case sets the same variables.
 	c := cli.NewWithCredentials(t, s.owner, s.token,
 		"UPDATECLI_GITEA_USERNAME="+s.owner,
 		"UPDATECLI_GITEA_TOKEN="+s.token,

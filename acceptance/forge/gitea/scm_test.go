@@ -18,7 +18,7 @@ import (
 	"github.com/updatecli/updatecli/acceptance/internal/cli"
 )
 
-func testSCM(t *testing.T, s *server) {
+func (s *server) testSCM(t *testing.T) {
 	t.Run("private_branch_read_and_direct_push", func(t *testing.T) {
 		r := s.newRepo(t)
 		c := newCLI(t, s)

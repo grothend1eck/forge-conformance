@@ -12,7 +12,7 @@ import (
 	"github.com/updatecli/updatecli/acceptance/internal/cli"
 )
 
-func testAuthentication(t *testing.T, s *server) {
+func (s *server) testAuthentication(t *testing.T) {
 	r := s.newRepo(t)
 	// A file changed only on stable proves that the binary checked out the
 	// requested branch. Use diff so a successful check doesn't publish a PR.

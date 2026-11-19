@@ -22,7 +22,7 @@ const (
 	resourcePageSize  = 30
 )
 
-func testBranches(t *testing.T, s *server) {
+func (s *server) testBranches(t *testing.T) {
 	r := s.newRepo(t)
 	push := []string{"push", "origin"}
 	for _, branch := range []string{"v1.9.0", "v1.10.0", "v2.0.0", "release/candidate"} {
@@ -49,7 +49,7 @@ func testBranches(t *testing.T, s *server) {
 	t.Run("pagination", func(t *testing.T) { testBranchPagination(t, s) })
 }
 
-func testTags(t *testing.T, s *server) {
+func (s *server) testTags(t *testing.T) {
 	r := s.newRepo(t)
 	r.Git(t, "tag", "v1.9.0", r.Base)
 	r.Git(t, "push", "origin", "refs/tags/v1.9.0")

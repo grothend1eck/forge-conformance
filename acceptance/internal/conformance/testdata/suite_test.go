@@ -11,6 +11,9 @@ import (
 func TestCapabilities(t *testing.T) {
 	conformance.Observe(t)
 	profile, mode, _ := strings.Cut(os.Getenv("CONFORMANCE_FIXTURE"), ":")
+	if mode == "root:fail" {
+		t.Fatal("private test output")
+	}
 	t.Run(profile, func(t *testing.T) {
 		if mode == "partial" {
 			return
@@ -26,8 +29,11 @@ func TestCapabilities(t *testing.T) {
 				}
 			})
 		})
-		if mode == "extra" {
-			t.Run("preview", func(*testing.T) {})
+		if profile != "pending" {
+			t.Run("read", func(*testing.T) {})
+		}
+		if group, ok := strings.CutPrefix(mode, "extra-"); ok {
+			t.Run(group, func(*testing.T) {})
 		}
 	})
 }

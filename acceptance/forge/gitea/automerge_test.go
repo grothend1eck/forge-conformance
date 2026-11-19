@@ -12,7 +12,7 @@ import (
 	"github.com/updatecli/updatecli/acceptance/internal/cli"
 )
 
-func testProtectedMerge(t *testing.T, s *server) {
+func (s *server) testProtectedMerge(t *testing.T) {
 	t.Run("observably_scheduled", func(t *testing.T) {
 		r, opened := applyProtectedRequest(t, s, "schedule-observer", "auto", false)
 		r.assertScheduledBy(t, "before status success", opened.number, s.owner)
@@ -86,17 +86,17 @@ func testProtectedMerge(t *testing.T, s *server) {
 	testExplicitMergeStyles(t, s)
 }
 
-func testManualMerge(t *testing.T, s *server) {
+func (s *server) testManualMerge(t *testing.T) {
 	r, opened := applyProtectedRequest(t, s, "protected-manual", "manual", false)
 	r.assertNoAutomerge(t, opened, "manual request")
 }
 
-func testDraft(t *testing.T, s *server) {
+func (s *server) testDraft(t *testing.T) {
 	r, opened := applyProtectedRequest(t, s, "protected-draft", "auto", true)
 	r.assertNoAutomerge(t, opened, "draft request")
 }
 
-func testDraftSurvivesEdit(t *testing.T, s *server) {
+func (s *server) testDraftSurvivesEdit(t *testing.T) {
 	const id = "draft-survives-edit"
 	r, opened := applyProtectedRequest(t, s, id, "manual", false)
 	// Mark an existing non-draft PR as WIP outside Updatecli, as a maintainer would.
