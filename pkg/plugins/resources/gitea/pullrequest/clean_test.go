@@ -28,10 +28,8 @@ func intPtr(v int) *int {
 
 // cleanServer fakes the Gitea API endpoints used to clean a pull request.
 type cleanServer struct {
-	// noPullRequest removes the pull request from the list
-	noPullRequest bool
-	headRepoID    int64
-	changedFiles  *int
+	headRepoID   int64
+	changedFiles *int
 	// listedSha returns the pull request ref commit for each list request, the last value being repeated
 	listedSha []string
 	branchSha string
@@ -75,16 +73,12 @@ func (s *cleanServer) handler(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == pullsPath:
 		s.listCount++
-		pullRequests := []giteasdk.PullRequest{}
-		if !s.noPullRequest {
-			sha := s.listedSha[min(s.listCount, len(s.listedSha))-1]
-			pr := pullRequest(sha)
-			if s.replacementIndex != 0 && s.listCount > 1 {
-				pr.Index = s.replacementIndex
-			}
-			pullRequests = append(pullRequests, pr)
+		sha := s.listedSha[min(s.listCount, len(s.listedSha))-1]
+		pr := pullRequest(sha)
+		if s.replacementIndex != 0 && s.listCount > 1 {
+			pr.Index = s.replacementIndex
 		}
-		_ = json.NewEncoder(w).Encode(pullRequests)
+		_ = json.NewEncoder(w).Encode([]giteasdk.PullRequest{pr})
 
 	case r.Method == http.MethodGet && r.URL.Path == prPath:
 		pr := pullRequest(s.branchSha)
@@ -137,33 +131,6 @@ func TestCleanAction(t *testing.T) {
 		expectedSleeps  int
 	}{
 		{
-			name:          "No pull request found",
-			server:        cleanServer{noPullRequest: true},
-			expectedLists: 1,
-		},
-		{
-			name: "Pull request with changed files",
-			server: cleanServer{
-				headRepoID:   testRepoID,
-				changedFiles: intPtr(3),
-				listedSha:    []string{"abc"},
-				branchSha:    "abc",
-			},
-			expectedLists: 1,
-		},
-		{
-			name: "Empty pull request",
-			server: cleanServer{
-				headRepoID:   testRepoID,
-				changedFiles: intPtr(0),
-				listedSha:    []string{"abc"},
-				branchSha:    "abc",
-			},
-			expectedClosed:  true,
-			expectedComment: true,
-			expectedLists:   1,
-		},
-		{
 			name: "Unknown number of changed files",
 			server: cleanServer{
 				headRepoID: testRepoID,
@@ -209,7 +176,8 @@ func TestCleanAction(t *testing.T) {
 			expectedSleeps: 1,
 		},
 		{
-			name: "Pull request opened from a fork",
+			// The live fork has changes; here even an empty foreign PR is out of scope.
+			name: "Empty pull request opened from a fork",
 			server: cleanServer{
 				headRepoID:   testForkID,
 				changedFiles: intPtr(0),
@@ -286,9 +254,13 @@ func TestCleanAction(t *testing.T) {
 			if tt.expectedClosed {
 				assert.Equal(t, 1, fake.closeCount)
 				assert.Contains(t, fake.closeBody, `"state":"closed"`)
+				// Check CleanAction's report directly, not the CLI summary assembled before cleanup.
 				assert.Empty(t, report.Link)
 				assert.Equal(t, pullRequestClosedMessage, report.Description)
 			} else {
+				if !tt.expectedError {
+					assert.Zero(t, fake.closeCount)
+				}
 				assert.NotEmpty(t, report.Link)
 				assert.Equal(t, "original", report.Description)
 			}

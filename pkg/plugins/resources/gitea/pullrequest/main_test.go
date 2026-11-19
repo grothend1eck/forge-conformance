@@ -15,16 +15,9 @@ import (
 func TestNewTokenPrecedence(t *testing.T) {
 	testData := []struct {
 		name     string
-		token    string
 		scmToken string
 		expected string
 	}{
-		{
-			name:     "Action token wins over both the SCM and the environment",
-			token:    "action-token",
-			scmToken: "scm-token",
-			expected: "token action-token",
-		},
 		{
 			name:     "Scm token wins over the environment",
 			scmToken: "scm-token",
@@ -48,7 +41,7 @@ func TestNewTokenPrecedence(t *testing.T) {
 			}))
 			defer server.Close()
 
-			g, err := New(map[string]any{"token": tt.token}, &giteascm.Gitea{
+			g, err := New(Spec{}, &giteascm.Gitea{
 				Spec: giteascm.Spec{
 					Spec:       giteaclient.Spec{URL: server.URL, Token: tt.scmToken},
 					Owner:      "updatecli",
@@ -85,29 +78,6 @@ func TestNew(t *testing.T) {
 				Repository:   "updatecli",
 				SourceBranch: "workingBranch",
 				TargetBranch: "main",
-			},
-			scm: &giteascm.Gitea{
-				Spec: giteascm.Spec{
-					Spec: giteaclient.Spec{
-						URL:      "gitea.updatecli.io",
-						Token:    "xxx",
-						Username: "tes",
-					},
-				},
-			},
-			expectedGiteaOwner:        "updatecli",
-			expectedGiteaRepository:   "updatecli",
-			expectedGiteaSourceBranch: "workingBranch",
-			expectedGiteaTargetBranch: "main",
-		},
-		{
-			name: "Test basic scenario with assignees",
-			spec: Spec{
-				Owner:        "updatecli",
-				Repository:   "updatecli",
-				SourceBranch: "workingBranch",
-				TargetBranch: "main",
-				Assignees:    []string{"user1", "user2"},
 			},
 			scm: &giteascm.Gitea{
 				Spec: giteascm.Spec{

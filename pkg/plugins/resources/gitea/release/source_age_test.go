@@ -134,6 +134,9 @@ func TestSourceAgeHold(t *testing.T) {
 
 			require.NoError(t, err)
 			assert.Equal(t, tt.wantSkipped, gotResult.Result == result.SKIPPED)
+			if tt.wantSkipped {
+				assert.Empty(t, gotResult.Information, "a held source must not emit a version")
+			}
 		})
 	}
 }

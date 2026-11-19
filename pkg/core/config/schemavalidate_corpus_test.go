@@ -18,6 +18,7 @@ import (
 // closest thing available to a representative sample of the manifests found in the wild,
 // so a schema change making one of them invalid is a change that would break users.
 var corpusRoots = []string{
+	filepath.Join("..", "..", "..", "acceptance", "forge", "gitea", "testdata", "codeberg"),
 	filepath.Join("..", "..", "..", "e2e", "updatecli.d"),
 	filepath.Join("..", "..", "..", "updatecli", "updatecli.d"),
 }

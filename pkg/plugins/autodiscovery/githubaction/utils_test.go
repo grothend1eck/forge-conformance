@@ -204,3 +204,19 @@ func TestParseActionDigestComment(t *testing.T) {
 		})
 	}
 }
+
+func TestKnownGiteaActionHosts(t *testing.T) {
+	t.Setenv("UPDATECLI_GITEA_TOKEN", "")
+	t.Setenv("GITEA_TOKEN", "")
+	// A regression to GitHub fallback must not use ambient GitHub App credentials.
+	t.Setenv("UPDATECLI_GITHUB_TOKEN", "fixture-github-token")
+	for _, hostname := range []string{"gitea.com", "codeberg.org", "code.forgejo.org"} {
+		t.Run(hostname, func(t *testing.T) {
+			var crawler GitHubAction
+			kind, token, err := crawler.getGitProviderKind("https://" + hostname)
+			require.NoError(t, err)
+			assert.Equal(t, kindGitea, kind)
+			assert.Empty(t, token)
+		})
+	}
+}

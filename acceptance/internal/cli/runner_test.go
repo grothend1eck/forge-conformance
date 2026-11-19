@@ -34,22 +34,11 @@ targets:
 	runner := cli.New(t, "UPDATECLI_ACCEPTANCE_VERSION="+candidate)
 	file := filepath.Join(runner.Dir, "version.yaml")
 	require.NoError(t, os.WriteFile(file, []byte(before), 0o600))
-	checkFile := func(want string) {
-		t.Helper()
-		got, err := os.ReadFile(file)
-		require.NoError(t, err)
-		require.Equal(t, want, string(got))
-	}
-
-	preview := runner.Pipeline(t, "diff", manifest)
-	require.Zero(t, preview.ExitCode, "diff output:\n%s", preview.Output)
-	require.Contains(t, preview.Output, current)
-	require.Contains(t, preview.Output, candidate)
-	checkFile(before)
-
-	applied := runner.Pipeline(t, "apply", manifest)
-	require.Zero(t, applied.ExitCode, "apply output:\n%s", applied.Output)
-	checkFile(after)
+	preview := runner.PipelineOK(t, "diff", manifest)
+	cli.RequireOutput(t, preview, current, candidate)
+	checkFile(t, file, before)
+	runner.PipelineOK(t, "apply", manifest)
+	checkFile(t, file, after)
 
 	// A value present only in the parent must not satisfy requiredEnv.
 	t.Setenv("UPDATECLI_ACCEPTANCE_VERSION", candidate)
@@ -57,6 +46,13 @@ targets:
 	missing := isolated.Run(t, "pipeline", "diff", "--config", filepath.Join(runner.Dir, "updatecli.yaml"))
 	require.NotZero(t, missing.ExitCode)
 	require.Contains(t, missing.Output, "UPDATECLI_ACCEPTANCE_VERSION")
+}
+
+func checkFile(t *testing.T, path, want string) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, want, string(got))
 }
 
 func TestRunWithFixturePath(t *testing.T) {
@@ -99,17 +95,37 @@ targets:
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			runner := cli.New(t, tt.env...)
-			configDir := filepath.Join(runner.Dir, "manifests")
-			require.NoError(t, os.Mkdir(configDir, 0o700))
-			config := filepath.Join(configDir, "fixture.yaml")
-			require.NoError(t, os.WriteFile(config, []byte(manifest), 0o600))
-
-			applied := runner.Run(t, "pipeline", "apply", "--config", config, "--disable-version-check", "--disable-udash-report")
-			require.Zero(t, applied.ExitCode, "apply output:\n%s", applied.Output)
-			got, err := os.ReadFile(filepath.Join(runner.Dir, "fixture-environment"))
-			require.NoError(t, err, "apply output:\n%s", applied.Output)
-			require.Equal(t, tt.wantPath+"\n"+runner.Home+"\n", string(got))
+			runner.PipelineOK(t, "apply", manifest)
+			checkFile(t, filepath.Join(runner.Dir, "fixture-environment"), tt.wantPath+"\n"+runner.Home+"\n")
 			require.Equal(t, hostPath, os.Getenv("PATH"))
 		})
+	}
+}
+
+func TestAnonymousExternalHostOptIn(t *testing.T) {
+	t.Setenv("UPDATECLI_GITEA_USERNAME", "ambient-user")
+	t.Setenv("UPDATECLI_GITEA_TOKEN", "ambient-token")
+	t.Setenv("NO_PROXY", "*")
+	const manifest = `name: Inspect candidate environment
+targets:
+  no_proxy:
+    kind: file
+    disablesourceinput: true
+    spec:
+      file: no-proxy
+      content: '{{ env "NO_PROXY" }}|{{ env "no_proxy" }}|{{ env "UPDATECLI_GITEA_USERNAME" }}|{{ env "UPDATECLI_GITEA_TOKEN" }}'
+`
+	const loopback = "127.0.0.1,localhost,::1"
+	for _, tc := range []struct {
+		runner *cli.Runner
+		want   string
+	}{
+		{cli.New(t), loopback},
+		{cli.NewAnonymousExternal(t, "example.test"), loopback + ",example.test"},
+	} {
+		path := filepath.Join(tc.runner.Dir, "no-proxy")
+		require.NoError(t, os.WriteFile(path, []byte("unset"), 0o600))
+		tc.runner.PipelineOK(t, "apply", manifest)
+		checkFile(t, path, tc.want+"|"+tc.want+"||")
 	}
 }

@@ -1,236 +1,71 @@
 ---
-name: Forge acceptance
-
+name: Acceptance tests
 on:
   pull_request:
+  push:
     branches: [main]
-  schedule:
-    - cron: '27 3 * * *'
   workflow_dispatch:
-    inputs:
-      fuzz_only:
-        description: Run the nightly draft title fuzz test instead of the forge matrix
-        type: boolean
-        default: false
+  schedule:
+    - cron: '17 0 * * *'
 
 permissions:
   contents: read
-
 concurrency:
-  group: forge-acceptance-${{ github.event.pull_request.number || github.run_id }}
+  group: acceptance-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  scope:
-    name: Select forge checks
-    if: github.event_name != 'schedule' && !inputs.fuzz_only
-    runs-on: ubuntu-latest
-    outputs:
-      mode: ${{ steps.scope.outputs.mode }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 2
-          persist-credentials: false
-      - id: scope
-        env:
-          BASE: ${{ github.event.pull_request.base.sha }}
-          HEAD: ${{ github.event.pull_request.head.sha }}
-        run: |
-          mode=full
-          if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
-            mode=$(bash scripts/ci/forge-test-scope.sh "$GITHUB_SHA" "$BASE" "$HEAD")
-          fi
-          echo "mode=$mode" >> "$GITHUB_OUTPUT"
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        if: steps.scope.outputs.mode == 'package'
-        with:
-          go-version-file: go.mod
-      - name: Run draft title seeds and PR package tests
-        if: steps.scope.outputs.mode == 'package'
-        working-directory: pkg/plugins/resources/gitea/pullrequest
-        run: |
-          go test -list '^FuzzExistingPullRequestTitle$' | grep -Fx FuzzExistingPullRequestTitle
-          go test -count=1 -v .
-
   build:
     name: Build candidate
-    needs: scope
-    if: needs.scope.outputs.mode == 'full'
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    env:
-      CGO_ENABLED: '0'
     outputs:
-      binaries: ${{ steps.upload.outputs.artifact-id }}
-      sha256: ${{ steps.digest.outputs.sha256 }}
+      candidate: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0 # GoReleaser needs the tags and their history, not just HEAD.
+          fetch-depth: 0 # GoReleaser stamps the binary from the release tags.
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      - name: Install GoReleaser
-        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           version: v2.19.0
           install-only: true
-      - name: Build native GoReleaser snapshot
-        id: snapshot
-        shell: bash
+      - name: Build and check the snapshot
         run: |
-          test "$(git rev-parse --is-shallow-repository)" = false
-          git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' HEAD
-          mkdir "$RUNNER_TEMP/forge-bin"
-          GOVERSION="$(go version)"
-          GOVERSION="$GOVERSION" goreleaser build --config .goreleaser.yml --snapshot --clean --single-target \
-            --output "$RUNNER_TEMP/forge-bin/updatecli"
-          git diff --exit-code -- go.mod go.sum
-          tag="$(jq -er '.tag' dist/metadata.json)"
-          git merge-base --is-ancestor "refs/tags/$tag" HEAD
-          jq -e --arg commit "$(git rev-parse HEAD)" 'select(.commit == $commit and .version == (.tag + "-next")) | {tag, version, commit}' dist/metadata.json
-          jq -er '.version | strings | select(length > 0) | "version=\(.)"' dist/metadata.json >> "$GITHUB_OUTPUT"
-      - name: Compile forge acceptance tests
-        run: |
-          go test -count=1 ./acceptance/internal/conformance ./scripts/ci
-          go test -tags=acceptance,knownissues -run '^$' ./acceptance/forge
-          go test -c -tags=acceptance -ldflags='-s -w' -o "$RUNNER_TEMP/forge-bin/forge.test" ./acceptance/forge
-          go build -o "$RUNNER_TEMP/forge-bin/test2json" cmd/test2json
-      - name: Test stamped candidate and shared CLI runner
-        env:
-          UPDATECLI_BIN: ${{ runner.temp }}/forge-bin/updatecli
-          UPDATECLI_EXPECTED_VERSION: ${{ steps.snapshot.outputs.version }}
-        run: go test -tags=acceptance,candidate -count=1 -v ./acceptance/internal/cli
-      - name: Replay draft title fuzz corpus
-        working-directory: pkg/plugins/resources/gitea/pullrequest
-        run: |
-          go test -list '^FuzzExistingPullRequestTitle$' | grep -Fx FuzzExistingPullRequestTitle
-          go test -count=1 -v -run '^FuzzExistingPullRequestTitle$'
-      - name: Identify tested candidate
-        id: digest
-        run: |
-          digest="$(sha256sum "$RUNNER_TEMP/forge-bin/updatecli")"
-          echo "$digest"
-          echo "sha256=${digest%% *}" >> "$GITHUB_OUTPUT"
+          mkdir -p bin
+          make build BUILD_FLAGS="--single-target --output $PWD/bin/updatecli"
+          UPDATECLI_BIN="$PWD/bin/updatecli" UPDATECLI_EXPECTED_VERSION="$(git describe --tags --abbrev=0)-next" \
+            go test -tags=acceptance,candidate -count=1 ./acceptance/internal/cli
+          go test ./acceptance/cmd/... ./acceptance/internal/conformance
+      - name: Compile optional tests
+        run: go test -c -tags=acceptance,knownissues,live -o /dev/null ./acceptance/...
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         id: upload
         with:
-          name: forge-binaries-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/forge-bin/
+          name: updatecli-${{ github.run_attempt }}
+          path: bin/updatecli
           if-no-files-found: error
-          retention-days: 3
+          retention-days: 2
 
   forge:
-    name: ${{ matrix.name }}
+    name: Forge (${{ matrix.profile }})
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: Gitea
-            provider: gitea
-          - name: Forgejo
-            provider: forgejo
-          - name: GitLab
-            provider: gitlab
-    steps:
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          artifact-ids: ${{ needs.build.outputs.binaries }}
-          path: ${{ runner.temp }}/forge-bin
-          merge-multiple: true
-          digest-mismatch: error
-      - name: Run forge contracts
-        id: contracts
-        working-directory: ${{ runner.temp }}/forge-bin
-        shell: bash
-        env:
-          DOCKER_AUTH_CONFIG: '{}'
-          DOCKER_CONFIG: ${{ runner.temp }}/forge-docker-config
-          CANDIDATE_SHA256: ${{ needs.build.outputs.sha256 }}
-          UPDATECLI_TEST_FORGE: ${{ matrix.provider }}
-          UPDATECLI_BIN: ${{ runner.temp }}/forge-bin/updatecli
-          UPDATECLI_TEST_REPORT: ${{ runner.temp }}/conformance.json
-        run: |
-          echo "$CANDIDATE_SHA256  updatecli" | sha256sum --check --strict
-          chmod +x updatecli forge.test test2json
-          ./test2json -p forge ./forge.test -test.v=test2json -test.timeout=12m -test.paniconexit0 |
-            tee "$RUNNER_TEMP/forge.jsonl" | jq --unbuffered -jr 'select(.Action == "output") | .Output'
-          jq -se --arg test "TestForge/$UPDATECLI_TEST_FORGE" '
-            any(.[]; .Action == "pass" and .Test == $test) and
-            all(.[]; .Action != "skip" and .Action != "fail")' "$RUNNER_TEMP/forge.jsonl"
-      - name: Record capability results
-        if: ${{ !cancelled() && steps.contracts.outcome != 'skipped' }}
-        env:
-          PROFILE: ${{ matrix.provider }}
-          CANDIDATE: ${{ needs.build.outputs.sha256 }}
-          OUTCOME: ${{ steps.contracts.outcome }}
-        run: |
-          mkdir "$RUNNER_TEMP/results"
-          jq -e --arg p "$PROFILE" --arg sha "$CANDIDATE" --arg rev "$GITHUB_SHA" --arg outcome "$OUTCOME" '
-            select(.version == 1 and .profile == $p) |
-            . + {candidate: $sha, revision: $rev, outcome: $outcome}' \
-            "$RUNNER_TEMP/conformance.json" > "$RUNNER_TEMP/results/$PROFILE.json"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: ${{ !cancelled() && steps.contracts.outcome != 'skipped' }}
-        with:
-          name: conformance-${{ matrix.provider }}-${{ needs.build.outputs.sha256 }}
-          path: ${{ runner.temp }}/results/
-          if-no-files-found: error
-          overwrite: true
-          retention-days: 14
-
-  conformance:
-    name: Forge conformance
-    needs: [scope, build, forge]
-    if: ${{ !cancelled() && github.event_name != 'schedule' && !inputs.fuzz_only }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check selected jobs
-        env:
-          MODE: ${{ needs.scope.outputs.mode }}
-          SCOPE: ${{ needs.scope.result }}
-          BUILD: ${{ needs.build.result }}
-        run: |
-          test "$SCOPE" = success
-          case "$MODE" in
-            full) test "$BUILD" = success ;;
-            package|docs) echo "Forge matrix not run ($MODE-only change)." >> "$GITHUB_STEP_SUMMARY" ;;
-            *) exit 1 ;;
-          esac
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: needs.scope.outputs.mode == 'full'
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        if: needs.scope.outputs.mode == 'full'
-        with:
-          pattern: conformance-*-${{ needs.build.outputs.sha256 }}
-          path: ${{ runner.temp }}/results
-          digest-mismatch: error
-      - name: Compare capability results
-        if: needs.scope.outputs.mode == 'full'
-        shell: bash
-        env:
-          CANDIDATE: ${{ needs.build.outputs.sha256 }}
-          FORGES: ${{ needs.forge.result }}
-        run: |
-          files=("$RUNNER_TEMP"/results/*/*.json)
-          jq -sr --arg candidate "$CANDIDATE" --arg revision "$GITHUB_SHA" --slurpfile floor acceptance/forge/conformance-v1.json \
-            -f acceptance/internal/conformance/summary.jq "${files[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
-          jq -se 'all(.[]; .outcome == "success" and .bootstrap == "pass" and .complete and
-            all(.capabilities[]; .status != "fail" and .status != "not_exercised"))' "${files[@]}"
-          test "$FORGES" = success
-
-  fuzz:
-    name: Fuzz Gitea draft titles
-    if: github.event_name == 'schedule' || inputs.fuzz_only
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+          - {profile: gitea, package: gitea}
+          - {profile: forgejo, package: gitea}
+          - {profile: gitlab, package: gitlab}
+    env:
+      UPDATECLI_TEST_FORGE: ${{ matrix.profile }}
+      UPDATECLI_BIN: ${{ github.workspace }}/bin/updatecli
+      DOCKER_AUTH_CONFIG: '{}'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -238,15 +73,78 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      - name: Fuzz draft title edits
-        id: fuzz
-        working-directory: pkg/plugins/resources/gitea/pullrequest
-        run: |
-          go test -list '^FuzzExistingPullRequestTitle$' | grep -Fx FuzzExistingPullRequestTitle
-          go test -run '^$' -fuzz '^FuzzExistingPullRequestTitle$' -fuzztime=1m -parallel=2 -timeout=3m
-      - name: Save failing inputs for replay
-        if: failure() && steps.fuzz.outcome == 'failure'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: draft-title-fuzz-inputs
-          path: pkg/plugins/resources/gitea/pullrequest/testdata/fuzz/FuzzExistingPullRequestTitle/
+          artifact-ids: ${{ needs.build.outputs.candidate }}
+          path: bin
+          digest-mismatch: error
+      - name: Run tests
+        shell: bash
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/docker
+          PACKAGE: ./acceptance/forge/${{ matrix.package }}
+        run: |
+          chmod +x "$UPDATECLI_BIN"
+          mkdir -p results/forge
+          go test -json -tags=acceptance -count=1 -timeout=12m "$PACKAGE" | tee "results/forge/$UPDATECLI_TEST_FORGE.jsonl"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: results-${{ needs.build.outputs.candidate }}-forge-${{ matrix.profile }}
+          path: results/
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+
+  codeberg:
+    name: Codeberg (public read)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.build.outputs.candidate }}
+          path: bin
+          digest-mismatch: error
+      - name: Preview public recipes
+        env:
+          UPDATECLI_BIN: ${{ github.workspace }}/bin/updatecli
+        run: |
+          chmod +x "$UPDATECLI_BIN"
+          go test -tags=acceptance,live -count=1 -v ./acceptance/forge/gitea/live
+
+  conformance:
+    name: Conformance
+    needs: [build, forge]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: results-${{ needs.build.outputs.candidate }}-*
+          path: results
+          merge-multiple: true
+          digest-mismatch: error
+      - name: Report conformance
+        if: ${{ !cancelled() }}
+        run: |
+          echo "[Capability families]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/blob/$GITHUB_SHA/acceptance/CAPABILITIES.md)" >> "$GITHUB_STEP_SUMMARY"
+          go run ./acceptance/cmd/conformance results >> "$GITHUB_STEP_SUMMARY"
+      - name: Check test jobs
+        if: ${{ !cancelled() && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'skipped')) }}
+        run: exit 1

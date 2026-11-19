@@ -1,0 +1,29 @@
+name: Test Gitea release
+
+sources:
+  default:
+    kind: gitea/release
+    spec:
+      url: "codeberg.org"
+      owner: "updatecli"
+      repository: "updatecli-action"
+      versionfilter:
+        kind: semver
+        pattern: "~2"
+
+conditions:
+  default:
+    kind: gitea/release
+    spec:
+      url: "codeberg.org"
+      owner: "updatecli"
+      repository: "updatecli-action"
+      tag: "v2.15.0"
+  sourcedefault:
+    kind: gitea/release
+    sourceid: default
+    spec:
+      url: "codeberg.org"
+      owner: "updatecli"
+      repository: "updatecli-action"
+

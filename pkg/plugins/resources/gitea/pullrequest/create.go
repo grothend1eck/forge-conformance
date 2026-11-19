@@ -1,6 +1,7 @@
 package pullrequest
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 
@@ -12,12 +13,6 @@ import (
 
 // CreateAction opens or updates a Pull Request on the Gitea server
 func (g *Gitea) CreateAction(ctx context.Context, report *reports.Action, resetDescription bool) error {
-
-	title := report.Title
-
-	if len(g.spec.Title) > 0 {
-		title = g.spec.Title
-	}
 
 	// Check if a pull-request is already opened then update it if it does.
 	pullrequest, err := g.findExistingPullRequest(ctx)
@@ -39,10 +34,7 @@ func (g *Gitea) CreateAction(ctx context.Context, report *reports.Action, resetD
 			g.Owner,
 			g.Repository,
 			pullrequest.Index,
-			giteasdk.EditPullRequestOption{
-				Title: existingPullRequestTitle(title, pullrequest),
-				Body:  &body,
-			},
+			g.spec.EditOptions(pullrequest, report.Title, body),
 		)
 		if err != nil {
 			return fmt.Errorf("update Gitea pull request: %w", err)
@@ -83,6 +75,7 @@ func (g *Gitea) CreateAction(ctx context.Context, report *reports.Action, resetD
 		return nil
 	}
 
+	title := cmp.Or(g.spec.Title, report.Title)
 	log.Debugf("Title:\t%q\nBody:\t%q\nSource:\n%q\ntarget:\t%q\n",
 		title,
 		body,
@@ -143,4 +136,12 @@ func (g *Gitea) pullRequestBody(existingDescription string, report *reports.Acti
 	}
 
 	return utils.GeneratePullRequestBody("", actions)
+}
+
+// EditOptions builds the SDK options for updating an existing pull request.
+func (s *Spec) EditOptions(pr *giteasdk.PullRequest, reportTitle, body string) giteasdk.EditPullRequestOption {
+	return giteasdk.EditPullRequestOption{
+		Title: existingPullRequestTitle(cmp.Or(s.Title, reportTitle), pr),
+		Body:  &body,
+	}
 }

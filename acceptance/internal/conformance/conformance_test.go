@@ -1,149 +1,230 @@
 package conformance
 
 import (
-	"encoding/json"
-	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
 )
 
-func TestInvalidEnrollment(t *testing.T) {
-	setup := func(*testing.T) int { return 1 }
-	c := Capability[int]{"check", func(*testing.T, int) {}}
-	profile := NewProfile("demo", setup, []Capability[int]{c})
-	for name, profiles := range map[string][]Profile{
-		"duplicate profiles": {profile, profile},
-		"empty profile":      {NewProfile("demo", setup, nil)},
-		"duplicate case":     {NewProfile("demo", setup, []Capability[int]{c, c})},
-		"no assertion":       {NewProfile("demo", setup, []Capability[int]{{ID: "check"}})},
-		"invalid name":       {NewProfile("demo", setup, []Capability[int]{{"", c.Run}})},
-		"unreasoned N/A":     {NewProfile("demo", setup, []Capability[int]{c}, Unavailable{"gap", NotApplicable, ""})},
-		"static pass":        {NewProfile("demo", setup, []Capability[int]{c}, Unavailable{"gap", pass, "not evidence"})},
+func TestMatrixValidation(t *testing.T) {
+	edit := Row{ID: "edit", Cells: map[string]Cell{"text": {Status: Supported}}}
+	for _, test := range []struct {
+		name string
+		rows []Row
+		want string
+	}{
+		{"duplicate capability", []Row{edit, edit}, "duplicate capability"},
+		{"unknown profile", []Row{{ID: "edit", Cells: map[string]Cell{"typo": {Status: Supported}}}}, "unknown profile"},
+		{"explicit empty cell", []Row{{ID: "edit", Cells: map[string]Cell{"text": {}}}}, "unknown status"},
+		{"gap without reason", []Row{{ID: "edit", Cells: map[string]Cell{"text": {Status: Gap}}}}, "needs a reason"},
+		{"not applicable without reason", []Row{{ID: "edit", Cells: map[string]Cell{"text": {NotApplicable, " "}}}}, "needs a reason"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			m := Matrix{Family: "writing", Profiles: []string{"text"}, Rows: test.rows}
+			if err := m.Overview(io.Discard); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Overview error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestImplementations(t *testing.T) {
+	m := Matrix{Family: "writing", Profiles: []string{"text", "object", "tree", "stream", "binary"}, Rows: []Row{
+		{"edit", map[string]Cell{
+			"object": {Status: Supported},
+			"text":   {Status: Supported},
+			"tree":   {Gap, "not implemented"},
+			"stream": {NotApplicable, "not seekable"},
+		}},
+		{"preview", nil},
+	}}
+	got, err := m.Implementations("edit")
+	if err != nil || !slices.Equal(got, []string{"text", "object"}) {
+		t.Fatalf("Implementations(edit) = %v, %v", got, err)
+	}
+	if got, err := m.Implementations("preview"); err != nil || len(got) != 0 {
+		t.Fatalf("Implementations(preview) = %v, %v; want no supported profiles", got, err)
+	}
+	if got, err := m.Implementations("typo"); err == nil || len(got) != 0 {
+		t.Fatalf("Implementations(typo) = %v, %v; want unknown capability error", got, err)
+	}
+}
+
+func TestRunUsesOnlySupportedChecks(t *testing.T) {
+	m := Matrix{Family: "writing", Profiles: []string{"json"}, Rows: []Row{
+		{"edit", map[string]Cell{"json": {Status: Supported}}},
+		{"rename", map[string]Cell{"json": {Gap, "writer cannot rename fields"}}},
+		{"comments", map[string]Cell{"json": {NotApplicable, "JSON has no comments"}}},
+		{"indent", nil},
+	}}
+	checks := map[string]func(*testing.T){}
+	for _, row := range m.Rows {
+		checks[row.ID] = func(t *testing.T) { t.Fatalf("should not run %s", row.ID) }
+	}
+	ran := false
+	checks["edit"] = func(*testing.T) { ran = true }
+	m.Run(t, "json", checks)
+	if !ran {
+		t.Fatal("supported edit did not run")
+	}
+}
+
+func TestBind(t *testing.T) {
+	m := Matrix{Family: "writing", Profiles: []string{"text", "object", "tree", "stream", "binary", "remote"}, Rows: []Row{
+		{"edit", map[string]Cell{
+			"text":   {Status: Supported},
+			"object": {Status: Supported},
+			"tree":   {Gap, "not implemented"},
+			"stream": {NotApplicable, "not seekable"},
+		}},
+		{"read", map[string]Cell{"tree": {Status: Supported}}},
+		{"preview", map[string]Cell{"text": {Status: Supported}, "remote": {Status: Supported}}},
+	}}
+	drivers := map[string]int{"object": 2, "text": 0, "tree": 3, "stream": 4, "binary": 5}
+	for _, test := range []struct {
+		id      string
+		want    []Implementation[int]
+		wantErr string
+	}{
+		{id: "edit", want: []Implementation[int]{{"text", 0}, {"object", 2}}},
+		{id: "read", want: []Implementation[int]{{"tree", 3}}},
+		{id: "preview", wantErr: `no driver registered for supported profile "remote"`},
+		{id: "typo", wantErr: `unknown capability "typo"`},
+	} {
+		t.Run(test.id, func(t *testing.T) {
+			got, err := Bind(m, test.id, drivers)
+			if test.wantErr != "" {
+				if got != nil || err == nil || !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("Bind(%q) = %v, %v; want nil result and %q", test.id, got, err, test.wantErr)
+				}
+			} else if err != nil || !slices.Equal(got, test.want) {
+				t.Fatalf("Bind(%q) = %v, %v; want %v", test.id, got, err, test.want)
+			}
+		})
+	}
+}
+
+func TestReport(t *testing.T) {
+	goBin := filepath.Join(runtime.GOROOT(), "bin", "go")
+	binary := filepath.Join(t.TempDir(), "fixture.test")
+	if out, err := exec.CommandContext(t.Context(), goBin, "test", "-c", "-o", binary, "./testdata").CombinedOutput(); err != nil {
+		t.Fatalf("build fixture: %v\n%s", err, out)
+	}
+	fixture := func(mode string, flags ...string) string {
+		t.Helper()
+		args := append([]string{"tool", "test2json", "-p", "writing", binary, "-test.v=test2json"}, flags...)
+		cmd := exec.CommandContext(t.Context(), goBin, args...)
+		cmd.Env = append(os.Environ(), "CONFORMANCE_FIXTURE="+mode)
+		out, err := cmd.Output()
+		if len(out) == 0 || (err != nil) != strings.HasSuffix(mode, ":fail") {
+			t.Fatalf("fixture: %v\n%s", err, out)
+		}
+		return string(out)
+	}
+	m := Matrix{Family: "writing", Profiles: []string{"text", "object", "pending"}, Rows: []Row{
+		{"edit", map[string]Cell{"text": {Status: Supported}, "object": {Status: Supported}, "pending": {Gap, "no editor"}}},
+		{"read", map[string]Cell{"text": {Status: Supported}, "object": {Status: Supported}}},
+		{"comment", map[string]Cell{"text": {Gap, "comments lost"}, "object": {NotApplicable, "no comments"}, "pending": {NotApplicable, "no comments"}}},
+		{"preview", map[string]Cell{"object": {Gap, "no preview"}}},
+	}}
+	assertLines := func(t *testing.T, output string, lines ...string) {
+		t.Helper()
+		for _, line := range lines {
+			if !strings.Contains(output, line) {
+				t.Errorf("missing %q from:\n%s", line, output)
+			}
+		}
+	}
+	var overview strings.Builder
+	if err := m.Overview(&overview); err != nil {
+		t.Fatal(err)
+	}
+	assertLines(t, overview.String(),
+		"| edit | supported | supported | gap |",
+		"| read | supported | supported | unassessed |",
+		"| comment | gap | not applicable | not applicable |",
+		"| preview | unassessed | gap | unassessed |",
+		"| **Supported / assessed applicable** | 2/3 | 2/3 | 0/1 |",
+		"| **Unassessed** | 1 | 0 | 2 |",
+		"- comment / text (gap): comments lost",
+		"- comment / object (not applicable): no comments",
+	)
+	object, text := fixture("object"), fixture("text")
+	failure := fixture("text:fail")
+	dropTerminal := func(stream string) string {
+		return stream[:strings.LastIndex(strings.TrimSuffix(stream, "\n"), "\n")]
+	}
+	filtered := fixture("text", "-test.skip=^TestCapabilities$/^text$/^edit$/^pick$/^path$")
+	if strings.Contains(filtered, "pick/path") || !strings.Contains(filtered, `--- PASS: TestCapabilities/text/edit`) {
+		t.Fatalf("filter must omit only the leaf, leaving the group passing:\n%s", filtered)
+	}
+	for name, stream := range map[string]string{
+		"pass": text, "missing stream": "", "wrong profile": object,
+		"nested skip": fixture("text:skip"), "nested fail": failure, "filtered child": filtered,
+		"root failure":     fixture("text:root:fail"),
+		"unassessed group": fixture("text:extra-preview"), "gap group": fixture("text:extra-comment"),
+		"unknown group": fixture("text:extra-typo"), "missing group": fixture("text:partial"),
+		"truncated": dropTerminal(text), "truncated failure": dropTerminal(failure),
+		"corrupt": text[:len(text)-4], "corrupt after failure": failure + "{", "duplicate": text + text,
+		"mixed packages": strings.Replace(text, `"Package":"writing"`, `"Package":"other"`, 1),
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := index(profiles); err == nil {
-				t.Fatal("accepted invalid enrollment")
+			streams := map[string]io.Reader{"object": strings.NewReader(object)}
+			if stream != "" {
+				streams["text"] = strings.NewReader(stream)
+			}
+			var b strings.Builder
+			err := m.Report(&b, streams)
+			if (err == nil) != (name == "pass") {
+				t.Fatalf("bad result: %v\n%s", err, &b)
+			}
+			if name == "filtered child" && !strings.Contains(err.Error(), "missing unfiltered marker") {
+				t.Fatalf("filter rejected for the wrong reason: %v", err)
+			}
+			want := "0"
+			edit, read := "unverified", "unverified"
+			switch name {
+			case "pass":
+				want, edit, read = "2", "pass", "pass"
+			case "nested fail":
+				edit = "failed"
+			case "nested skip":
+				edit = "skipped"
+			}
+			assertLines(t, b.String(),
+				"| edit | "+edit+" | pass | gap |",
+				"| read | "+read+" | pass | unassessed |",
+				"| **Verified / supported** | "+want+"/2 | 2/2 | 0/0 |",
+				"| **Verified / assessed applicable** | "+want+"/3 | 2/3 | 0/1 |",
+				"| **Unassessed** | 1 | 0 | 2 |",
+			)
+			if strings.Contains(b.String(), "private test output") {
+				t.Fatal(b.String())
 			}
 		})
 	}
-}
-
-const fixtureMode = "UPDATECLI_CONFORMANCE_TEST_MODE"
-
-// Re-exec to observe actual testing.T outcomes. No Docker or credentials.
-func TestEvidence(t *testing.T) {
-	if os.Getenv(fixtureMode) != "" {
-		return
-	}
-	for _, tc := range []struct {
-		mode, flag       string
-		bootstrap, check Status
-		fails, complete  bool
-	}{
-		{mode: "parallel", bootstrap: pass, check: pass, complete: true},
-		{mode: "cleanup_failure", bootstrap: pass, check: fail, fails: true, complete: true},
-		{mode: "required_skip", bootstrap: pass, check: fail, fails: true, complete: true},
-		{mode: "raw_skip", bootstrap: pass, check: pass, complete: true},
-		{mode: "skip", bootstrap: pass, check: notExercised, fails: true},
-		{mode: "bootstrap_failure", bootstrap: fail, check: notExercised, fails: true},
-		{mode: "filtered", flag: "-test.run=^TestEvidenceFixture$/demo/check/case", fails: true},
-		{mode: "skip_flag", flag: "-test.skip=case", fails: true},
-		{mode: "repeat", flag: "-test.count=2", fails: true},
-		{mode: "excluded", flag: "-test.run=^$"},
-		{mode: "panic", fails: true},
-		{mode: "local", flag: "-test.run=^TestEvidenceFixture$/demo/check/case"},
-	} {
-		t.Run(tc.mode, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "evidence.json")
-			args := []string{"-test.v"}
-			if tc.flag != "" {
-				args = append(args, tc.flag)
-			}
-			cmd := exec.CommandContext(t.Context(), os.Args[0], args...)
-			cmd.Env = append(os.Environ(), fixtureMode+"="+tc.mode, "UPDATECLI_CONFORMANCE_TEST_REPORT="+path)
-			output, err := cmd.CombinedOutput()
-			if (err != nil) != tc.fails || tc.fails && cmd.ProcessState == nil {
-				t.Fatalf("got %v, want failure=%t:\n%s", err, tc.fails, output)
-			}
-			// CI's test2json gate must see this child skip: testing.T exposes
-			// the parent's pass, not its raw child's skip, to the runner.
-			if tc.mode == "raw_skip" && !strings.Contains(string(output), "--- SKIP: TestEvidenceFixture/demo/check/raw") {
-				t.Fatalf("missing native skip event:\n%s", output)
-			}
-			raw, err := os.ReadFile(path)
-			if tc.bootstrap == "" {
-				if !errors.Is(err, os.ErrNotExist) {
-					t.Fatalf("unexpected evidence file: %v", err)
-				}
-				return
-			}
-			var got report
-			if err != nil || json.Unmarshal(raw, &got) != nil || strings.Contains(string(raw), "not-for-report") {
-				t.Fatalf("invalid evidence (%v): %s", err, raw)
-			}
-			if got.Version != 1 || got.Profile != "demo" || !slices.Equal(got.Profiles, []string{"demo", "other"}) ||
-				got.Bootstrap != tc.bootstrap || got.Complete != tc.complete {
-				t.Fatalf("wrong report header: %s", raw)
-			}
-			check := cell{ID: "check", Status: tc.check}
-			if tc.mode == "skip" {
-				check.Reason = "capability skipped"
-			}
-			want := []cell{check, {"dialect", NotApplicable, "different dialect"}, {"extra", notEnrolled, ""}, {"gap", KnownIssue, "known bug"}}
-			if !slices.Equal(got.Capabilities, want) {
-				t.Fatalf("wrong capabilities: %s", raw)
-			}
-		})
-	}
-}
-
-func TestEvidenceFixture(t *testing.T) {
-	mode := os.Getenv(fixtureMode)
-	if mode == "" {
-		return
-	}
-	setup := func(t *testing.T) int {
-		if mode == "bootstrap_failure" || mode == "filtered" || mode == "skip_flag" || mode == "repeat" {
-			t.Fatal("not-for-report")
+	t.Run("not applicable group", func(t *testing.T) {
+		streams := map[string]io.Reader{
+			"text":   strings.NewReader(text),
+			"object": strings.NewReader(fixture("object:extra-comment")),
 		}
-		return 42
-	}
-	check := func(t *testing.T, fixture int) {
-		if fixture != 42 {
-			t.Fatal("wrong fixture")
+		if err := m.Report(io.Discard, streams); err == nil || !strings.Contains(err.Error(), `unexpected test "TestCapabilities/object/comment"`) {
+			t.Fatalf("Report error = %v; want unexpected not-applicable test", err)
 		}
-		switch mode {
-		case "parallel":
-			t.Parallel()
-		case "cleanup_failure":
-			t.Cleanup(func() { t.Error("not-for-report") })
-		case "required_skip":
-			Required(t, "case", func(t *testing.T) { t.Skip("not-for-report") })
-		case "raw_skip":
-			t.Run("raw", func(t *testing.T) { t.Skip("not-for-report") })
-		case "skip":
-			t.Skip("not-for-report")
-		case "panic":
-			panic("not-for-report")
-		case "local":
-			ran := false
-			Required(t, "excluded", func(t *testing.T) { t.Fatal("wanted filtered run") })
-			Required(t, "case", func(*testing.T) { ran = true })
-			if !ran {
-				t.Fatal("selected case did not run")
-			}
+	})
+	t.Run("stream without supported groups", func(t *testing.T) {
+		streams := map[string]io.Reader{
+			"text":    strings.NewReader(text),
+			"object":  strings.NewReader(object),
+			"pending": strings.NewReader(fixture("pending")),
 		}
-	}
-	demo := NewProfile("demo", setup, []Capability[int]{{"check", check}},
-		Unavailable{"gap", KnownIssue, "known bug"}, Unavailable{"dialect", NotApplicable, "different dialect"})
-	other := NewProfile("other", func(*testing.T) string { return "" }, []Capability[string]{{"extra", func(*testing.T, string) {}}})
-	path := os.Getenv("UPDATECLI_CONFORMANCE_TEST_REPORT")
-	if mode == "local" {
-		path = ""
-	}
-	Run(t, "demo", path, other, demo)
+		if err := m.Report(io.Discard, streams); err == nil || !strings.Contains(err.Error(), `unexpected test "TestCapabilities/pending/edit"`) {
+			t.Fatalf("Report error = %v; want unexpected gap test", err)
+		}
+	})
 }
