@@ -28,10 +28,10 @@ reproducer for private authenticated branch and tag creation that's still red.
 
 ## Add a case
 
-- **Another implementation:** register the fixture with `RunPublication`.
-  The [matrix](forge/matrix.go) selects its shared publication and title
-  tests. The tests read back the request from the server, including its ID
-  and title.
+- **Another implementation:** pass `forge.PublicationCases(s.newPublication)`
+  to `forge.Matrix.Run`, as in the [GitLab suite](forge/gitlab/forge_test.go).
+  The matrix selects the shared cases, which read back the request's ID and
+  title from the server.
 - **A feature or regression:** add a `t.Run` beside the behavior it protects.
   When adding a whole capability, enroll it in the family's
   [matrix](forge/matrix.go) and run it from the provider's `TestCapabilities`.
