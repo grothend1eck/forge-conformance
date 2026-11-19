@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/updatecli/updatecli/acceptance/forge"
 	"github.com/updatecli/updatecli/acceptance/internal/conformance"
@@ -19,7 +20,6 @@ func main() {
 		os.Exit(2)
 	}
 	var err error
-	// Each family owns its matrix. The renderer has no provider-specific code.
 	for _, family := range []conformance.Matrix{forge.Matrix} {
 		if len(os.Args) == 1 {
 			err = errors.Join(err, family.Overview(os.Stdout))
@@ -35,16 +35,17 @@ func main() {
 
 func report(family conformance.Matrix, dir string) error {
 	streams := make(map[string]io.Reader)
-	for _, id := range family.Profiles {
-		f, err := os.Open(filepath.Join(dir, family.Family, id+".jsonl"))
-		if errors.Is(err, os.ErrNotExist) {
-			continue // Report marks the missing profile unverified in the summary.
-		}
+	files, err := filepath.Glob(filepath.Join(dir, family.Family, "*.jsonl"))
+	if err != nil {
+		return err
+	}
+	for _, path := range files {
+		f, err := os.Open(path)
 		if err != nil {
 			return err
 		}
 		defer f.Close()
-		streams[id] = f
+		streams[strings.TrimSuffix(filepath.Base(path), ".jsonl")] = f
 	}
 	return family.Report(os.Stdout, streams)
 }

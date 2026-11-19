@@ -113,6 +113,8 @@ func start(t *testing.T) *fixture {
 	t.Cleanup(g.httpClient.CloseIdleConnections)
 
 	g.anonymous = g.sdkClient(t, "")
+	_, resp, err := g.anonymous.Users.CurrentUser(gitlabsdk.WithContext(ctx))
+	expectRejection(t, "anonymous current-user lookup", resp, err, http.StatusUnauthorized)
 	g.bootstrapActor(t, ctx, c)
 	t.Logf("GitLab CE %s with verified project actor ready in %s", gitLabVersion, time.Since(started).Round(time.Millisecond))
 	return g

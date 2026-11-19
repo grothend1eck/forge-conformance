@@ -38,7 +38,9 @@ reproducer for private authenticated branch and tag creation that's still red.
 - **A fuzz target:** keep the `Fuzz…` function in the package that owns the
   behavior. The [draft-title target](../pkg/plugins/resources/gitea/pullrequest/title_fuzz_test.go)
   checks repeat edits; the real-forge regression checks that an edited draft
-  stays open. `go test` replays the seeds, and the nightly job fuzzes for a minute.
+  stays open. No registration is needed: PRs replay the seeds, and the nightly
+  matrix gives each discovered target a minute. To see the same list locally,
+  run `GOFLAGS=-tags=acceptance go run ./acceptance/cmd/fuzzmatrix`.
 - **Another family:** use [`internal/cli`](internal/cli) to drive the binary
   and `testing.T` for the assertions. If it compares implementations, give
   it a `conformance.Matrix` and register that matrix in `cmd/conformance`.

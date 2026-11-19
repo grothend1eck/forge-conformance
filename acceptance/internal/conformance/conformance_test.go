@@ -10,6 +10,18 @@ import (
 	"testing"
 )
 
+func TestCatalogueCannotCountOneCapabilityTwice(t *testing.T) {
+	edit := Row{ID: "edit", Cells: []Cell{{Status: Required}}}
+	m := Matrix{Family: "writing", Profiles: []string{"text"}, Rows: []Row{edit, edit}}
+	if err := m.Overview(io.Discard); err == nil {
+		t.Fatal("one passing test would be counted as two capabilities")
+	}
+	m.Rows = []Row{{ID: "comment", Cells: []Cell{{Status: NotApplicable}}}}
+	if err := m.Overview(io.Discard); err == nil {
+		t.Fatal("excluding a capability from the denominator needs a reason")
+	}
+}
+
 func TestReport(t *testing.T) {
 	goBin := filepath.Join(runtime.GOROOT(), "bin", "go")
 	binary := filepath.Join(t.TempDir(), "fixture.test")

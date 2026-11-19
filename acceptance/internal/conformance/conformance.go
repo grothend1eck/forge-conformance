@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 )
 
@@ -42,8 +43,10 @@ func (m Matrix) Report(w io.Writer, streams map[string]io.Reader) error {
 		return err
 	}
 	var errs []error
-	if len(streams) > len(m.Profiles) {
-		errs = append(errs, fmt.Errorf("unexpected extra test stream"))
+	for profile := range streams {
+		if !slices.Contains(m.Profiles, profile) {
+			errs = append(errs, fmt.Errorf("unexpected profile %q", profile))
+		}
 	}
 	passed := make([]bool, len(m.Profiles))
 	for i, profile := range m.Profiles {
@@ -57,12 +60,31 @@ func (m Matrix) Report(w io.Writer, streams map[string]io.Reader) error {
 }
 
 func (m Matrix) validate() error {
-	if len(m.Profiles) == 0 || len(m.Rows) == 0 {
+	if m.Family == "" || len(m.Profiles) == 0 || len(m.Rows) == 0 {
 		return fmt.Errorf("empty conformance matrix")
 	}
+	for i, p := range m.Profiles {
+		if p == "" || slices.Contains(m.Profiles[:i], p) {
+			return fmt.Errorf("empty or duplicate profile %q", p)
+		}
+	}
+	seen := make(map[string]bool)
 	for _, row := range m.Rows {
-		if len(row.Cells) != len(m.Profiles) {
-			return fmt.Errorf("%s: expected one cell per profile", row.ID)
+		if row.ID == "" || seen[row.ID] || len(row.Cells) != len(m.Profiles) {
+			return fmt.Errorf("expected a unique capability and one cell per profile: %q", row.ID)
+		}
+		seen[row.ID] = true
+		for i, cell := range row.Cells {
+			switch cell.Status {
+			case Required, NotEnrolled:
+			case Gap, KnownIssue, NotApplicable:
+				if cell.Reason != "" {
+					continue
+				}
+				return fmt.Errorf("%s/%s: %s needs a reason", m.Profiles[i], row.ID, cell.Status)
+			default:
+				return fmt.Errorf("%s/%s: unknown status %q", m.Profiles[i], row.ID, cell.Status)
+			}
 		}
 	}
 	return nil
