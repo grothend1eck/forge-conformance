@@ -201,7 +201,7 @@ func (g *Gitea) PushTag(tag string) error {
 
 // PushBranch push branch
 func (g *Gitea) PushBranch(branch string) error {
-	err := g.nativeGitHandler.PushTag(
+	err := g.nativeGitHandler.PushBranch(
 		branch,
 		g.Spec.Username,
 		g.Spec.Token,

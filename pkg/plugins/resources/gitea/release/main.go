@@ -3,6 +3,7 @@ package release
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -225,13 +226,10 @@ func (g *Gitea) SearchReleases(ctx context.Context, releaseAge age.Spec) ([]stri
 func (g *Gitea) searchReleases(ctx context.Context, releaseAge age.Spec) ([]string, []string, error) {
 	results := []string{}
 	published := []string{}
-	page := 0
-	for {
-		// Timeout api query after 30sec
-		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
+	for page := 1; page != 0; {
+		queryCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		releases, resp, err := g.client.Releases.List(
-			ctx,
+			queryCtx,
 			strings.Join([]string{g.spec.Owner, g.spec.Repository}, "/"),
 			scm.ReleaseListOptions{
 				Page:   page,
@@ -240,6 +238,7 @@ func (g *Gitea) searchReleases(ctx context.Context, releaseAge age.Spec) ([]stri
 				Closed: true,
 			},
 		)
+		cancel()
 
 		if err != nil {
 			return nil, nil, err
@@ -249,26 +248,25 @@ func (g *Gitea) searchReleases(ctx context.Context, releaseAge age.Spec) ([]stri
 			log.Debugf("Gitea Api Response:\n%+v", resp)
 		}
 
-		for i := len(releases) - 1; i >= 0; i-- {
-			if releases[i].Draft {
+		for _, release := range releases {
+			if release.Draft {
 				continue
 			}
-			published = append(published, releases[i].Tag)
-			date := releaseDate(releases[i])
+			published = append(published, release.Tag)
+			date := releaseDate(release)
 			if !releaseAge.Matches(date) {
-				log.Debugf("ignoring release %q, dated %s, as outside of the age window", releases[i].Tag, date)
+				log.Debugf("ignoring release %q, dated %s, as outside of the age window", release.Tag, date)
 				continue
 			}
-			results = append(results, releases[i].Tag)
+			results = append(results, release.Tag)
 		}
-
-		if page >= resp.Page.Last {
-			break
-		}
-		page++
-
+		page = resp.Page.Next
 	}
 
+	// The API returns newest first across pages; the version filter expects
+	// oldest first. Reversing each page would give older pages priority.
+	slices.Reverse(results)
+	slices.Reverse(published)
 	return results, published, nil
 }
 
