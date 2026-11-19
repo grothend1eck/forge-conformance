@@ -233,15 +233,17 @@ func (r *repository) awaitBranches(t *testing.T, branches ...string) map[string]
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
 	defer cancel()
-	tick := time.NewTicker(100 * time.Millisecond)
+	tick := time.NewTicker(250 * time.Millisecond)
 	defer tick.Stop()
 	for {
 		label := "repository metadata"
 		repo, resp, err := s.client.Repositories.GetRepo(ctx, s.owner, r.name)
 		ready := err == nil && repo != nil && !repo.Empty && repo.DefaultBranch == "main"
-		if repo != nil && !repo.Private {
+		// The SDK also returns a zero Repository on transport/HTTP errors.
+		// Only a successful metadata read can establish that it is public.
+		if err == nil && repo != nil && !repo.Private {
 			t.Fatalf("%s repository %s unexpectedly public", s.provider, r.name)
 		}
 		if ready {

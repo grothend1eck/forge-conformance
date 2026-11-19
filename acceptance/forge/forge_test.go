@@ -68,7 +68,7 @@ func giteaProfile(id string) conformance.Profile {
 		},
 		conformance.Unavailable{
 			ID: "private_native_ref_targets", Status: conformance.KnownIssue,
-			Reason: "The native gitbranch target issues an anonymous checkout before the authenticated push; see known_private_refs_test.go.",
+			Reason: "Private gitbranch creation and managed gittag creation can check out anonymously before the push; see known_private_refs_test.go.",
 		},
 		conformance.Unavailable{
 			ID: "repository_search", Status: conformance.Unimplemented,

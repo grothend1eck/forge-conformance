@@ -31,7 +31,7 @@ use the same `gitea` provider and run all the groups below. GitLab uses the
 | PR review metadata (Gitea and Forgejo) | An update keeps the assignee and completed approval on the same PR and requests only the new reviewer. |
 | Close and isolate requests | Keep nonempty PRs; identify and close an empty managed PR, and prune only its working branch. A same-named PR **from another fork** is not Updatecli's PR. |
 | Review safety | An edit keeps a maintainer-marked draft on the same PR. If the forge rejects a reviewer, Updatecli reports failure and does not schedule a merge, even after the required check passes. |
-| Protected automerge | The server records who scheduled the merge. Success on the wrong SHA or in the wrong status context cannot release it. Passing the required check on the PR head merges the original request without another CLI run. An edit keeps an existing schedule. Native Git distinguishes explicit merge and fast-forward from the repository's default squash. |
+| Protected automerge | The server records who scheduled the merge. Success on the wrong SHA or in the wrong status context cannot release it. Passing the required check merges the original request; an edit keeps an existing schedule. Git parents and file contents distinguish merge, squash, rebase, rebase-merge and fast-forward. |
 | Git SCM | Native Git verifies private shallow and submodule checkouts, commit contents, signatures, direct and working-branch updates, squash and pruning. Native branch and tag targets leave same-named sibling refs alone. |
 | Branches, tags and releases | Select real refs, feed a condition or target from the result, and distinguish absence from a held-back release. A release on page two must be selectable; ensuring it exists must keep its original ID, contents and Git refs. |
 | Action discovery | Resolve fully qualified actions in Gitea/Forgejo workflow and composite-action steps. Check release, tag and branch inputs, pins and version comments, and untouched neighbors. This tests Updatecli's crawler, not a forge Actions runner. |
@@ -67,6 +67,12 @@ the full check. **Only N/A is excluded from the denominator.** For example,
 GitLab does not use the Gitea Actions run-number URL. A missing Updatecli
 feature, an untested group, and a known bug stay visible. This is the
 catalog in [`forge_test.go`](forge_test.go), not a percentage of a forge's API.
+
+[`conformance-v1.json`](conformance-v1.json) records the minimum already
+promised by this suite: each key is a capability, each listed profile must
+pass it. An empty list is a tracked gap. Removing a v1 row or dropping an
+enrollment cannot improve the score or pass CI. New tests run as soon as
+they join a capability; new capabilities can be tried before promising them.
 
 For local evidence, set `UPDATECLI_TEST_FORGE` and `UPDATECLI_TEST_REPORT`
 to one profile and a new absolute JSON filename. Run its whole suite with
