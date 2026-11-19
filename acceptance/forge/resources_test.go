@@ -52,6 +52,7 @@ func testBranches(t *testing.T, s *server) {
 	if got := r.refs(t); !maps.Equal(got, before) {
 		t.Fatalf("branch sources/conditions and rejected target changed remote refs: got %v, want %v", got, before)
 	}
+	runRequired(t, "pagination", func(t *testing.T) { testBranchPagination(t, s) })
 }
 
 func testTags(t *testing.T, s *server) {
@@ -84,14 +85,7 @@ func testTags(t *testing.T, s *server) {
 }
 
 func testReleases(t *testing.T, s *server) {
-	runRequired(t, "paginated_source", func(t *testing.T) {
-		r, release := seedReleaseOnLaterPage(t, s)
-		before := r.refs(t)
-		checkResourceSelection(t, s, r.name, "release", resourceSelection{
-			kind: "latest", pattern: release.TagName, want: release.TagName,
-		})
-		require.Equal(t, before, r.refs(t), "the selector and condition must not modify remote refs")
-	})
+	runRequired(t, "pagination", func(t *testing.T) { testReleasePagination(t, s) })
 	runRequired(t, "selection-and-conditions", func(t *testing.T) {
 		r := s.newRepo(t)
 		// Publish the highest semver first, so default/latest and a semver
@@ -104,13 +98,17 @@ func testReleases(t *testing.T, s *server) {
 				s.apiFailure(t, "seed release "+tag, resp, err)
 			}
 		}
-		releases := readResourceReleases(t, s, r.name)
+		const tagOnly = "v3.0.0"
+		r.git(t, "tag", tagOnly, r.base)
+		r.git(t, "push", "origin", "refs/tags/"+tagOnly)
 		before := r.refs(t)
+		require.NotEmpty(t, before["refs/tags/"+tagOnly], "fixture needs a Git tag without a release")
+		releases := readResourceReleases(t, s, r.name)
 		var latest string
 		for _, release := range releases {
-			if !release.IsDraft {
+			require.NotEqual(t, tagOnly, release.TagName)
+			if latest == "" && !release.IsDraft {
 				latest = release.TagName
-				break
 			}
 		}
 		if len(releases) != 5 || latest == "" {
@@ -127,18 +125,22 @@ func testReleases(t *testing.T, s *server) {
 			{name: "draft-excluded", kind: "latest", pattern: "v9.0.0", wantError: `no version found matching pattern "v9.0.0"`},
 		})
 		testResourceConditions(t, s, r.name, "release", "tag", "v2.0.0")
-		runRequired(t, "condition/ignores-selector-age-and-excludes-drafts", func(t *testing.T) {
+		runRequired(t, "condition/published-release-not-draft-or-plain-tag", func(t *testing.T) {
 			c := newCLI(t, s)
 			writeResourceFile(t, c.runner.Dir, resourceOutput, resourceUntouched)
 			fresh := resourceNode(s, r.name, "release", map[string]any{
 				"tag": "v2.0.0", "age": map[string]string{"minimum": "30d"},
+				"versionfilter": map[string]string{"kind": "semver", "pattern": "~7"},
 			})
 			fresh["disablesourceinput"] = true
-			draft := resourceNode(s, r.name, "release", map[string]any{"tag": "v9.0.0"})
-			draft["disablesourceinput"], draft["failwhen"] = true, true
+			absentAsRelease := func(tag string) map[string]any {
+				node := resourceNode(s, r.name, "release", map[string]any{"tag": tag})
+				node["disablesourceinput"], node["failwhen"] = true, true
+				return node
+			}
 			c.ok(t, "apply", manifestYAML(t, map[string]any{
 				"name":       "Only published releases satisfy conditions",
-				"conditions": map[string]any{"published": fresh, "notPublished": draft},
+				"conditions": map[string]any{"published": fresh, "noDraft": absentAsRelease("v9.0.0"), "noPlainTag": absentAsRelease(tagOnly)},
 				"targets":    map[string]any{"check": resourceFileNode(resourceOutput, "passed")},
 			}))
 			assertResourceFile(t, c.runner.Dir, resourceOutput, "passed")
@@ -146,38 +148,6 @@ func testReleases(t *testing.T, s *server) {
 		if got := r.refs(t); !maps.Equal(got, before) {
 			t.Fatalf("release selectors and conditions changed remote refs: got %v, want %v", got, before)
 		}
-	})
-	runRequired(t, "target/existing_on_later_page", func(t *testing.T) {
-		r, release := seedReleaseOnLaterPage(t, s)
-		c := newCLI(t, s)
-		before := r.refs(t)
-		target := resourceNode(s, r.name, "release", map[string]any{
-			"tag": release.TagName, "commitish": r.base, "title": "Do not replace the published release",
-		})
-		target["disablesourceinput"] = true
-		manifest := manifestYAML(t, map[string]any{
-			"name":    "Ensure a release already on page 2 exists",
-			"targets": map[string]any{"ensure": target},
-		})
-		existing := fmt.Sprintf("Release Tag %q already exist", release.TagName)
-		checkUnchanged := func(t *testing.T, mode string) {
-			t.Helper()
-			require.Equal(t, before, r.refs(t), "%s must not change remote refs", mode)
-			require.Len(t, readReleasePage(t, s, r.name, 1), releasePageSize)
-			second := readReleasePage(t, s, r.name, 2)
-			require.Len(t, second, 1)
-			require.Equal(t, release, second[0], "%s must preserve the existing release", mode)
-		}
-
-		preview := c.ok(t, "diff", manifest)
-		if strings.Contains(preview, "doesn't exist and should be created") {
-			t.Fatalf("diff must not plan creation of existing release %q", release.TagName)
-		}
-		requireOutput(t, preview, existing)
-		checkUnchanged(t, "diff")
-
-		requireOutput(t, c.ok(t, "apply", manifest), existing)
-		checkUnchanged(t, "apply")
 	})
 	runRequired(t, "target/explicit-create-preview-and-no-op", func(t *testing.T) {
 		r := s.newRepo(t)
@@ -258,6 +228,41 @@ func testReleases(t *testing.T, s *server) {
 		if got := strings.TrimSpace(r.git(t, "rev-parse", "FETCH_HEAD^{commit}")); got != main {
 			t.Fatalf("default commitish points to %q, want main at %q", got, main)
 		}
+	})
+	runRequired(t, "target/publish-existing-git-tag", func(t *testing.T) {
+		r := s.newRepo(t)
+		r.stage(t, r.base, "stable.txt", "different commit than the tag\n")
+		const tag = "v5.1.0"
+		// Seed through the API and delete only the release, keeping the tag.
+		// Pushing a tag here would race asynchronous post-receive bookkeeping.
+		seed, resp, err := s.client.Releases.CreateRelease(t.Context(), s.owner, r.name, gitea.CreateReleaseOption{
+			TagName: tag, Target: "main", Title: "Temporary fixture release",
+		})
+		if err != nil {
+			s.apiFailure(t, "seed release tag", resp, err)
+		}
+		if resp, err := s.client.Releases.DeleteRelease(t.Context(), s.owner, r.name, seed.ID); err != nil {
+			s.apiFailure(t, "delete fixture release while keeping its tag", resp, err)
+		}
+		before := r.refs(t)
+		tagSHA := before["refs/tags/"+tag]
+		require.NotEmpty(t, tagSHA)
+		require.Equal(t, before["refs/heads/main"], tagSHA)
+		require.NotEqual(t, before["refs/heads/"+r.base], tagSHA)
+		require.Empty(t, readResourceReleases(t, s, r.name), "fixture needs a tag without a release")
+
+		c := newCLI(t, s)
+		target := resourceNode(s, r.name, "release", map[string]any{"tag": tag, "commitish": r.base})
+		target["disablesourceinput"] = true
+		c.ok(t, "apply", manifestYAML(t, map[string]any{
+			"name":    "Publish a release without moving its existing Git tag",
+			"targets": map[string]any{"release": target},
+		}))
+		release := onlyResourceRelease(t, s, r.name)
+		require.Equal(t, tag, release.TagName)
+		require.False(t, release.IsDraft)
+		require.Equal(t, tag, release.Title)
+		require.Equal(t, before, r.refs(t), "publishing a release must not move its existing Git tag")
 	})
 	runRequired(t, "target/draft", func(t *testing.T) {
 		r := s.newRepo(t)
@@ -400,14 +405,17 @@ func testUnsupportedRefTarget(t *testing.T, s *server, repo, kind, wantError str
 		c := newCLI(t, s)
 		target := resourceNode(s, repo, kind, map[string]any{kind: resourceMissing})
 		target["disablesourceinput"] = true
-		res := c.run(t, "apply", manifestYAML(t, map[string]any{
+		manifest := manifestYAML(t, map[string]any{
 			"name":    "Reject an unsupported Gitea target",
 			"targets": map[string]any{"unsupported": target},
-		}))
-		if res.ExitCode != 1 {
-			t.Fatalf("unsupported target: apply exited %d, want 1", res.ExitCode)
+		})
+		for _, mode := range []string{"diff", "apply"} {
+			res := c.run(t, mode, manifest)
+			if res.ExitCode != 1 {
+				t.Fatalf("unsupported target: %s exited %d, want 1", mode, res.ExitCode)
+			}
+			requireOutput(t, res.Output, wantError)
 		}
-		requireOutput(t, res.Output, wantError)
 	})
 }
 
@@ -441,7 +449,7 @@ func assertResourceFile(t *testing.T, dir, file, want string) {
 		t.Fatal(err)
 	}
 	if string(content) != want {
-		t.Fatalf("%s = %q, want %q", file, content, want)
+		t.Fatalf("%s did not contain the expected value %q", file, want)
 	}
 }
 

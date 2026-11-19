@@ -13,6 +13,13 @@ import (
 )
 
 func testRequestSafety(t *testing.T, s *server) {
+	runRequired(t, "generated_report_persists", func(t *testing.T) {
+		testGeneratedPRReport(t, s)
+	})
+	runRequired(t, "explicit_patch_branches", func(t *testing.T) {
+		testPRBranchOverrides(t, s)
+	})
+
 	runRequired(t, "draft_survives_edit", func(t *testing.T) {
 		const id = "draft-survives-edit"
 		const title = "Acceptance: " + id

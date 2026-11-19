@@ -5,83 +5,87 @@ package forge
 import (
 	"os"
 	"testing"
+
+	"github.com/updatecli/updatecli/acceptance/internal/conformance"
 )
 
-type capability[F any] struct {
-	name string
-	run  func(*testing.T, F)
+var profiles = []conformance.Profile{
+	giteaProfile("gitea"),
+	giteaProfile("forgejo"),
+	conformance.NewProfile("gitlab", startGitLab, []conformance.Capability[*gitlabFixture]{
+		publishUpdate[*gitlabFixture](),
+	},
+		conformance.Unavailable{
+			ID: "workflow_discovery", Status: conformance.NotApplicable,
+			// testWorkflowDiscovery seeds .gitea/.forgejo workflow and composite-action files.
+			Reason: "This contract is for Gitea/Forgejo Actions files; GitLab CI uses .gitlab-ci.yml, not that Actions dialect.",
+		},
+		conformance.Unavailable{
+			ID: "gitea_actions_run_link", Status: conformance.NotApplicable,
+			Reason: "GitLab CI uses its own job URL rather than the Gitea Actions run-number URL.",
+		},
+		conformance.Unavailable{
+			ID: "release_changelog", Status: conformance.Unimplemented,
+			Reason: "Updatecli's gitlab/release Changelog method returns nil.",
+		},
+	),
 }
 
-var profiles = []struct {
-	name string
-	run  func(*testing.T)
-}{
-	{"gitea", func(t *testing.T) { runProfile(t, startServer(t, "gitea"), giteaCapabilities) }},
-	{"forgejo", func(t *testing.T) { runProfile(t, startServer(t, "forgejo"), giteaCapabilities) }},
-	{"gitlab", func(t *testing.T) { runProfile(t, startGitLab(t), gitlabCapabilities) }},
-}
-
-var giteaCapabilities = []capability[*server]{
-	{"authentication", testAuthentication},
-	publishUpdate[*server](),
-	{"publish_review_metadata", testPublishReviewMetadata},
-	{"request_safety", testRequestSafety},
-	{"close_obsolete_request", testClean},
-	{"fork_isolation", testFork},
-	{"server_automerge", testProtectedMerge},
-	{"manual_merge", testManualMerge},
-	{"draft_request", testDraft},
-	{"git_scm", testSCM},
-	{"branch_resource", testBranches},
-	{"tag_resource", testTags},
-	{"release_resource", testReleases},
-	{"workflow_discovery", testWorkflowDiscovery},
-}
-
-var gitlabCapabilities = []capability[*gitlabFixture]{
-	publishUpdate[*gitlabFixture](),
-}
-
-func runProfile[F any](t *testing.T, fixture F, capabilities []capability[F]) {
-	t.Helper()
-	if len(capabilities) == 0 {
-		t.Fatal("no capabilities enrolled")
-	}
-	for _, c := range capabilities {
-		runRequired(t, c.name, func(t *testing.T) { c.run(t, fixture) })
-	}
+func giteaProfile(id string) conformance.Profile {
+	return conformance.NewProfile(id, func(t *testing.T) *server { return startServer(t, id) },
+		[]conformance.Capability[*server]{
+			{ID: "authentication", Run: testAuthentication},
+			publishUpdate[*server](),
+			{ID: "publish_review_metadata", Run: testPublishReviewMetadata},
+			{ID: "request_safety", Run: testRequestSafety},
+			{ID: "close_obsolete_request", Run: testClean},
+			{ID: "fork_isolation", Run: testFork},
+			{ID: "server_automerge", Run: testProtectedMerge},
+			{ID: "manual_merge", Run: testManualMerge},
+			{ID: "draft_request", Run: testDraft},
+			{ID: "git_scm", Run: testSCM},
+			{ID: "branch_resource", Run: testBranches},
+			{ID: "tag_resource", Run: testTags},
+			{ID: "release_resource", Run: testReleases},
+			{ID: "workflow_discovery", Run: testWorkflowDiscovery},
+			{ID: "gitea_actions_run_link", Run: testWorkflowRunLink},
+		},
+		conformance.Unavailable{
+			ID: "release_changelog", Status: conformance.Unimplemented,
+			Reason: "Updatecli's gitea/release Changelog method returns nil.",
+		},
+		conformance.Unavailable{
+			ID: "request_labels", Status: conformance.Unimplemented,
+			Reason: "Updatecli's gitea/pullrequest action has no labels setting.",
+		},
+		conformance.Unavailable{
+			ID: "request_team_reviewers", Status: conformance.Unimplemented,
+			Reason: "Updatecli's gitea/pullrequest action requests reviews from user accounts only.",
+		},
+		conformance.Unavailable{
+			ID: "publish_from_fork", Status: conformance.Unimplemented,
+			Reason: "Updatecli's gitea/pullrequest action requires both branches in one repository and ignores existing PRs from forks.",
+		},
+		conformance.Unavailable{
+			ID: "private_native_ref_targets", Status: conformance.KnownIssue,
+			Reason: "The native gitbranch target issues an anonymous checkout before the authenticated push; see known_private_refs_test.go.",
+		},
+		conformance.Unavailable{
+			ID: "repository_search", Status: conformance.Unimplemented,
+			Reason: "Updatecli registers no giteasearch SCM.",
+		},
+	)
 }
 
 func TestForge(t *testing.T) {
-	failOnSkip(t)
 	selected, specified := os.LookupEnv("UPDATECLI_TEST_FORGE")
-	matched := false
-	for _, profile := range profiles {
-		if specified && selected != profile.name {
-			continue
-		}
-		matched = true
-		runRequired(t, profile.name, profile.run)
+	if specified && selected == "" {
+		t.Fatal("UPDATECLI_TEST_FORGE is set but empty")
 	}
-	if !matched {
-		t.Fatalf("no forge profile matches UPDATECLI_TEST_FORGE=%q", selected)
-	}
+	conformance.Run(t, selected, os.Getenv("UPDATECLI_TEST_REPORT"), profiles...)
 }
 
-// A skipped enrolled case must fail the check. Go's -run filter still works:
-// tests outside the filter never enter the callback.
 func runRequired(t *testing.T, name string, f func(*testing.T)) {
 	t.Helper()
-	t.Run(name, func(t *testing.T) {
-		failOnSkip(t)
-		f(t)
-	})
-}
-
-func failOnSkip(t *testing.T) {
-	t.Cleanup(func() {
-		if t.Skipped() {
-			t.Error("enrolled forge test was skipped")
-		}
-	})
+	conformance.Required(t, name, f)
 }

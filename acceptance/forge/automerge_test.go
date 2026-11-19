@@ -15,6 +15,7 @@ import (
 	"time"
 
 	giteasdk "gitea.dev/sdk"
+	"github.com/stretchr/testify/require"
 )
 
 const (
@@ -78,6 +79,75 @@ func testProtectedMerge(t *testing.T, s *server) {
 		// Squash creates a new commit whose only parent is the old base.
 		r.awaitMerged(t, opened, before.baseTip)
 	})
+
+	runRequired(t, "existing_schedule_unchanged", func(t *testing.T) {
+		const id = "keep-existing-schedule"
+		r, before := newProtectedMergeRepo(t, s)
+		r.configureDefaultSquash(t)
+		c := newCLI(t, s)
+		apply := func(version, strategy, method string) {
+			t.Helper()
+			c.ok(t, "apply", requestManifest(t, r, id, version, map[string]any{
+				"title": version, "merge": map[string]any{"strategy": strategy}, "mergemethod": method,
+			}))
+		}
+		apply("v1.1.0", "AuTo", "MeRgE")
+		opened := r.assertOpened(t, "after scheduling with explicit merge over default squash", before, "v1.1.0", false)
+		r.assertScheduledBy(t, "after the first scheduling request", opened.number, s.owner)
+
+		apply("v1.2.0", "auto", "squash")
+		edited := r.assertScheduleKeptOnEdit(t, opened, "v1.2.0")
+		apply("v1.3.0", "manual", "squash")
+		edited = r.assertScheduleKeptOnEdit(t, edited, "v1.3.0")
+
+		r.publishStatus(t, edited.headSHA, requiredMergeCheck, "success")
+		// The original explicit merge policy, not either later squash setting,
+		// must still govern the server's merge of the latest head.
+		r.awaitMergedCommit(t, edited, "version: v1.3.0\nkeep: untouched\n", false, before.baseTip, edited.headSHA)
+	})
+
+	runRequired(t, "explicit_fast_forward", func(t *testing.T) {
+		const (
+			id    = "explicit-ff-only"
+			title = "Fast-forward after the required check"
+		)
+		r, before := newProtectedMergeRepo(t, s)
+		// Leave regular merge and squash enabled. A fast-forward result must
+		// come from the manifest, not the repository default.
+		r.configureDefaultSquash(t)
+		_, resp, err := s.client.Repositories.EditRepo(t.Context(), s.owner, r.name, giteasdk.EditRepoOption{
+			AllowFastForwardOnlyMerge: new(true),
+		})
+		if err != nil {
+			s.apiFailure(t, "allow fast-forward-only merges", resp, err)
+		}
+		require.True(t, publishRepo(t, r).AllowFastForwardOnlyMerge)
+		newCLI(t, s).ok(t, "apply", requestManifest(t, r, id, "v1.1.0", map[string]any{
+			"title": title, "merge": map[string]any{"strategy": "auto"}, "mergemethod": "fast-forward-only",
+		}))
+
+		opened := r.assertOpened(t, "after requesting an explicit fast-forward", before, title, false)
+		r.assertScheduledBy(t, "before publishing the required status", opened.number, s.owner)
+		r.publishStatus(t, opened.headSHA, requiredMergeCheck, "success")
+		r.awaitMergedCommit(t, opened, mergeFixtureAfter, true, before.baseTip)
+	})
+}
+
+func (r *repository) assertScheduleKeptOnEdit(t *testing.T, prior mergeSnapshot, version string) mergeSnapshot {
+	t.Helper()
+	const phase = "after editing an already scheduled request"
+	require.Len(t, r.listRequests(t, phase), 1)
+	edited := r.readMergeSnapshot(t, phase, prior.number)
+	require.NotEmpty(t, edited.headSHA)
+	require.NotEqual(t, prior.headSHA, edited.headSHA)
+	want := prior
+	want.title = version
+	want.headSHA, want.headTip = edited.headSHA, edited.headSHA
+	assertOpen(t, phase, edited, want)
+	contents, _ := r.readCommit(t, edited.headBranch, edited.headSHA)
+	require.Equal(t, "version: "+version+"\nkeep: untouched\n", contents)
+	r.assertScheduledBy(t, phase, edited.number, r.server.owner)
+	return edited
 }
 
 func testManualMerge(t *testing.T, s *server) {
@@ -178,6 +248,11 @@ func (r *repository) assertUnmergedFor(t *testing.T, phase string, opened mergeS
 
 func (r *repository) awaitMerged(t *testing.T, opened mergeSnapshot, wantParents ...string) {
 	t.Helper()
+	r.awaitMergedCommit(t, opened, mergeFixtureAfter, false, wantParents...)
+}
+
+func (r *repository) awaitMergedCommit(t *testing.T, opened mergeSnapshot, wantContents string, fastForward bool, wantParents ...string) {
+	t.Helper()
 	const phase = "await automatic merge after required status success"
 	deadline := time.Now().Add(mergeWaitTimeout)
 	for {
@@ -190,7 +265,10 @@ func (r *repository) awaitMerged(t *testing.T, opened mergeSnapshot, wantParents
 			if pr.mergedSHA != pr.baseTip || pr.mergedBy != r.server.owner || len(r.listRequests(t, phase)) != 1 {
 				t.Fatalf("%s: expected the sole original request merged by %q at the remote base tip, got %+v", phase, r.server.owner, pr)
 			}
-			if pr.baseTip == opened.headSHA {
+			if fastForward && pr.baseTip != opened.headSHA {
+				t.Fatalf("%s: base advanced to %s, want exact PR head %s for fast-forward", phase, pr.baseTip, opened.headSHA)
+			}
+			if !fastForward && pr.baseTip == opened.headSHA {
 				t.Fatalf("%s: base fast-forwarded to %s instead of creating a new commit", phase, pr.baseTip)
 			}
 			// Read the actual Git parents and file, independent of the API's
@@ -199,8 +277,8 @@ func (r *repository) awaitMerged(t *testing.T, opened mergeSnapshot, wantParents
 			if !slices.Equal(parents, wantParents) {
 				t.Fatalf("%s: merge parents %v, want %v", phase, parents, wantParents)
 			}
-			if contents != mergeFixtureAfter {
-				t.Fatalf("%s: merged version.yaml = %q, want %q", phase, contents, mergeFixtureAfter)
+			if contents != wantContents {
+				t.Fatalf("%s: merged version.yaml = %q, want %q", phase, contents, wantContents)
 			}
 			return
 		}

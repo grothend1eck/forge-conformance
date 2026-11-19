@@ -31,10 +31,11 @@ use the same `gitea` provider and run all the groups below. GitLab uses the
 | PR review metadata (Gitea and Forgejo) | An update keeps the assignee and completed approval on the same PR and requests only the new reviewer. |
 | Close and isolate requests | Keep nonempty PRs; identify and close an empty managed PR, and prune only its working branch. A same-named PR **from another fork** is not Updatecli's PR. |
 | Review safety | An edit keeps a maintainer-marked draft on the same PR. If the forge rejects a reviewer, Updatecli reports failure and does not schedule a merge, even after the required check passes. |
-| Protected automerge | The server records who scheduled the merge. Success on the wrong SHA or in the wrong status context cannot release it. Passing the required check on the PR head merges the original request without another CLI run. Manual and WIP requests stay open. Git ancestry distinguishes an explicit merge from the repository's default squash. |
-| Git SCM | Native Git verifies the private checkout, shallow/single-branch reads, direct and working-branch commits, `--existing-only`, and squash across two updates. A `gittag` target must create its annotated tag on the selected commit and leave it alone on reapply. |
+| Protected automerge | The server records who scheduled the merge. Success on the wrong SHA or in the wrong status context cannot release it. Passing the required check on the PR head merges the original request without another CLI run. An edit keeps an existing schedule. Native Git distinguishes explicit merge and fast-forward from the repository's default squash. |
+| Git SCM | Native Git verifies private shallow and submodule checkouts, commit contents, signatures, direct and working-branch updates, squash and pruning. Native branch and tag targets leave same-named sibling refs alone. |
 | Branches, tags and releases | Select real refs, feed a condition or target from the result, and distinguish absence from a held-back release. A release on page two must be selectable; ensuring it exists must keep its original ID, contents and Git refs. |
 | Action discovery | Resolve fully qualified actions in Gitea/Forgejo workflow and composite-action steps. Check release, tag and branch inputs, pins and version comments, and untouched neighbors. This tests Updatecli's crawler, not a forge Actions runner. |
+| Gitea Actions run link | With the documented runner variables supplied, the generated PR body links to the run **number**, not the run ID. No Actions worker is needed. |
 
 ## Adding a capability
 
@@ -57,19 +58,31 @@ seeds; the nightly job explores new inputs for one minute. To run it locally:
 go test -run '^$' -fuzz '^FuzzExistingPullRequestTitle$' -fuzztime=1m ./pkg/plugins/resources/gitea/pullrequest
 ```
 
-## Known failures
+## Reading the conformance check
 
-With a `gitbranch` target and `scmid` pointing to `gitea`, an existing tag
-with the requested branch name can make `apply` exit zero **without creating
-the branch**. The [branch test](known_test.go) checks the remote branch and tag.
+`Forge conformance` compares capability groups, not subtest counts. Each
+matrix job uploads a JSON report from its real test run. Only a passed group
+from a successful, complete run counts as verified. Missing evidence fails
+the full check. **Only N/A is excluded from the denominator.** For example,
+GitLab does not use the Gitea Actions run-number URL. A missing Updatecli
+feature, an untested group, and a known bug stay visible. This is the
+catalog in [`forge_test.go`](forge_test.go), not a percentage of a forge's API.
 
-Run the reproducer on Gitea and Forgejo with `UPDATECLI_BIN` set:
+For local evidence, set `UPDATECLI_TEST_FORGE` and `UPDATECLI_TEST_REPORT`
+to one profile and a new absolute JSON filename. Run its whole suite with
+`-count=1`. Use `-run` without a report for day-to-day work.
+
+**Known issue:** the generic native ref targets can attempt an anonymous
+checkout of a private repository before the authenticated push. The
+[reproducer](known_private_refs_test.go) checks the branch and the managed
+tag case on both servers. Run it with `UPDATECLI_BIN` set:
 
 ```sh
-go test -tags=acceptance,knownissues -count=1 -run '^TestNativeGitBranchPush$' ./acceptance/forge
+go test -tags=acceptance,knownissues -count=1 -run '^TestPrivateNativeRefTargets$' ./acceptance/forge
 ```
 
-Move the test into its capability when the fix lands. It does not count as passing.
+The ordinary public branch/tag case and private direct-base tag control are
+separate. A green result for either does not clear this private checkout bug.
 
 ## Scope
 
@@ -81,6 +94,13 @@ implemented at this baseline.
 
 The [existing Codeberg recipes](../../e2e/updatecli.d/success.d/gitea) still
 cover public hosting and bare-host HTTPS URLs. Local HTTP servers do not
-qualify either. See [the Gitea/Forgejo fixture](fixture_test.go) and
+qualify either. See [the Gitea/Forgejo fixture](gitea_fixture_test.go) and
 [the GitLab fixture](gitlab_fixture_test.go) for pinned versions. Passing the
 GitLab publication case does not qualify GitLab auto-merge or hosted GitLab.com.
+
+On PRs that touch only the two acceptance READMEs, the forge check reports
+“not run.” An edit confined to the draft-title fuzz target or its corpus
+runs the full Go pull-request package (including the seeds). Source changes,
+other tests, fixtures, module or workflow changes, deletions, renames and
+ambiguous history all run the full matrix. A manual dispatch can always
+request a full run.

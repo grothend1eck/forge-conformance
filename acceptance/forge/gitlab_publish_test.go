@@ -72,33 +72,13 @@ func (d *gitLabPublication) run(t *testing.T, mode string, input publicationInpu
 
 func (d *gitLabPublication) manifest(t *testing.T, input publicationInput) string {
 	t.Helper()
-	return manifestYAML(t, map[string]any{
-		"name":       "Update the fixture version",
-		"pipelineid": publicationID,
-		"scms": map[string]any{
-			"origin": map[string]any{
-				"kind": "gitlab",
-				"spec": map[string]any{
-					"url": d.repo.url, "owner": d.fixture.owner,
-					"repository": d.project.Path, "branch": d.repo.base,
-					"username": `{{ requiredEnv "UPDATECLI_GITLAB_USERNAME" }}`,
-					"token":    `{{ requiredEnv "UPDATECLI_GITLAB_TOKEN" }}`,
-				},
-			},
-		},
-		"targets": map[string]any{
-			"version": map[string]any{
-				"name": "Update the version", "kind": "yaml", "scmid": "origin",
-				"spec": map[string]any{"file": "version.yaml", "key": "$.version", "value": input.version},
-			},
-		},
-		"actions": map[string]any{
-			"request": map[string]any{
-				"kind": "gitlab/mergerequest", "scmid": "origin",
-				"spec": map[string]any{"title": input.title},
-			},
-		},
-	})
+	scm := map[string]any{"kind": "gitlab", "spec": map[string]any{
+		"url": d.repo.url, "owner": d.fixture.owner, "repository": d.project.Path, "branch": d.repo.base,
+		"username": `{{ requiredEnv "UPDATECLI_GITLAB_USERNAME" }}`,
+		"token":    `{{ requiredEnv "UPDATECLI_GITLAB_TOKEN" }}`,
+	}}
+	action := map[string]any{"kind": "gitlab/mergerequest", "scmid": "origin", "spec": map[string]any{"title": input.title}}
+	return manifestYAML(t, publicationConfig(publicationID, input.version, scm, action))
 }
 
 func (d *gitLabPublication) requests(t *testing.T) []publicationRequest {

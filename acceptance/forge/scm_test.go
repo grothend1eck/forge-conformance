@@ -57,6 +57,9 @@ func testSCM(t *testing.T, s *server) {
 				},
 			},
 		})
+		requireOutput(t, c.ok(t, "diff", manifest), "Copy branch input")
+		require.Equal(t, before, r.refs(t), "diff must not publish a direct update")
+
 		c.ok(t, "apply", manifest)
 
 		baseRef := "refs/heads/" + r.base
@@ -73,6 +76,12 @@ func testSCM(t *testing.T, s *server) {
 		for _, ref := range refs {
 			require.Contains(t, []string{baseRef, "refs/remotes/origin/" + r.base}, ref, "singlebranch fetched an unrelated ref")
 		}
+		c.ok(t, "apply", manifest, "--clean-git-branches")
+		require.Equal(t, after, r.refs(t), "an identical apply must not advance or prune the configured branch")
+	})
+
+	runRequired(t, "submodule_checkout", func(t *testing.T) {
+		testSCMSubmodules(t, s)
 	})
 
 	runRequired(t, "custom_working_branch_existing_only", func(t *testing.T) {
@@ -170,6 +179,62 @@ func testSCM(t *testing.T, s *server) {
 			"the replacement commit must have stable as its only parent, not the first working tip")
 		require.Equal(t, "first apply\n", r.git(t, "show", tip+":first.txt"))
 		require.Equal(t, "second apply\n", r.git(t, "show", tip+":second.txt"))
+
+		apply("second.txt", "second apply\n")
+		require.Equal(t, second, r.refs(t), "an unchanged target must not rewrite squashed history")
+	})
+
+	runRequired(t, "signed_commit", func(t *testing.T) {
+		testSCMSignedCommit(t, s)
+	})
+
+	runRequired(t, "direct_push_requires_explicit_force_setting", func(t *testing.T) {
+		r := s.newRepo(t)
+		spec := scmTestSpec(r)
+		spec["workingbranch"] = false
+		delete(spec, "force")
+		before := r.refs(t)
+		manifest := scmFileManifest(t, spec, "explicit-force", "version-note.txt", "requires explicit push settings\n")
+		result := newCLI(t, s).run(t, "apply", manifest)
+		require.NotZero(t, result.ExitCode, "workingbranch: false with an implicit force push must be rejected")
+		requireOutput(t, result.Output, "unclear configuration, better safe than sorry")
+		require.Equal(t, before, r.refs(t))
+	})
+
+	runRequired(t, "prune_current_working_branch_only", func(t *testing.T) {
+		r := s.newRepo(t)
+		c := newCLI(t, s)
+		const id, file = "prune", "prune.txt"
+		branch := "updatecli_" + r.base + "_" + id
+		workingRef := "refs/heads/" + branch
+		r.stage(t, r.base, file, "current\n")
+		r.git(t, "push", "origin", "refs/heads/"+r.base+":"+workingRef, "refs/heads/main:refs/tags/"+branch)
+		before := r.refs(t)
+		require.Equal(t, before["refs/heads/"+r.base], before[workingRef])
+
+		manifest := func(value string) string {
+			return scmFileManifest(t, scmTestSpec(r), id, file, value)
+		}
+		c.ok(t, "apply", manifest("current\n"))
+		require.Equal(t, before, r.refs(t), "branch pruning must be opt-in")
+		c.ok(t, "apply", manifest("current\n"), "--clean-git-branches")
+		delete(before, workingRef)
+		require.Equal(t, before, r.refs(t), "pruning must remove only the managed head, not the same-name tag or base")
+
+		c.ok(t, "apply", manifest("changed\n"), "--clean-git-branches")
+		withChange := r.refs(t)
+		assertSCMRefChange(t, before, withChange, workingRef)
+		require.NotEqual(t, withChange["refs/heads/"+r.base], withChange[workingRef])
+		c.ok(t, "apply", manifest("changed\n"), "--clean-git-branches")
+		require.Equal(t, withChange, r.refs(t), "pruning must keep the working branch while its commit differs from the base")
+	})
+
+	runRequired(t, "native_gitbranch_target", func(t *testing.T) {
+		testNativeGitBranchTarget(t, s)
+	})
+
+	runRequired(t, "native_ref_sources_and_conditions", func(t *testing.T) {
+		testNativeRefReads(t, s)
 	})
 
 	runRequired(t, "native_gittag_target", func(t *testing.T) {
@@ -177,27 +242,19 @@ func testSCM(t *testing.T, s *server) {
 		c := newCLI(t, s)
 		r.stage(t, r.base, "stable-only.txt", "this commit should be tagged\n")
 		r.git(t, "push", "origin", "main:refs/tags/v1.0.0")
-		before := r.refs(t)
 		const tag = "v1.1.0"
 		const tagRef = "refs/tags/" + tag
+		r.git(t, "push", "origin", "refs/heads/main:refs/heads/"+tag)
+		before := r.refs(t)
+		require.NotContains(t, before, tagRef)
+		require.NotEqual(t, before["refs/heads/"+r.base], before["refs/heads/"+tag])
 
-		// Annotated tags need a tagger; use only the isolated candidate home.
-		require.NoError(t, os.WriteFile(filepath.Join(c.runner.Home, ".gitconfig"),
-			[]byte("[user]\n\tname = Forge Acceptance\n\temail = forge@example.invalid\n"), 0o600))
+		configureNativeTagger(t, c)
 		spec := scmTestSpec(r)
 		spec["workingbranch"] = false
-		manifest := manifestYAML(t, map[string]any{
-			"name": "Tag the configured branch",
-			"scms": map[string]any{"repo": map[string]any{"kind": "gitea", "spec": spec}},
-			"targets": map[string]any{
-				"tag": map[string]any{
-					"name": "Publish a Git tag", "kind": "gittag", "scmid": "repo",
-					"spec": map[string]any{
-						"versionfilter": map[string]any{"pattern": tag},
-						"message":       "Tag from the SCM acceptance test",
-					},
-				},
-			},
+		manifest := nativeRefManifest(t, spec, "gittag", map[string]any{
+			"versionfilter": map[string]any{"pattern": tag},
+			"message":       "Tag from the SCM acceptance test",
 		})
 
 		// Preview the private repo with only a PAT, exercising the SCM's username fallback.
@@ -213,9 +270,78 @@ func testSCM(t *testing.T, s *server) {
 		stable := before["refs/heads/"+r.base]
 		require.Equal(t, stable+"\t"+tagRef+"^{}\n", r.git(t, "ls-remote", "origin", tagRef+"^{}"),
 			"the annotated tag must peel to the configured base, not main")
+		r.git(t, "fetch", "origin", tagRef)
+		tagObject := r.git(t, "cat-file", "tag", published[tagRef])
+		require.True(t, strings.HasSuffix(tagObject, "\n\nTag from the SCM acceptance test\n"), "tag must contain the configured annotation")
 
 		requireOutput(t, c.ok(t, "apply", manifest, "--commit=false"), `git tag "v1.1.0" already exists`)
 		require.Equal(t, published, r.refs(t), "reapply must neither replace the tag object nor move other refs")
+	})
+}
+
+func testSCMSubmodules(t *testing.T, s *server) {
+	r, sub := s.newRepo(t), s.newRepo(t)
+	const input, moduleDir = "module-input.txt", "fixture-module"
+	const value = "from the pinned submodule commit\n"
+	sub.stage(t, sub.base, input, value)
+	subBefore := sub.refs(t)
+	subCommit := subBefore["refs/heads/"+sub.base]
+	subURL := s.url + "/" + s.owner + "/" + sub.name + ".git"
+	r.write(t, ".gitmodules", "[submodule \""+moduleDir+"\"]\n\tpath = "+moduleDir+"\n\turl = "+subURL+"\n")
+	// Stage the submodule pin without cloning it in the fixture's worktree.
+	// The candidate must download the pinned object over authenticated HTTP.
+	r.git(t, "update-index", "--add", "--cacheinfo", "160000,"+subCommit+","+moduleDir)
+	r.git(t, "add", "--", ".gitmodules")
+	r.git(t, "commit", "-m", "Pin a local private submodule")
+	r.git(t, "push", "origin", "HEAD:refs/heads/"+r.base)
+	before := r.refs(t)
+
+	for _, name := range []string{"default", "disabled"} {
+		runRequired(t, name, func(t *testing.T) {
+			c := newCLI(t, s)
+			dir := filepath.Join(c.runner.Dir, "checkout")
+			spec := scmTestSpec(r)
+			spec["directory"], spec["workingbranch"] = dir, false
+			spec["singlebranch"] = true
+			if name == "disabled" {
+				spec["submodules"] = false
+			}
+			manifest := manifestYAML(t, map[string]any{
+				"name": "Check out a pinned submodule",
+				"scms": map[string]any{"repo": map[string]any{"kind": "gitea", "spec": spec}},
+				"sources": map[string]any{
+					"parent": map[string]any{"kind": "file", "scmid": "repo", "spec": map[string]string{"file": "version.yaml"}},
+				},
+			})
+			c.ok(t, "diff", manifest)
+			require.FileExists(t, filepath.Join(dir, ".gitmodules"))
+			path := filepath.Join(dir, moduleDir, input)
+			if name == "disabled" {
+				require.NoFileExists(t, path)
+			} else {
+				got, err := os.ReadFile(path)
+				require.NoError(t, err)
+				require.Equal(t, value, string(got))
+				require.Equal(t, subCommit+"\n", r.git(t, "-C", filepath.Join(dir, moduleDir), "rev-parse", "HEAD"))
+			}
+		})
+	}
+	require.Equal(t, before, r.refs(t), "cloning must not change the parent repository")
+	require.Equal(t, subBefore, sub.refs(t), "cloning must not change the submodule repository")
+}
+
+func scmFileManifest(t *testing.T, spec map[string]any, id, file, content string) string {
+	t.Helper()
+	return manifestYAML(t, map[string]any{
+		"name":       "Write a file with the configured SCM",
+		"pipelineid": id,
+		"scms":       map[string]any{"repo": map[string]any{"kind": "gitea", "spec": spec}},
+		"targets": map[string]any{
+			"write": map[string]any{
+				"name": "Write " + file, "kind": "file", "scmid": "repo",
+				"spec": map[string]any{"file": file, "forcecreate": true, "content": content},
+			},
+		},
 	})
 }
 

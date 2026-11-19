@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"github.com/updatecli/updatecli/acceptance/internal/conformance"
 )
 
 // Each case gets a fresh repository on the same running forge.
@@ -45,24 +46,18 @@ func publicationHead(r *gitRepository) string {
 	return "updatecli_" + r.base + "_" + publicationID
 }
 
-var publicationCases = []capability[publicationFixture]{
-	{"lifecycle", testPublicationLifecycle},
-	{"already_current", testPublicationAlreadyCurrent},
-}
-
 // Enroll a provider in publish_update as a whole, never in individual cases.
-func publishUpdate[F publicationProvider]() capability[F] {
-	return capability[F]{"publish_update", func(t *testing.T, provider F) {
-		if len(publicationCases) == 0 {
-			t.Fatal("no publication cases enrolled")
-		}
-		for _, c := range publicationCases {
-			runRequired(t, c.name, func(t *testing.T) {
+func publishUpdate[F publicationProvider]() conformance.Capability[F] {
+	return conformance.Capability[F]{ID: "publish_update", Run: func(t *testing.T, provider F) {
+		check := func(name string, run func(*testing.T, publicationFixture)) {
+			runRequired(t, name, func(t *testing.T) {
 				fixture := provider.newPublication(t)
 				seedPublication(t, fixture.repo)
-				c.run(t, fixture)
+				run(t, fixture)
 			})
 		}
+		check("lifecycle", testPublicationLifecycle)
+		check("already_current", testPublicationAlreadyCurrent)
 	}}
 }
 

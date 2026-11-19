@@ -18,6 +18,7 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	tcexec "github.com/testcontainers/testcontainers-go/exec"
 	"github.com/testcontainers/testcontainers-go/wait"
+	"github.com/updatecli/updatecli/acceptance/internal/cli"
 )
 
 type server struct {
@@ -25,6 +26,20 @@ type server struct {
 	client                      *gitea.Client
 
 	admin *gitea.Client
+}
+
+func newCLI(t *testing.T, s *server) *forgeCLI {
+	t.Helper()
+	return newCLIWithCredentials(t, s.owner, s.token)
+}
+
+func newCLIWithCredentials(t *testing.T, user, token string) *forgeCLI {
+	t.Helper()
+	return &forgeCLI{
+		runner: cli.New(t, "UPDATECLI_GITEA_USERNAME="+user, "UPDATECLI_GITEA_TOKEN="+token),
+		user:   user,
+		token:  token,
+	}
 }
 
 func startServer(t *testing.T, provider string) *server {
