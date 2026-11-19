@@ -1,39 +1,67 @@
 # Acceptance tests
 
-The tests run a built Updatecli binary through its public commands. To run
-the shared runner's local YAML test, from the repository root:
+These tests run a built Updatecli binary. The [family overview](CAPABILITIES.md)
+lists the behaviors we want to compare across plugins. To see the capabilities
+enrolled today, including gaps and reasons for N/A:
 
 ```sh
-mkdir -p bin
+go run ./acceptance/cmd/conformance
+```
+
+## Run a forge
+
+```sh
 go build -o bin/updatecli .
-UPDATECLI_BIN="$PWD/bin/updatecli" go test -tags=acceptance -count=1 ./acceptance/internal/cli
+export UPDATECLI_BIN="$PWD/bin/updatecli"
+UPDATECLI_TEST_FORGE=forgejo go test -tags=acceptance -count=1 -v ./acceptance/forge/gitea
 ```
 
-[`internal/cli`](internal/cli) gives each test a working directory and home.
-Use `Run` for commands, file trees and compose runs. `Pipeline` is a shortcut
-for one manifest. Pass fixture variables explicitly, including `PATH` if
-the test supplies a tool of its own. The runner's proxy catches unexpected
-HTTP(S) from clients that use it; it isn't a network sandbox. The
-[local tests](internal/cli/runner_test.go) need no forge or hosted credentials.
+Use `gitea` for Gitea, or run `./acceptance/forge/gitlab` for GitLab CE. Each
+profile starts one disposable container. Git and the forge API seed private
+repositories and inspect what the candidate actually published. You need
+Docker and Git locally. The fixture supplies its own credentials.
 
-The [forge suite](forge/README.md) adds disposable servers and checks their
-state with Git and the forge API.
+Use Go's `-run` to work on one regression, for example
+`-run '^TestCapabilities$/^forgejo$/^draft_title_marker$'`.
+The `knownissues` build tag also exposes `TestPrivateNativeRefTargets`, a
+reproducer for private authenticated branch and tag creation that's still red.
 
-Put a regression beside the behavior it protects. If the bug needs a real
-service to reproduce, add a case to that capability. If a Go function alone
-can reproduce it, keep the test and any minimized fuzz input in its package.
+## Add a case
 
-Families that compare multiple implementations can use
-[`internal/conformance`](internal/conformance). A profile supplies one
-fixture and a list of named capability functions. A file-only or single-tool
-test can use `testing.T` and the CLI runner directly.
+- **Another implementation:** pass `forge.PublicationCases(s.newPublication)`
+  to `forge.Matrix.Run`, as in the [GitLab suite](forge/gitlab/forge_test.go).
+  The matrix selects the shared cases, which read back the request's ID and
+  title from the server.
+- **A feature or regression:** add a `t.Run` beside the behavior it protects.
+  When adding a whole capability, enroll it in the family's
+  [matrix](forge/matrix.go) and run it from the provider's `TestCapabilities`.
+  Individual regressions do not need a new row or a workflow edit.
+- **A shared fuzz property:** write one `Fuzz…` per behavior. In the
+  [title example](forge/title_fuzz_test.go), each implementation registers
+  how to read the title from its real edit options. `conformance.Bind` selects
+  the supported implementations and rejects a missing adapter. Each generated
+  input goes through all of them. PRs replay seeds; the separate **Fuzz**
+  workflow gives each property one minute nightly. Adding an implementation
+  needs no copy of the property and no YAML edit.
+- **Another family:** use [`internal/cli`](internal/cli) to drive the binary
+  and `testing.T` for the assertions. If it compares implementations, give
+  it a `conformance.Matrix` and register that matrix in `cmd/conformance`.
+  File plugins don't need a forge fixture.
 
-CI runs an additional check against the native GoReleaser snapshot: an
-incompatible manifest must leave the target unchanged, while a compatible one
-can edit it. To run that check locally, use a full checkout with a reachable
-version tag and the GoReleaser version pinned in the workflow:
+## What CI reports
 
-```sh
-GOVERSION="$(go version)" goreleaser build --snapshot --clean --single-target --output "$PWD/bin/updatecli"
-UPDATECLI_BIN="$PWD/bin/updatecli" go test -tags=acceptance,candidate -count=1 ./acceptance/internal/cli
-```
+Every PR runs **Acceptance tests** against one native GoReleaser snapshot.
+The matrix declares product support; Go test results say what passed.
+
+| Declaration | Meaning |
+| --- | --- |
+| Supported | Updatecli promises this behavior. The check must run and pass. |
+| Gap | The implementation can do it, but Updatecli doesn't yet satisfy the contract. Record why. |
+| Not applicable | There is no equivalent operation for this implementation. Record why. |
+
+An omitted cell means **unassessed**. It makes no claim about the product.
+The report counts supported features and gaps as assessed and applicable, and
+shows the unassessed count separately. To reproduce a summary, put
+one unfiltered `go test -json -count=1` stream per profile in
+`results/forge/{gitea,forgejo,gitlab}.jsonl`, then run
+`go run ./acceptance/cmd/conformance results`.
