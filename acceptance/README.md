@@ -37,3 +37,5 @@ version tag and the GoReleaser version pinned in the workflow:
 GOVERSION="$(go version)" goreleaser build --snapshot --clean --single-target --output "$PWD/bin/updatecli"
 UPDATECLI_BIN="$PWD/bin/updatecli" go test -tags=acceptance,candidate -count=1 ./acceptance/internal/cli
 ```
+
+Selection probe for the public forge sandbox.
