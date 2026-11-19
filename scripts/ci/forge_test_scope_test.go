@@ -23,6 +23,8 @@ func TestForgeTestScope(t *testing.T) {
 		changed    []string
 		remove     string
 		badHistory bool
+		symlink    bool
+		gitlink    bool
 	}{
 		{name: "allowlisted docs", want: "docs", changed: []string{doc}},
 		{name: "test and docs", want: "package", changed: []string{doc, target}},
@@ -31,6 +33,8 @@ func TestForgeTestScope(t *testing.T) {
 		{name: "embedded markdown", want: "full", changed: []string{"pkg/core/scaffold/assets/README.md"}},
 		{name: "odd filename", want: "full", changed: []string{"unknown\n" + doc}},
 		{name: "rename into allowed path", want: "full", changed: []string{seed}, remove: "original"},
+		{name: "new corpus symlink", want: "full", symlink: true},
+		{name: "new corpus gitlink", want: "full", gitlink: true},
 		{name: "missing history", want: "full", changed: []string{doc}, badHistory: true},
 		{name: "empty diff", want: "full"},
 	} {
@@ -71,7 +75,19 @@ func TestForgeTestScope(t *testing.T) {
 			for _, path := range tc.changed {
 				write(path)
 			}
+			if tc.symlink {
+				path := filepath.Join(dir, seed)
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink("another-input", path); err != nil {
+					t.Fatal(err)
+				}
+			}
 			run("git", "add", ".")
+			if tc.gitlink {
+				run("git", "update-index", "--add", "--cacheinfo", "160000", base, seed)
+			}
 			tree := run("git", "write-tree")
 			head := run("git", "commit-tree", tree, "-p", base, "-m", "feature")
 			merge := run("git", "commit-tree", tree, "-p", base, "-p", head, "-m", "merge")
