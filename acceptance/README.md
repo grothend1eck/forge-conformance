@@ -23,6 +23,11 @@ Put a regression beside the behavior it protects. If the bug needs a real
 service to reproduce, add a case to that capability. If a Go function alone
 can reproduce it, keep the test and any minimized fuzz input in its package.
 
+Families that compare multiple implementations can use
+[`internal/conformance`](internal/conformance). A profile supplies one
+fixture and a list of named capability functions. A file-only or single-tool
+test can use `testing.T` and the CLI runner directly.
+
 CI runs an additional check against the native GoReleaser snapshot: an
 incompatible manifest must leave the target unchanged, while a compatible one
 can edit it. To run that check locally, use a full checkout with a reachable
