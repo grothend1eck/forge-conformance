@@ -1,6 +1,6 @@
 //go:build acceptance
 
-package forge
+package gitea_test
 
 import (
 	"encoding/xml"
@@ -8,13 +8,28 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"github.com/updatecli/updatecli/acceptance/internal/cli"
 )
+
+func testRequestSafety(t *testing.T, s *server) {
+	for _, tc := range []struct {
+		name string
+		run  func(*testing.T, *server)
+	}{
+		{"generated_report_persists", testGeneratedPRReport},
+		{"explicit_patch_branches", testPRBranchOverrides},
+		{"draft_survives_edit", testDraftSurvivesEdit},
+		{"review_failure_blocks_automerge", testReviewFailureBlocksAutomerge},
+	} {
+		t.Run(tc.name, func(t *testing.T) { tc.run(t, s) })
+	}
+}
 
 func testGeneratedPRReport(t *testing.T, s *server) {
 	r := s.newRepo(t)
 	// The initial apply changes the version, which is already current on the
 	// next apply. The second target then contributes a different report entry.
-	r.stage(t, r.base, "channel.yaml", "channel: stable\n")
+	r.Stage(t, r.Base, "channel.yaml", "channel: stable\n")
 	c := newCLI(t, s)
 	const (
 		id         = "generated-report"
@@ -29,7 +44,7 @@ func testGeneratedPRReport(t *testing.T, s *server) {
 			"name": "Change the channel", "kind": "yaml", "scmid": "origin",
 			"spec": map[string]any{"file": "channel.yaml", "key": "$.channel", "value": channel},
 		}
-		return manifestYAML(t, config)
+		return cli.Manifest(t, config)
 	}
 	type entry struct {
 		ID    string `xml:"id,attr"`
@@ -40,7 +55,7 @@ func testGeneratedPRReport(t *testing.T, s *server) {
 		t.Helper()
 		// Observe the stored XML report rather than regenerating its expected
 		// body with Updatecli's code. The decorative Markdown footer isn't XML.
-		text, _, _ := strings.Cut(redactCredential(body, s.owner, s.token), "\n---\n")
+		text, _, _ := strings.Cut(cli.RedactCredential(body, s.owner, s.token), "\n---\n")
 		var got struct {
 			XMLName xml.Name `xml:"Actions"`
 			Actions []struct {
@@ -60,7 +75,7 @@ func testGeneratedPRReport(t *testing.T, s *server) {
 		return got.Actions[0].ID, entries
 	}
 	first := manifest("v1.1.0", "stable", firstTitle, nil)
-	c.ok(t, "apply", first)
+	c.PipelineOK(t, "apply", first)
 	opened := onlyOpenPullRequest(t, r)
 	require.Equal(t, firstTitle, opened.Title, "action title overrides the pipeline and target names")
 	reportID, initial := report(opened.Body)
@@ -68,18 +83,18 @@ func testGeneratedPRReport(t *testing.T, s *server) {
 	require.Contains(t, initial["Update the version"].Body, "v1.1.0")
 
 	// New PR settings alone must not trigger an edit or schedule a merge.
-	savedRefs := r.refs(t)
-	output := c.ok(t, "apply", manifest("v1.1.0", "stable", "Unapplied title", map[string]any{
+	savedRefs := r.Refs(t)
+	output := c.PipelineOK(t, "apply", manifest("v1.1.0", "stable", "Unapplied title", map[string]any{
 		"body": "Unapplied body", "merge": map[string]any{"strategy": "auto"},
 	}))
-	requireOutput(t, output, opened.HTMLURL)
+	cli.RequireOutput(t, output, opened.HTMLURL)
 	noOp := onlyOpenPullRequest(t, r)
 	require.Equal(t, giteaRequest(t, opened), giteaRequest(t, noOp))
 	require.True(t, opened.Body == noOp.Body, "an unchanged apply must not edit the persisted body")
-	require.Equal(t, savedRefs, r.refs(t))
+	require.Equal(t, savedRefs, r.Refs(t))
 	r.assertScheduledBy(t, "after applying PR settings without target changes", opened.Index)
 
-	c.ok(t, "apply", manifest("v1.1.0", "beta", firstTitle, map[string]any{"title": specTitle}))
+	c.PipelineOK(t, "apply", manifest("v1.1.0", "beta", firstTitle, map[string]any{"title": specTitle}))
 	updated := onlyOpenPullRequest(t, r)
 	require.Equal(t, opened.ID, updated.ID)
 	require.Equal(t, opened.Index, updated.Index)
@@ -90,75 +105,50 @@ func testGeneratedPRReport(t *testing.T, s *server) {
 	require.Len(t, merged, 2)
 	require.Equal(t, initial["Update the version"], merged["Update the version"], "unchanged target report must survive")
 	require.Contains(t, merged["Change the channel"].Body, "beta")
-	refs := r.refs(t)
+	refs := r.Refs(t)
 	savedRefs["refs/heads/"+updated.Head.Ref] = updated.Head.Sha
 	require.Equal(t, savedRefs, refs, "only the working branch may advance")
-	r.git(t, "fetch", "origin", "refs/heads/"+updated.Head.Ref)
-	require.Equal(t, "version: v1.1.0\nkeep: untouched\n", r.git(t, "show", updated.Head.Sha+":version.yaml"))
-	require.Equal(t, "channel: beta\n", r.git(t, "show", updated.Head.Sha+":channel.yaml"))
+	r.Git(t, "fetch", "origin", "refs/heads/"+updated.Head.Ref)
+	require.Equal(t, "version: v1.1.0\nkeep: untouched\n", r.Git(t, "show", updated.Head.Sha+":version.yaml"))
+	require.Equal(t, "channel: beta\n", r.Git(t, "show", updated.Head.Sha+":channel.yaml"))
 
 	// Advancing the base independently diverges it from the working branch.
 	// The force-push resets the report. The old version entry is no longer
 	// relevant, even though this is still the same request.
-	r.stage(t, r.base, "version.yaml", "version: v1.1.0\nkeep: untouched\n")
-	newBase := r.refs(t)["refs/heads/"+r.base]
-	c.ok(t, "apply", manifest("v1.1.0", "rc", firstTitle, nil))
+	r.Stage(t, r.Base, "version.yaml", "version: v1.1.0\nkeep: untouched\n")
+	newBase := r.Refs(t)["refs/heads/"+r.Base]
+	c.PipelineOK(t, "apply", manifest("v1.1.0", "rc", firstTitle, nil))
 	reset := onlyOpenPullRequest(t, r)
 	require.Equal(t, opened.ID, reset.ID)
 	require.Equal(t, opened.Index, reset.Index)
 	require.NotEqual(t, updated.Head.Sha, reset.Head.Sha)
-	r.git(t, "fetch", "origin", "refs/heads/"+reset.Head.Ref)
-	require.Equal(t, newBase, strings.TrimSpace(r.git(t, "rev-parse", reset.Head.Sha+"^")), "working branch must reset onto the new base")
+	r.Git(t, "fetch", "origin", "refs/heads/"+reset.Head.Ref)
+	require.Equal(t, newBase, strings.TrimSpace(r.Git(t, "rev-parse", reset.Head.Sha+"^")), "working branch must reset onto the new base")
 	resetID, resetEntries := report(reset.Body)
 	require.Equal(t, reportID, resetID)
 	require.Len(t, resetEntries, 1)
 	require.Contains(t, resetEntries["Change the channel"].Body, "rc")
-	require.Equal(t, "channel: rc\n", r.git(t, "show", reset.Head.Sha+":channel.yaml"))
+	require.Equal(t, "channel: rc\n", r.Git(t, "show", reset.Head.Sha+":channel.yaml"))
 }
 
-func testPRBranchOverrides(t *testing.T, s *server) {
+func testWorkflowRunLink(t *testing.T, s *server) {
 	r := s.newRepo(t)
-	patch := s.newRepo(t)
-	c := newCLI(t, s)
-	repoID := publishRepo(t, patch).ID
-	const (
-		id    = "patch-branches"
-		base  = "release/1.x"
-		head  = "patch/1.x"
-		title = "Patch the supported release"
+	// Simulate only the runner environment. No Actions workflow is executed.
+	c := cli.NewWithCredentials(t, s.owner, s.token,
+		"UPDATECLI_GITEA_USERNAME="+s.owner,
+		"UPDATECLI_GITEA_TOKEN="+s.token,
+		"GITEA_ACTIONS=true",
+		"GITHUB_ACTION=fixture",
+		"GITHUB_SERVER_URL=https://ci.example.invalid",
+		"GITHUB_REPOSITORY=fixture/workflows",
+		"GITHUB_RUN_ID=9001",
+		"GITHUB_RUN_NUMBER=42",
 	)
-	patch.stage(t, base, "support.txt", "supported release\n")
-	before := patch.awaitBranches(t, base)
-	// Prepare a real patch head based on release/1.x, not the SCM's stable
-	// branch. The pipeline still pushes its working branch to the SCM repo.
-	patch.git(t, "push", "origin", before["refs/heads/"+base]+":refs/heads/"+head)
-	patch.stage(t, head, "version.yaml", "version: v1.0.1\nkeep: untouched\n")
-	before = patch.awaitBranches(t, head)
-	scmBefore := r.refs(t)
-	manifest := requestManifest(t, r, id, "v1.1.0", map[string]any{
-		"sourcebranch": head, "targetbranch": base,
-		"owner": s.owner, "repository": patch.name, "title": title,
-	})
-	c.ok(t, "apply", manifest)
-	require.Empty(t, publishPRs(t, r), "no PR should be opened in the SCM repository")
-	opened := giteaRequest(t, onlyOpenPullRequest(t, patch))
-	require.Equal(t, head, opened.head)
-	require.Equal(t, base, opened.base)
-	require.Equal(t, repoID, opened.headRepoID)
-	require.Equal(t, repoID, opened.baseRepoID)
-	require.Equal(t, before["refs/heads/"+head], opened.headSHA)
-	require.Equal(t, before["refs/heads/"+base], opened.baseSHA)
-	require.Equal(t, title, opened.title)
-	require.Equal(t, "version.yaml", strings.TrimSpace(patch.git(t, "diff", "--name-only", opened.baseSHA, opened.headSHA)))
-	require.Equal(t, before, patch.refs(t), "creating the PR must not move either explicit patch ref")
+	c.PipelineOK(t, "apply", requestManifest(t, r, "gitea-actions-run-link", "v1.1.0", nil))
 
-	gotRefs := r.refs(t)
-	workingRef := "refs/heads/updatecli_" + r.base + "_" + id
-	require.NotEmpty(t, gotRefs[workingRef], "the target must push its own working branch")
-	require.NotEqual(t, opened.headSHA, gotRefs[workingRef])
-	r.git(t, "fetch", "origin", workingRef)
-	require.Equal(t, mergeFixtureAfter, r.git(t, "show", gotRefs[workingRef]+":version.yaml"))
-	require.Equal(t, scmBefore["refs/heads/"+r.base], strings.TrimSpace(r.git(t, "rev-parse", gotRefs[workingRef]+"^")))
-	scmBefore[workingRef] = gotRefs[workingRef]
-	require.Equal(t, scmBefore, gotRefs, "only the SCM working branch should change")
+	pr := onlyOpenPullRequest(t, r)
+	body := cli.RedactCredential(pr.Body, s.owner, s.token)
+	const runs = "https://ci.example.invalid/fixture/workflows/actions/runs/"
+	require.Contains(t, body, `<a href="`+runs+`42?by_index=1">Gitea Actions workflow link</a>`)
+	require.NotContains(t, body, runs+"9001", "the report must not use GITHUB_RUN_ID")
 }

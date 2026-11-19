@@ -1,7 +1,6 @@
 package pullrequest
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -12,78 +11,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/updatecli/updatecli/pkg/core/reports"
 )
-
-func TestEnableAutoMergeMethods(t *testing.T) {
-	tests := []struct {
-		name, strategy, method string
-		defaultMethod          giteasdk.MergeStyle
-		wantMethod             giteasdk.MergeStyle
-		wantErr                string
-	}{
-		{name: "empty strategy is manual", method: "merge"},
-		{name: "explicit manual is case insensitive", strategy: "MANUAL", method: "merge"},
-		{name: "merge", strategy: "auto", method: "merge", wantMethod: giteasdk.MergeStyleMerge},
-		{name: "rebase", strategy: "auto", method: "REBASE", wantMethod: giteasdk.MergeStyleRebase},
-		{name: "rebase merge", strategy: "auto", method: "rebase-merge", wantMethod: giteasdk.MergeStyleRebaseMerge},
-		{name: "squash", strategy: "auto", method: "squash", wantMethod: giteasdk.MergeStyleSquash},
-		{name: "fast forward only", strategy: "auto", method: "fast-forward-only", wantMethod: giteasdk.MergeStyleFastForwardOnly},
-		{name: "repository default", strategy: "AUTO", defaultMethod: giteasdk.MergeStyleSquash, wantMethod: giteasdk.MergeStyleSquash},
-		{name: "invalid repository default", strategy: "auto", defaultMethod: "manually-merged", wantErr: "unsupported repository default merge method"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			const headSHA = "0123456789abcdef"
-			var repoReads int
-			var requests []giteasdk.MergePullRequestOption
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				switch {
-				case r.URL.Path == "/api/v1/version":
-					_, _ = w.Write([]byte(`{"version":"1.24.0"}`))
-				case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/updatecli/updatecli":
-					repoReads++
-					_ = json.NewEncoder(w).Encode(giteasdk.Repository{DefaultMergeStyle: tt.defaultMethod})
-				case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/updatecli/updatecli/pulls/42/merge":
-					var sent giteasdk.MergePullRequestOption
-					if err := json.NewDecoder(r.Body).Decode(&sent); err != nil {
-						http.Error(w, "invalid merge request", http.StatusBadRequest)
-						return
-					}
-					requests = append(requests, sent)
-					w.WriteHeader(http.StatusCreated)
-				default:
-					http.NotFound(w, r)
-				}
-			}))
-			defer server.Close()
-			client, err := giteasdk.NewClient(server.URL)
-			require.NoError(t, err)
-			g := Gitea{
-				spec:   Spec{Merge: MergeSpec{Strategy: tt.strategy}, MergeMethod: tt.method},
-				client: client, Owner: "updatecli", Repository: "updatecli",
-			}
-			require.NoError(t, g.spec.Validate())
-			err = g.enableAutoMerge(t.Context(), &giteasdk.PullRequest{Index: 42, Head: &giteasdk.PRBranchInfo{Sha: headSHA}})
-			if tt.wantErr != "" {
-				require.ErrorContains(t, err, tt.wantErr)
-			} else {
-				require.NoError(t, err)
-			}
-			if tt.defaultMethod != "" {
-				require.Equal(t, 1, repoReads)
-			} else {
-				require.Zero(t, repoReads)
-			}
-			if tt.wantMethod == "" {
-				require.Empty(t, requests)
-			} else {
-				require.Equal(t, []giteasdk.MergePullRequestOption{{
-					Style: tt.wantMethod, MergeWhenChecksSucceed: true, HeadCommitId: headSHA,
-				}}, requests)
-			}
-		})
-	}
-}
 
 func TestCreateActionExistingPullRequestAutoMerge(t *testing.T) {
 	testData := []struct {

@@ -5,6 +5,7 @@ package cli
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -12,16 +13,21 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
+
+	"go.yaml.in/yaml/v4"
 )
 
 // Runner keeps the same working directory and home across calls. Each command
 // gets its own TMPDIR so a previous checkout cannot satisfy a later assertion.
+// Do not use a Runner concurrently; the commands may edit its workspace.
 type Runner struct {
-	Dir, Home string
-	binary    string
-	env       []string
+	Dir, Home   string
+	binary      string
+	env         []string
+	user, token string
 }
 
 // New uses the binary named by UPDATECLI_BIN. Supply fixture variables as
@@ -52,6 +58,15 @@ func New(t *testing.T, env ...string) *Runner {
 	return r
 }
 
+// NewWithCredentials is like New but redacts the supplied fixture credentials
+// from command output. The caller passes credentials via provider-specific env.
+func NewWithCredentials(t *testing.T, user, token string, env ...string) *Runner {
+	t.Helper()
+	r := New(t, env...)
+	r.user, r.token = user, token
+	return r
+}
+
 // Result contains the exit status and combined stdout and stderr.
 type Result struct {
 	ExitCode int
@@ -72,14 +87,15 @@ func (r *Runner) Run(t *testing.T, args ...string) Result {
 	if ctx.Err() != nil {
 		t.Fatalf("run updatecli: %v", ctx.Err())
 	}
+	result := Result{Output: RedactCredential(string(out), r.user, r.token)}
 	if err != nil {
 		var exit *exec.ExitError
 		if !errors.As(err, &exit) {
 			t.Fatalf("run updatecli: %v", err)
 		}
-		return Result{ExitCode: exit.ExitCode(), Output: string(out)}
+		result.ExitCode = exit.ExitCode()
 	}
-	return Result{Output: string(out)}
+	return result
 }
 
 // Pipeline writes updatecli.yaml in Dir and runs the given pipeline subcommand.
@@ -91,4 +107,46 @@ func (r *Runner) Pipeline(t *testing.T, mode, manifest string, flags ...string) 
 	}
 	args := []string{"pipeline", mode, "--config", config, "--disable-version-check", "--disable-udash-report"}
 	return r.Run(t, append(args, flags...)...)
+}
+
+// Manifest encodes test-authored Updatecli configuration.
+func Manifest(t *testing.T, spec map[string]any) string {
+	t.Helper()
+	b, err := yaml.Marshal(spec)
+	if err != nil {
+		t.Fatalf("encode Updatecli manifest: %v", err)
+	}
+	return string(b)
+}
+
+// PipelineOK runs a pipeline and requires a successful exit.
+func (r *Runner) PipelineOK(t *testing.T, mode, manifest string, flags ...string) string {
+	t.Helper()
+	result := r.Pipeline(t, mode, manifest, flags...)
+	if result.ExitCode != 0 {
+		t.Fatalf("pipeline %s: exit status %d, want 0", mode, result.ExitCode)
+	}
+	return result.Output
+}
+
+// RequireOutput reports missing test-authored markers without logging output.
+func RequireOutput(t *testing.T, output string, want ...string) {
+	t.Helper()
+	for _, marker := range want {
+		if !strings.Contains(output, marker) {
+			t.Fatalf("CLI output does not contain %q", marker)
+		}
+	}
+}
+
+// RedactCredential removes a fixture PAT and its HTTP Basic encoding.
+func RedactCredential(text, user, token string) string {
+	if token == "" {
+		return text
+	}
+	if user == "" {
+		user = "oauth2"
+	}
+	basic := base64.StdEncoding.EncodeToString([]byte(user + ":" + token))
+	return strings.NewReplacer(token, "[redacted]", basic, "[redacted]").Replace(text)
 }

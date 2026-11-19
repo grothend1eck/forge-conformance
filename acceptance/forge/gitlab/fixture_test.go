@@ -1,11 +1,12 @@
 //go:build acceptance
 
-package forge
+package gitlab
 
 import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -27,19 +28,17 @@ import (
 const (
 	gitLabVersion = "19.3.9"
 	gitLabImage   = "docker.io/gitlab/gitlab-ce:" + gitLabVersion + "-ce.0@sha256:7cb320e8da464484b270b5442d2e626d08cb12981219df703dd0caccee78072e"
+	actorName     = "fixture-bot"
 )
 
-type gitlabFixture struct {
-	url    string
-	client *gitlabsdk.Client
-	owner  string
-	token  string
-
-	httpClient *http.Client
-	ownerID    int64
+type fixture struct {
+	url, token        string
+	ownerID           int64
+	client, anonymous *gitlabsdk.Client
+	httpClient        *http.Client
 }
 
-func startGitLab(t *testing.T) *gitlabFixture {
+func start(t *testing.T) *fixture {
 	t.Helper()
 	// The official image is public; never look up an operator's registry credentials.
 	t.Setenv("DOCKER_AUTH_CONFIG", "{}")
@@ -100,10 +99,9 @@ func startGitLab(t *testing.T) *gitlabFixture {
 	if err != nil {
 		t.Fatalf("get GitLab CE fixture HTTP port: %v", err)
 	}
-	g := &gitlabFixture{
+	g := &fixture{
 		// The API and Git use Docker's mapping, not GitLab's advertised URL.
-		url:   "http://" + net.JoinHostPort("127.0.0.1", mapped.Port()),
-		owner: "fixture-bot",
+		url: "http://" + net.JoinHostPort("127.0.0.1", mapped.Port()),
 		httpClient: &http.Client{
 			Timeout: 20 * time.Second,
 			CheckRedirect: func(*http.Request, []*http.Request) error {
@@ -114,11 +112,7 @@ func startGitLab(t *testing.T) *gitlabFixture {
 	}
 	t.Cleanup(g.httpClient.CloseIdleConnections)
 
-	_, response, err := g.sdkClient(t, "").Users.CurrentUser(gitlabsdk.WithContext(ctx))
-	if err == nil || response == nil || response.StatusCode != http.StatusUnauthorized {
-		gitLabAPIFailure(t, "check anonymous API readiness (want HTTP 401)", response, err)
-	}
-	t.Logf("GitLab CE ready in %s", time.Since(started).Round(time.Millisecond))
+	g.anonymous = g.sdkClient(t, "")
 	g.bootstrapActor(t, ctx, c)
 	t.Logf("GitLab CE %s with verified project actor ready in %s", gitLabVersion, time.Since(started).Round(time.Millisecond))
 	return g
@@ -139,99 +133,67 @@ gitlab_rails['usage_ping_enabled'] = false
 gitlab_rails['rake_cache_clear'] = false
 `
 
-func (g *gitlabFixture) bootstrapActor(t *testing.T, ctx context.Context, c testcontainers.Container) {
+func (g *fixture) bootstrapActor(t *testing.T, ctx context.Context, c testcontainers.Container) {
 	t.Helper()
-	// Use the stock Rails runner for initial root bootstrap only. GitLab
-	// generates the PAT itself; it is never in process arguments or the environment.
+	// Create the actor locally via GitLab's Rails service. Only its PAT comes
+	// back over Docker exec; no administrator credential is issued.
 	const script = `
 ApplicationSetting.current.update!(
   signup_enabled: false, version_check_enabled: false, import_sources: [],
   shared_runners_enabled: false, allow_runner_registration_token: false,
   update_runner_versions_enabled: false)
-pat = User.find_by!(username: 'root').personal_access_tokens.create!(
-  name: 'acceptance-bootstrap', scopes: ['api'], expires_at: Date.current + 1)
-puts "ACCEPTANCE_BOOTSTRAP=#{pat.token}"
+result = Users::CreateService.new(User.find_by!(username: 'root', admin: true),
+  username: '` + actorName + `', email: '` + actorName + `@example.test', name: 'Acceptance Fixture',
+  organization_id: Organizations::Organization.first.id,
+  admin: false, force_random_password: true, skip_confirmation: true).execute
+actor = result.payload[:user]
+abort 'fixture actor creation failed' unless result.success? && actor && !actor.admin?
+pat = actor.personal_access_tokens.create!(
+  name: 'acceptance-project-actor', scopes: ['api'], expires_at: Date.current + 1)
+puts "ACCEPTANCE_ACTOR_PAT=#{pat.token}"
 `
 	code, output, err := c.Exec(ctx, []string{"gitlab-rails", "runner", script}, tcexec.Multiplexed())
 	if err != nil || code != 0 || output == nil {
-		t.Fatalf("bootstrap GitLab CE root credential: Docker exec failed (exit %d)", code)
+		t.Fatalf("bootstrap GitLab CE project actor: Docker exec failed (exit %d)", code)
 	}
-	bytes, err := io.ReadAll(io.LimitReader(output, 32<<10))
+	out, err := io.ReadAll(io.LimitReader(output, 32<<10))
 	if err != nil {
 		t.Fatal("read GitLab CE bootstrap result")
 	}
-	_, raw, found := strings.Cut(string(bytes), "ACCEPTANCE_BOOTSTRAP=")
-	rootToken, _, _ := strings.Cut(raw, "\n")
-	if !found || !strings.HasPrefix(rootToken, "glpat-") || len(rootToken) > 256 {
-		t.Fatal("missing GitLab CE bootstrap credential")
+	for line := range strings.SplitSeq(string(out), "\n") {
+		if token, ok := strings.CutPrefix(line, "ACCEPTANCE_ACTOR_PAT="); ok {
+			g.token = strings.TrimSpace(token)
+			break
+		}
+	}
+	if !strings.HasPrefix(g.token, "glpat-") || len(g.token) <= len("glpat-") || len(g.token) > 256 {
+		t.Fatal("missing GitLab CE project actor PAT")
 	}
 
-	root := g.sdkClient(t, rootToken)
-	api := gitlabsdk.WithContext(ctx)
-	actor, response, err := root.Users.CreateUser(&gitlabsdk.CreateUserOptions{
-		Username:            &g.owner,
-		Name:                gitlabsdk.Ptr("Acceptance Fixture"),
-		Email:               gitlabsdk.Ptr(g.owner + "@example.test"),
-		ForceRandomPassword: gitlabsdk.Ptr(true),
-		SkipConfirmation:    gitlabsdk.Ptr(true),
-		Admin:               gitlabsdk.Ptr(false),
-	}, api)
-	if err != nil {
-		gitLabAPIFailure(t, "create project actor", response, err)
-	}
-	// GitLab's api scope includes read/write Git over HTTP as well as API
-	// writes. A second write_repository scope would not narrow it.
-	scopes := []string{"api"}
-	credential, response, err := root.Users.CreatePersonalAccessToken(actor.ID, &gitlabsdk.CreatePersonalAccessTokenOptions{
-		Name:      gitlabsdk.Ptr("acceptance-project-actor"),
-		Scopes:    &scopes,
-		ExpiresAt: gitlabsdk.Ptr(gitlabsdk.ISOTime(time.Now().UTC().AddDate(0, 0, 1))),
-	}, api)
-	if err != nil {
-		gitLabAPIFailure(t, "create project actor PAT", response, err)
-	}
-	if response, err := root.PersonalAccessTokens.RevokePersonalAccessTokenSelf(api); err != nil {
-		gitLabAPIFailure(t, "revoke root bootstrap PAT", response, err)
-	}
-	_, response, err = root.Users.CurrentUser(api)
-	if err == nil || response == nil || response.StatusCode != http.StatusUnauthorized {
-		gitLabAPIFailure(t, "confirm revoked root PAT cannot authenticate (want HTTP 401)", response, err)
-	}
-	if credential.Token == "" || credential.Token == rootToken {
-		t.Fatal("GitLab CE did not issue a separate actor PAT")
-	}
-	g.token = credential.Token
 	g.client = g.sdkClient(t, g.token)
-	g.ownerID = actor.ID
-
+	api := gitlabsdk.WithContext(ctx)
 	me, response, err := g.client.Users.CurrentUser(api)
-	if err != nil {
-		gitLabAPIFailure(t, "authenticate project actor", response, err)
-	}
-	if me.ID != actor.ID || me.Username != g.owner || me.State != "active" || me.IsAdmin || actor.IsAdmin {
+	requireAPI(t, "authenticate project actor", response, err)
+	if me == nil || me.ID <= 0 || me.Username != actorName || me.State != "active" || me.IsAdmin {
 		t.Fatal("GitLab CE project actor is not the expected active non-admin user")
 	}
+	g.ownerID = me.ID
 	_, response, err = g.client.Settings.GetSettings(api)
-	if err == nil || response == nil || (response.StatusCode != http.StatusForbidden && response.StatusCode != http.StatusUnauthorized) {
-		gitLabAPIFailure(t, "confirm project actor cannot read admin settings (want HTTP 403 or 401)", response, err)
-	}
+	expectRejection(t, "project actor reading admin settings", response, err, http.StatusForbidden, http.StatusUnauthorized)
 	pat, response, err := g.client.PersonalAccessTokens.GetSinglePersonalAccessToken(api)
-	if err != nil {
-		gitLabAPIFailure(t, "read back project actor PAT", response, err)
-	}
-	if !pat.Active || pat.Revoked || pat.UserID != me.ID || !slices.Equal(pat.Scopes, scopes) {
-		t.Fatal("GitLab CE project actor PAT is not active, owned by the actor, and API-only")
+	requireAPI(t, "read back project actor PAT", response, err)
+	if pat == nil || !pat.Active || pat.Revoked || pat.UserID != g.ownerID ||
+		!slices.Equal(pat.Scopes, []string{"api"}) || pat.ExpiresAt == nil || time.Until(time.Time(*pat.ExpiresAt)) > 24*time.Hour {
+		t.Fatal("GitLab CE project actor PAT must be active, short-lived, owned by the actor and API-only")
 	}
 	version, response, err := g.client.Version.GetVersion(api)
-	if err != nil {
-		gitLabAPIFailure(t, "read GitLab CE version", response, err)
-	}
-	if version.Version != gitLabVersion {
-		t.Fatalf("unexpected GitLab version %q, want %q", version.Version, gitLabVersion)
+	requireAPI(t, "read GitLab CE version", response, err)
+	if version == nil || version.Version != gitLabVersion {
+		t.Fatalf("fixture did not report GitLab version %s", gitLabVersion)
 	}
 }
 
-func (g *gitlabFixture) newProject(t *testing.T) *gitlabsdk.Project {
+func (g *fixture) newProject(t *testing.T) *gitlabsdk.Project {
 	t.Helper()
 	name := "acceptance-" + strings.ToLower(rand.Text())
 	api := gitlabsdk.WithContext(t.Context())
@@ -242,27 +204,25 @@ func (g *gitlabFixture) newProject(t *testing.T) *gitlabsdk.Project {
 		AutoDevopsEnabled:    gitlabsdk.Ptr(false),
 		BuildsAccessLevel:    gitlabsdk.Ptr(gitlabsdk.DisabledAccessControl),
 	}, api)
-	if err != nil {
-		gitLabAPIFailure(t, "create empty private project", response, err)
+	requireAPI(t, "create empty private project", response, err)
+	if created == nil || created.ID <= 0 {
+		t.Fatal("GitLab CE did not return a project ID")
 	}
 	project, response, err := g.client.Projects.GetProject(created.ID, nil, api)
-	if err != nil {
-		gitLabAPIFailure(t, "read back empty private project", response, err)
-	}
-	if project.ID <= 0 || !project.EmptyRepo || project.Visibility != gitlabsdk.PrivateVisibility ||
-		project.PathWithNamespace != g.owner+"/"+name || project.Namespace == nil || project.Namespace.Kind != "user" ||
+	requireAPI(t, "read back empty private project", response, err)
+	if project == nil || project.ID != created.ID || !project.EmptyRepo || project.Visibility != gitlabsdk.PrivateVisibility ||
+		project.Path != name || project.PathWithNamespace != actorName+"/"+name || project.Namespace == nil || project.Namespace.Kind != "user" ||
 		project.Owner == nil || project.Owner.ID != g.ownerID {
 		t.Fatal("GitLab CE project is not empty, private, and in the actor's personal namespace")
 	}
-	_, response, err = g.sdkClient(t, "").Projects.GetProject(project.ID, nil, api)
-	if err == nil || response == nil || response.StatusCode != http.StatusNotFound {
-		gitLabAPIFailure(t, "confirm anonymous project read is denied (want HTTP 404)", response, err)
-	}
+	_, response, err = g.anonymous.Projects.GetProject(project.ID, nil, api)
+	expectRejection(t, "anonymous private project read", response, err, http.StatusNotFound)
 	return project
 }
 
-func (g *gitlabFixture) sdkClient(t *testing.T, token string) *gitlabsdk.Client {
+func (g *fixture) sdkClient(t *testing.T, token string) *gitlabsdk.Client {
 	t.Helper()
+	// SDK-level retries also cover writes; only poll explicitly chosen reads.
 	client, err := gitlabsdk.NewClient(token, gitlabsdk.WithBaseURL(g.url), gitlabsdk.WithHTTPClient(g.httpClient),
 		gitlabsdk.WithoutRetries(), gitlabsdk.WithCustomLogger(nil))
 	if err != nil {
@@ -271,11 +231,24 @@ func (g *gitlabFixture) sdkClient(t *testing.T, token string) *gitlabsdk.Client 
 	return client
 }
 
-// SDK errors may include request or response data; do not log credential bodies.
-func gitLabAPIFailure(t *testing.T, action string, response *gitlabsdk.Response, err error) {
+func requireAPI(t *testing.T, action string, response *gitlabsdk.Response, err error) {
 	t.Helper()
-	if response != nil && response.Response != nil {
-		t.Fatalf("GitLab CE: %s: HTTP %d", action, response.StatusCode)
+	if err != nil {
+		t.Fatalf("GitLab CE: %s: %s", action, apiStatus(response, err))
 	}
-	t.Fatalf("GitLab CE: %s: SDK request failed (%T)", action, err)
+}
+
+func expectRejection(t *testing.T, action string, response *gitlabsdk.Response, err error, codes ...int) {
+	t.Helper()
+	if err == nil || response == nil || response.Response == nil || !slices.Contains(codes, response.StatusCode) {
+		t.Fatalf("GitLab CE: %s: got %s, want rejection with HTTP status in %v", action, apiStatus(response, err), codes)
+	}
+}
+
+// SDK errors may include response bodies. Report only the status or error type.
+func apiStatus(response *gitlabsdk.Response, err error) string {
+	if response != nil && response.Response != nil {
+		return fmt.Sprintf("HTTP %d", response.StatusCode)
+	}
+	return fmt.Sprintf("SDK request result (%T)", err)
 }
