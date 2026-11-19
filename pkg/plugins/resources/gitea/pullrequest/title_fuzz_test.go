@@ -9,6 +9,7 @@ import (
 )
 
 func FuzzExistingPullRequestTitle(f *testing.F) {
+	f.Add("WIP: scoped fixture", "New title", true)
 	f.Add("Update v1", "Update v2", false)
 	f.Add("WIP: Update v1", "Update v2", true)
 	f.Add("[wIp]Update v1", "Update v2", false)
